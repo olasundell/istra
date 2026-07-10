@@ -16,6 +16,8 @@ The plugin requires Node.js 24 or newer because the bundled MCP runtime uses `no
 
 ## Behaviour
 
-The plugin registers a local `istra` MCP server unless `mcp.istra` is already configured. OpenCode exposes its tools with an `istra_` prefix, for example `istra_get_project_pulse` and `istra_save_checkpoint`.
+The plugin registers a local `istra` MCP server unless `mcp.istra` is already configured. OpenCode exposes its tools with an `istra_` prefix, for example `istra_get_project_pulse`, `istra_save_checkpoint`, and `istra_report_error`.
+
+Agents report only concrete or strongly suspected faults in Istra itself—its MCP tools, packaging, instructions, or workflow. They report once per root cause after a quick check, without blocking user work, and never include secrets or recursively report a reporter failure.
 
 To override the runtime manually, configure `mcp.istra` in `opencode.json` with a local command that runs `node` and this package's `dist/mcp/stdio.mjs` file.

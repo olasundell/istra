@@ -15,11 +15,11 @@ import {
   UpdateWorkItemSchema,
   WorkItemStatusSchema,
   CreateEvidenceSchema,
+  CreateErrorReportSchema,
   CreateExternalBlockerSchema,
   CreateRequirementSchema,
   CreateRequirementStateSchema,
   CreateRunObjectSchema,
-  CreateRunSchema,
   CreateWorkQueueSchema,
   CreateWorkRelationSchema,
   CreateWorkspaceRevisionSchema,
@@ -27,6 +27,8 @@ import {
   UpdateRequirementSchema,
   CreateLabelSchema,
   PageRequestSchema,
+  ErrorReportPageRequestSchema,
+  UpdateErrorReportSchema,
 } from '../../domain/contracts.js'
 
 const client = z.string().trim().max(200).optional().describe('Name of the MCP client recording this change')
@@ -76,6 +78,30 @@ export function createMcpServer(service: IstraService): McpServer {
     inputSchema: z.object({ query: z.string().trim().min(1).max(500), limit: z.number().int().min(1).max(200).default(50), projectId: z.string().uuid().optional(), entityTypes: z.array(z.enum(['project', 'phase', 'work_item', 'update', 'requirement', 'run', 'evidence'])).max(10).optional(), state: z.string().trim().max(100).optional(), phaseId: z.string().uuid().optional(), requirementId: z.string().uuid().optional(), evidenceResult: z.enum(['recorded', 'verified', 'failed', 'interrupted']).optional(), from: z.string().datetime({ offset: true }).optional(), to: z.string().datetime({ offset: true }).optional() }),
     annotations: readOnly,
   }, async ({ query, limit, ...filters }) => result(service.search(query, limit, filters)))
+
+  server.registerTool('report_error', {
+    description: 'Report a concrete or strongly suspected fault in Istra’s MCP tools, plugins, instructions or workflow. Report only Istra faults after a quick sanity check; do not report user-project bugs, expected validation errors, or failures of this tool itself. Keep evidence concise and sanitised, then continue the user’s task.',
+    inputSchema: CreateErrorReportSchema.extend({
+      idempotencyKey: z.string().trim().min(1).max(200).describe('A task-scoped key reused only to retry this identical report.'),
+      client,
+    }).strict(),
+    annotations: write,
+  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.reportError(input, source(clientName), idempotencyKey)))
+  server.registerTool('list_error_reports_page', {
+    description: 'Read a bounded page of unresolved Istra error reports. Use only when explicitly asked to triage the inbox.',
+    inputSchema: ErrorReportPageRequestSchema,
+    annotations: readOnly,
+  }, async (page) => result(service.listErrorReportsPage(page)))
+  server.registerTool('get_error_report', {
+    description: 'Read one Istra error report and its creation and triage history. Use only when explicitly asked to triage the inbox.',
+    inputSchema: z.object({ reportId: z.string().uuid() }),
+    annotations: readOnly,
+  }, async ({ reportId }) => result(required(service.getErrorReport(reportId), 'Error report', reportId)))
+  server.registerTool('update_error_report', {
+    description: 'Set the triage status or note for an Istra error report using optimistic concurrency. Use only when explicitly asked to triage the inbox.',
+    inputSchema: UpdateErrorReportSchema.extend({ reportId: z.string().uuid(), client }).strict(),
+    annotations: write,
+  }, async ({ reportId, client: clientName, ...input }) => result(await service.updateErrorReport(reportId, input, source(clientName))))
 
   server.registerTool('list_labels', {
     description: 'List labels available to work items.',
@@ -290,10 +316,7 @@ export function createMcpServer(service: IstraService): McpServer {
 
   server.registerTool('create_run', {
     description: 'Record a bounded command/test execution with redacted excerpts.',
-    inputSchema: CreateRunObjectSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }).superRefine((run, context) => {
-      const parsed = CreateRunSchema.safeParse(run)
-      if (!parsed.success) for (const issue of parsed.error.issues) context.addIssue(issue)
-    }),
+    inputSchema: CreateRunObjectSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }).strict(),
     annotations: write,
   }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('list_runs', {

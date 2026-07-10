@@ -402,4 +402,34 @@ export const migrations: Migration[] = [{
       DELETE FROM artifact_references WHERE run_id IS NULL AND NOT EXISTS (SELECT 1 FROM evidence_artifact_links WHERE artifact_id=artifact_references.id);
     END;
   `,
+}, {
+  version: 2,
+  name: 'global_error_reports',
+  sql: `
+    CREATE TABLE error_reports (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK(kind IN ('bug','design')),
+      component TEXT NOT NULL CHECK(length(trim(component)) > 0 AND length(component) <= 200),
+      summary TEXT NOT NULL CHECK(length(trim(summary)) > 0 AND length(summary) <= 500),
+      observation TEXT NOT NULL CHECK(length(trim(observation)) > 0 AND length(observation) <= 20000),
+      expected_behaviour TEXT CHECK(expected_behaviour IS NULL OR (length(trim(expected_behaviour)) > 0 AND length(expected_behaviour) <= 20000)),
+      actual_behaviour TEXT CHECK(actual_behaviour IS NULL OR (length(trim(actual_behaviour)) > 0 AND length(actual_behaviour) <= 20000)),
+      reproduction_steps_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(reproduction_steps_json) AND json_type(reproduction_steps_json) = 'array' AND json_array_length(reproduction_steps_json) <= 20),
+      impact TEXT CHECK(impact IS NULL OR (length(trim(impact)) > 0 AND length(impact) <= 20000)),
+      project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+      workspace_path TEXT CHECK(workspace_path IS NULL OR (length(trim(workspace_path)) > 0 AND length(workspace_path) <= 4000)),
+      status TEXT NOT NULL CHECK(status IN ('open','acknowledged','resolved','dismissed')),
+      triage_note TEXT CHECK(triage_note IS NULL OR (length(trim(triage_note)) > 0 AND length(triage_note) <= 20000)),
+      source TEXT NOT NULL CHECK(source IN ('ui','mcp','import','system')),
+      client TEXT,
+      actor TEXT NOT NULL,
+      redaction_json TEXT NOT NULL DEFAULT '{"count":0,"fields":[]}' CHECK(json_valid(redaction_json)),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX error_reports_status_created ON error_reports(status, created_at DESC, id DESC);
+    CREATE INDEX error_reports_component_created ON error_reports(component, created_at DESC, id DESC);
+    CREATE INDEX error_reports_project_created ON error_reports(project_id, created_at DESC, id DESC);
+  `,
 }]

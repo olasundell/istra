@@ -1,0 +1,12 @@
+interface:
+  display_name: "Report an Istra fault"
+  short_description: "Report Istra tool and workflow faults"
+  default_prompt: "Use $istra-error-reporting to record this perceived Istra fault safely."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "istra"
+      description: "Istra local error-reporting MCP server"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

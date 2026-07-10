@@ -14,6 +14,8 @@ export const runOutcomes = ['recorded', 'verified', 'failed', 'interrupted'] as 
 export const evidenceResults = ['recorded', 'verified', 'failed', 'interrupted'] as const
 export const proofStatuses = ['open', 'partial', 'proven', 'defect'] as const
 export const validationStatuses = ['validated', 'legacy_unvalidated', 'overridden'] as const
+export const errorReportKinds = ['bug', 'design'] as const
+export const errorReportStatuses = ['open', 'acknowledged', 'resolved', 'dismissed'] as const
 
 export const ProjectStateSchema = z.enum(projectStates)
 export const PhaseStateSchema = z.enum(phaseStates)
@@ -28,6 +30,8 @@ export const RunOutcomeSchema = z.enum(runOutcomes)
 export const EvidenceResultSchema = z.enum(evidenceResults)
 export const ProofStatusSchema = z.enum(proofStatuses)
 export const ValidationStatusSchema = z.enum(validationStatuses)
+export const ErrorReportKindSchema = z.enum(errorReportKinds)
+export const ErrorReportStatusSchema = z.enum(errorReportStatuses)
 
 export type ProjectState = z.infer<typeof ProjectStateSchema>
 export type PhaseState = z.infer<typeof PhaseStateSchema>
@@ -42,6 +46,8 @@ export type RunOutcome = z.infer<typeof RunOutcomeSchema>
 export type EvidenceResult = z.infer<typeof EvidenceResultSchema>
 export type ProofStatus = z.infer<typeof ProofStatusSchema>
 export type ValidationStatus = z.infer<typeof ValidationStatusSchema>
+export type ErrorReportKind = z.infer<typeof ErrorReportKindSchema>
+export type ErrorReportStatus = z.infer<typeof ErrorReportStatusSchema>
 export type Provenance = { source: 'ui' | 'mcp' | 'import' | 'system'; client?: string; actor?: string; idempotencyKey?: string | null; occurredAt?: string }
 export type MutationContext = Provenance & { actor: string; idempotencyKey: string | null; occurredAt: string }
 
@@ -374,6 +380,29 @@ export interface RedactionMetadata {
   fields: string[]
 }
 
+export interface ErrorReport {
+  id: string
+  kind: ErrorReportKind
+  component: string
+  summary: string
+  observation: string
+  expectedBehaviour: string | null
+  actualBehaviour: string | null
+  reproductionSteps: string[]
+  impact: string | null
+  projectId: string | null
+  workspacePath: string | null
+  status: ErrorReportStatus
+  triageNote: string | null
+  source: Provenance['source']
+  client: string | null
+  actor: string
+  redaction: RedactionMetadata
+  version: number
+  createdAt: string
+  updatedAt: string
+}
+
 export interface EvidenceCriterionLink {
   criterionId: string
   criterionVersion: number
@@ -656,6 +685,29 @@ export const PageRequestSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().trim().max(500).nullable().optional(),
 })
+const optionalErrorReportText = z.string().trim().min(1).max(20_000).nullable().optional()
+export const CreateErrorReportSchema = z.object({
+  kind: ErrorReportKindSchema.describe('Use bug for contradicted behaviour or design for a materially unsafe, contradictory, impossible, or repeatedly misleading Istra design.'),
+  component: z.string().trim().min(1).max(200).describe('Affected Istra surface, such as mcp:create_run, codex-plugin, opencode-plugin, instructions, or workflow.'),
+  summary: z.string().trim().min(1).max(500).describe('Concise description of the perceived Istra fault.'),
+  observation: z.string().trim().min(1).max(20_000).describe('Sanitised facts observed; keep inference separate from observation.'),
+  expectedBehaviour: optionalErrorReportText.describe('Optional expected behaviour or contract.'),
+  actualBehaviour: optionalErrorReportText.describe('Optional observed behaviour that differs from expectation.'),
+  reproductionSteps: z.array(z.string().trim().min(1).max(2_000)).max(20).optional().describe('Optional minimal, sanitised reproduction steps.'),
+  impact: optionalErrorReportText.describe('Optional concrete impact of the concern.'),
+  projectId: z.string().uuid().nullable().optional().describe('Optional already-resolved project context; do not resolve a project merely to report a fault.'),
+  workspacePath: z.string().trim().min(1).max(4_000).nullable().optional().describe('Optional relevant workspace context.'),
+}).strict()
+export const UpdateErrorReportSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+  status: ErrorReportStatusSchema,
+  triageNote: optionalErrorReportText,
+}).strict()
+export const ErrorReportPageRequestSchema = PageRequestSchema.extend({
+  statuses: z.array(ErrorReportStatusSchema).min(1).max(errorReportStatuses.length).optional(),
+  kinds: z.array(ErrorReportKindSchema).min(1).max(errorReportKinds.length).optional(),
+  component: z.string().trim().min(1).max(200).optional(),
+}).strict()
 
 export type CreateRequirementStateInput = z.infer<typeof CreateRequirementStateSchema>
 export type CreateRequirementInput = z.infer<typeof CreateRequirementSchema>
@@ -667,3 +719,5 @@ export type CreateWorkspaceInput = z.infer<typeof CreateWorkspaceSchema>
 export type CreateWorkspaceRevisionInput = z.infer<typeof CreateWorkspaceRevisionSchema>
 export type CreateRunInput = z.infer<typeof CreateRunSchema>
 export type CreateEvidenceInput = z.infer<typeof CreateEvidenceSchema>
+export type CreateErrorReportInput = z.infer<typeof CreateErrorReportSchema>
+export type UpdateErrorReportInput = z.infer<typeof UpdateErrorReportSchema>

@@ -37,7 +37,7 @@ Set `ISTRA_DATA_DIR` to keep the database and backups elsewhere. Istra enables f
 
 Use the Data management view for a portable, versioned JSON export or a full replacement import. Import validates the bundle before changing active data and takes a pre-import backup. Import is intentionally not a merge operation.
 
-The authoritative-ledger development schema is created from one fresh migration and accepts export format v3 only. Earlier databases and v1/v2 exports are intentionally unsupported: stop every Istra web/MCP process, remove the old database together with its `-wal` and `-shm` files, then restart Istra to create the new schema. Startup fails closed when it detects an older migration history; it never deletes a database automatically.
+The authoritative ledger starts at migration v1 and adds the global error-report inbox in v2. Existing databases with the matching v1 history upgrade automatically after a pre-migration backup; incompatible legacy histories still fail closed and are never deleted automatically. Istra exports format v4, accepts v3 and v4 imports, and treats a v3 import as a full replacement with an empty error inbox.
 
 ## MCP
 
@@ -57,11 +57,11 @@ required = false
 default_tools_approval_mode = "writes"
 ```
 
-MCP provides read/search and non-destructive create, edit and archive tools. It deliberately does not expose hard deletion, import or backup restoration.
+MCP provides read/search and non-destructive create, edit and archive tools. `report_error` records a bounded, sanitised report of a perceived Istra MCP, plugin, instruction, or workflow fault; it is not for bugs in the user’s project. Istra deliberately does not expose hard deletion, import or backup restoration.
 
 ## Codex plugin
 
-The installable plugin source lives in `plugins/istra`. It packages the stdio MCP server and the `istra-project-memory` skill, which resolves the current checkout, reconciles requirements, ordered work, blockers and evidence before substantive work, records verification runs, and saves authoritative closing checkpoints afterwards.
+The installable plugin source lives in `plugins/istra`. It packages the stdio MCP server, the `istra-project-memory` skill, and the implicitly triggered `istra-error-reporting` skill. The latter tells agents when to report Istra faults autonomously, safely, and without blocking the user’s task.
 
 Build the self-contained plugin runtime with:
 

@@ -171,6 +171,42 @@ describe('operational project memory', () => {
     expect(operational.listRuns(project.id)).toHaveLength(1)
   })
 
+  it('stores global Istra error reports with redaction, history, triage and exact retries', () => {
+    const project = repository.createProject({ title: 'Error report context' }, provenance)
+    const payload = {
+      kind: 'bug' as const,
+      component: 'mcp:create_run',
+      summary: 'Token handling leaks in a tool response',
+      observation: 'TOKEN=secret appeared in a returned diagnostic.',
+      expectedBehaviour: 'Secrets are always redacted.',
+      actualBehaviour: 'The diagnostic included TOKEN=secret.',
+      reproductionSteps: ['Call the tool with TOKEN=secret.'],
+      impact: 'Sensitive data could be exposed.',
+      projectId: project.id,
+      workspacePath: dataDir,
+    }
+    const first = operational.runIdempotent('error-report-test', 'report-1', 'report_error', payload, () => operational.createErrorReport(payload))
+    const replay = operational.runIdempotent<typeof first>('error-report-test', 'report-1', 'report_error', payload, () => { throw new Error('replay must not execute') })
+
+    expect(replay.id).toBe(first.id)
+    expect(first).toMatchObject({ kind: 'bug', status: 'open', projectId: project.id, redaction: { count: expect.any(Number) } })
+    expect(first.observation).toContain('[REDACTED]')
+    expect(operational.listErrorReportsPage(10).items.map(({ id }) => id)).toContain(first.id)
+    expect(operational.getErrorReport(first.id)).toMatchObject({ report: { id: first.id }, history: [expect.objectContaining({ eventType: 'error_report.created' })] })
+
+    expect(() => operational.runIdempotent('error-report-test', 'report-1', 'report_error', { ...payload, summary: 'Changed' }, () => operational.createErrorReport(payload))).toThrow(/idempotency/i)
+    const independent = operational.runIdempotent('error-report-test', 'report-2', 'report_error', { ...payload, kind: 'design' as const, summary: 'The recovery path is misleading' }, () => operational.createErrorReport({ ...payload, kind: 'design', summary: 'The recovery path is misleading' }))
+    expect(independent.id).not.toBe(first.id)
+
+    expect(() => operational.updateErrorReport(first.id, { expectedVersion: first.version + 1, status: 'acknowledged' })).toThrow(/changed; refresh/i)
+    const acknowledged = operational.updateErrorReport(first.id, { expectedVersion: first.version, status: 'acknowledged', triageNote: 'Investigate TOKEN=secret handling.' })
+    expect(acknowledged).toMatchObject({ status: 'acknowledged', version: first.version + 1 })
+    expect(acknowledged.triageNote).toContain('[REDACTED]')
+    expect(operational.listErrorReportsPage(10).items.map(({ id }) => id)).toContain(first.id)
+    expect(operational.getErrorReport(first.id)?.history.map(({ eventType }) => eventType)).toEqual(expect.arrayContaining(['error_report.created', 'error_report.status_updated']))
+    expect(operational.listErrorReportsPage(10, undefined, ['resolved']).items).toHaveLength(0)
+  })
+
   it('captures a reconstructable checkpoint snapshot and evidence links', () => {
     const project = repository.createProject({ title: 'Snapshot probe' }, provenance)
     const requirement = operational.createRequirement(project.id, {
@@ -206,6 +242,7 @@ describe('operational project memory', () => {
       workItemIds: [item.id],
       artifacts: [{ uri: 'artifact://evidence-report', mediaType: 'text/plain' }],
     })
+    const report = operational.createErrorReport({ kind: 'design', component: 'instructions', summary: 'The retry rule is ambiguous', observation: 'Two instructions give conflicting retry advice.', projectId: project.id })
     const bundle = repository.exportAll()
     const targetDir = await mkdtemp(join(tmpdir(), 'istra-import-operational-'))
     const target = await openIstraDatabase({ dataDir: targetDir })
@@ -222,6 +259,29 @@ describe('operational project memory', () => {
         workItemIds: expect.arrayContaining([item.id]),
         artifacts: [expect.objectContaining({ uri: 'artifact://evidence-report' })],
       })
+      expect(targetOperational.getErrorReport(report.id)?.report).toMatchObject({ id: report.id, kind: 'design', projectId: project.id })
+    } finally {
+      target.db.close()
+      await rm(targetDir, { recursive: true, force: true })
+    }
+  })
+
+  it('treats a legacy v3 export as a full replacement with an empty error inbox', async () => {
+    const report = operational.createErrorReport({ kind: 'bug', component: 'mcp', summary: 'Legacy export probe', observation: 'The report should not survive a v3 import.' })
+    const legacy = repository.exportAll()
+    legacy.formatVersion = 3
+    delete legacy.tables.error_reports
+
+    const targetDir = await mkdtemp(join(tmpdir(), 'istra-import-legacy-error-reports-'))
+    const target = await openIstraDatabase({ dataDir: targetDir })
+    try {
+      const targetRepository = new SqliteIstraRepository(target.db)
+      const targetOperational = new SqliteOperationalRepository(target.db)
+      const targetReport = targetOperational.createErrorReport({ kind: 'design', component: 'instructions', summary: 'Existing target report', observation: 'This must be cleared by full replacement.' })
+      targetRepository.validateImport(legacy)
+      targetRepository.importAll(legacy)
+      expect(targetOperational.getErrorReport(report.id)).toBeNull()
+      expect(targetOperational.getErrorReport(targetReport.id)).toBeNull()
     } finally {
       target.db.close()
       await rm(targetDir, { recursive: true, force: true })

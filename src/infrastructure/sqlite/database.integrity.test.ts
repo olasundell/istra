@@ -40,14 +40,16 @@ describe('SQLite database integrity', () => {
     }).toThrow()
   })
 
-  it('creates the complete authoritative schema from one fresh migration', async () => {
+  it('creates the complete authoritative schema including the global error inbox', async () => {
     const { db } = await openDatabase()
 
     expect(migrations.map(({ version, name }) => ({ version, name }))).toEqual([
       { version: 1, name: 'authoritative_ledger' },
+      { version: 2, name: 'global_error_reports' },
     ])
     expect(db.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all()).toEqual([
       { version: 1, name: 'authoritative_ledger' },
+      { version: 2, name: 'global_error_reports' },
     ])
 
     const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(({ name }) => name))
@@ -58,7 +60,26 @@ describe('SQLite database integrity', () => {
       'evidence',
       'checkpoint_snapshots',
       'idempotency_records',
+      'error_reports',
     ]))
+  })
+
+  it('upgrades a populated v1 database and backs it up before adding the global inbox', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'istra-v1-upgrade-'))
+    directories.push(dataDir)
+    const databasePath = join(dataDir, 'istra.sqlite3')
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec(migrations[0]!.sql)
+    const timestamp = new Date().toISOString()
+    legacy.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)').run(1, 'authoritative_ledger', timestamp)
+    legacy.prepare("INSERT INTO projects(id,title,state,created_at,updated_at,last_activity_at) VALUES (?,?,?,?,?,?)").run(randomUUID(), 'Preserve me', 'active', timestamp, timestamp, timestamp)
+    legacy.close()
+
+    const upgraded = await openIstraDatabase({ dataDir })
+    databases.push(upgraded.db)
+    expect((upgraded.db.prepare('SELECT COUNT(*) AS count FROM error_reports').get() as { count: number }).count).toBe(0)
+    expect((upgraded.db.prepare("SELECT COUNT(*) AS count FROM projects WHERE title='Preserve me'").get() as { count: number }).count).toBe(1)
+    expect((await upgraded.backupManager.list()).some(({ name }) => name.startsWith('pre-migration-v1-to-v2-'))).toBe(true)
   })
 
   it('fails closed when a legacy migration history is opened without recreating the database', async () => {

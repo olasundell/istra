@@ -14,6 +14,7 @@ import {
   UpdateWorkItemSchema,
   WorkItemStatusSchema,
   CreateEvidenceSchema,
+  CreateErrorReportSchema,
   CreateExternalBlockerSchema,
   CreateRequirementSchema,
   CreateRequirementStateSchema,
@@ -24,6 +25,8 @@ import {
   CreateWorkspaceSchema,
   UpdateRequirementSchema,
   PageRequestSchema,
+  ErrorReportPageRequestSchema,
+  UpdateErrorReportSchema,
   type Provenance,
   type MutationContext,
   type SearchFilters,
@@ -34,7 +37,7 @@ import type { OperationalRepository } from '../infrastructure/sqlite/operational
 
 const ExportBundleSchema = z.object({
   format: z.literal('istra-export'),
-  formatVersion: z.literal(3),
+  formatVersion: z.union([z.literal(3), z.literal(4)]),
   exportedAt: z.string().datetime({ offset: true }),
   tables: z.record(z.array(z.record(z.unknown()))),
 }).strict()
@@ -98,6 +101,11 @@ export class IstraService {
   listRecentActivity(limit?: number) { return this.repository.listRecentActivity(limit) }
   getUpdateRevisions(updateId: string) { return this.repository.getUpdateRevisions(updateId) }
   listLabels() { return this.repository.listLabels() }
+  listErrorReportsPage(input: unknown = {}) {
+    const parsed = this.parse(ErrorReportPageRequestSchema, input)
+    return this.operations().listErrorReportsPage(parsed.limit, parsed.cursor, parsed.statuses, parsed.kinds, parsed.component)
+  }
+  getErrorReport(id: string) { return this.operations().getErrorReport(id) }
   search(query: string, limit?: number, filters: unknown = {}) {
     const parsed = this.parse(z.object({ projectId: z.string().uuid().optional(), entityTypes: z.array(z.enum(['project', 'phase', 'work_item', 'update', 'requirement', 'run', 'evidence'])).max(10).optional(), state: z.string().trim().max(100).optional(), phaseId: z.string().uuid().optional(), requirementId: z.string().uuid().optional(), evidenceResult: z.enum(['recorded', 'verified', 'failed', 'interrupted']).optional(), from: z.string().datetime({ offset: true }).optional(), to: z.string().datetime({ offset: true }).optional() }), filters) as SearchFilters
     const max = this.parse(z.number().int().min(1).max(200), limit ?? 50)
@@ -127,6 +135,14 @@ export class IstraService {
   createProject(input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CreateProjectSchema, input)
     return this.writeCore(source, idempotencyKey, 'create_project', parsed, (context) => this.repository.createProject(parsed, context))
+  }
+  reportError(input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
+    const parsed = this.parse(CreateErrorReportSchema, input)
+    return this.writeOperational(source ?? {}, idempotencyKey, 'report_error', parsed, () => this.operations().createErrorReport(parsed))
+  }
+  updateErrorReport(id: string, input: unknown, source?: Partial<Provenance>) {
+    const parsed = this.parse(UpdateErrorReportSchema, input)
+    return this.writeOperational(source ?? {}, undefined, 'update_error_report', { id, parsed }, () => this.operations().updateErrorReport(id, parsed))
   }
   updateProject(id: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(UpdateProjectSchema, input)

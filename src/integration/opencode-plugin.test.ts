@@ -45,6 +45,8 @@ describe("OpenCode plugin package", () => {
       "dist/mcp/stdio.mjs",
       "instructions/opencode-project-memory.md",
       "skills/istra-project-memory/SKILL.md",
+      "skills/istra-error-reporting/SKILL.md",
+      "skills/istra-error-reporting/agents/openai.yaml",
     ]));
     expect(instructions).toContain("Call `istra_resolve_project` first with the current checkout path.");
     expect(instructions).toContain("Call `istra_get_project_pulse_summary`");
@@ -58,6 +60,9 @@ describe("OpenCode plugin package", () => {
     expect(instructions.toLocaleLowerCase()).toContain("link evidence to the exact acceptance criteria and work items");
     expect(instructions).toContain("Never create evidence overrides.");
     expect(instructions).toContain("Confirm that `istra_save_checkpoint` returned its snapshot identifier and digest.");
+    expect(instructions).toContain("`istra_report_error`");
+    expect(instructions).toMatch(/Never report user-project bugs/i);
+    expect(instructions).toMatch(/Never recursively report a failure of `istra_report_error`/i);
   });
 
   it("adds Istra only when the user has not already configured it", async () => {

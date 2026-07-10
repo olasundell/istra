@@ -9347,7 +9347,7 @@ const unknownType = ZodUnknown.create;
 ZodNever.create;
 const arrayType = ZodArray.create;
 const objectType = ZodObject.create;
-ZodUnion.create;
+const unionType = ZodUnion.create;
 ZodIntersection.create;
 ZodTuple.create;
 const recordType = ZodRecord.create;
@@ -9465,6 +9465,8 @@ const runOutcomes = ["recorded", "verified", "failed", "interrupted"];
 const evidenceResults = ["recorded", "verified", "failed", "interrupted"];
 const proofStatuses = ["open", "partial", "proven", "defect"];
 const validationStatuses = ["validated", "legacy_unvalidated", "overridden"];
+const errorReportKinds = ["bug", "design"];
+const errorReportStatuses = ["open", "acknowledged", "resolved", "dismissed"];
 const ProjectStateSchema = enumType(projectStates);
 const PhaseStateSchema = enumType(phaseStates);
 const WorkItemKindSchema = enumType(workItemKinds);
@@ -9478,6 +9480,8 @@ const RunOutcomeSchema = enumType(runOutcomes);
 const EvidenceResultSchema = enumType(evidenceResults);
 enumType(proofStatuses);
 enumType(validationStatuses);
+const ErrorReportKindSchema = enumType(errorReportKinds);
+const ErrorReportStatusSchema = enumType(errorReportStatuses);
 const PulseSnapshotSchema = objectType({
   state: ProjectStateSchema,
   currentFocus: stringType().nullable(),
@@ -9672,6 +9676,29 @@ const PageRequestSchema = objectType({
   limit: coerce.number().int().min(1).max(200).default(50),
   cursor: stringType().trim().max(500).nullable().optional()
 });
+const optionalErrorReportText = stringType().trim().min(1).max(2e4).nullable().optional();
+const CreateErrorReportSchema = objectType({
+  kind: ErrorReportKindSchema.describe("Use bug for contradicted behaviour or design for a materially unsafe, contradictory, impossible, or repeatedly misleading Istra design."),
+  component: stringType().trim().min(1).max(200).describe("Affected Istra surface, such as mcp:create_run, codex-plugin, opencode-plugin, instructions, or workflow."),
+  summary: stringType().trim().min(1).max(500).describe("Concise description of the perceived Istra fault."),
+  observation: stringType().trim().min(1).max(2e4).describe("Sanitised facts observed; keep inference separate from observation."),
+  expectedBehaviour: optionalErrorReportText.describe("Optional expected behaviour or contract."),
+  actualBehaviour: optionalErrorReportText.describe("Optional observed behaviour that differs from expectation."),
+  reproductionSteps: arrayType(stringType().trim().min(1).max(2e3)).max(20).optional().describe("Optional minimal, sanitised reproduction steps."),
+  impact: optionalErrorReportText.describe("Optional concrete impact of the concern."),
+  projectId: stringType().uuid().nullable().optional().describe("Optional already-resolved project context; do not resolve a project merely to report a fault."),
+  workspacePath: stringType().trim().min(1).max(4e3).nullable().optional().describe("Optional relevant workspace context.")
+}).strict();
+const UpdateErrorReportSchema = objectType({
+  expectedVersion: numberType().int().positive(),
+  status: ErrorReportStatusSchema,
+  triageNote: optionalErrorReportText
+}).strict();
+const ErrorReportPageRequestSchema = PageRequestSchema.extend({
+  statuses: arrayType(ErrorReportStatusSchema).min(1).max(errorReportStatuses.length).optional(),
+  kinds: arrayType(ErrorReportKindSchema).min(1).max(errorReportKinds.length).optional(),
+  component: stringType().trim().min(1).max(200).optional()
+}).strict();
 class AppError extends Error {
   constructor(code2, message, statusCode, details) {
     super(message);
@@ -9705,7 +9732,7 @@ class IdempotencyConflictError extends AppError {
 }
 const ExportBundleSchema = objectType({
   format: literalType("istra-export"),
-  formatVersion: literalType(3),
+  formatVersion: unionType([literalType(3), literalType(4)]),
   exportedAt: stringType().datetime({ offset: true }),
   tables: recordType(arrayType(recordType(unknownType())))
 }).strict();
@@ -9789,6 +9816,13 @@ class IstraService {
   listLabels() {
     return this.repository.listLabels();
   }
+  listErrorReportsPage(input = {}) {
+    const parsed = this.parse(ErrorReportPageRequestSchema, input);
+    return this.operations().listErrorReportsPage(parsed.limit, parsed.cursor, parsed.statuses, parsed.kinds, parsed.component);
+  }
+  getErrorReport(id2) {
+    return this.operations().getErrorReport(id2);
+  }
   search(query, limit2, filters = {}) {
     const parsed = this.parse(objectType({ projectId: stringType().uuid().optional(), entityTypes: arrayType(enumType(["project", "phase", "work_item", "update", "requirement", "run", "evidence"])).max(10).optional(), state: stringType().trim().max(100).optional(), phaseId: stringType().uuid().optional(), requirementId: stringType().uuid().optional(), evidenceResult: enumType(["recorded", "verified", "failed", "interrupted"]).optional(), from: stringType().datetime({ offset: true }).optional(), to: stringType().datetime({ offset: true }).optional() }), filters);
     const max = this.parse(numberType().int().min(1).max(200), limit2 ?? 50);
@@ -9819,6 +9853,14 @@ class IstraService {
   createProject(input, source2, idempotencyKey) {
     const parsed = this.parse(CreateProjectSchema, input);
     return this.writeCore(source2, idempotencyKey, "create_project", parsed, (context) => this.repository.createProject(parsed, context));
+  }
+  reportError(input, source2, idempotencyKey) {
+    const parsed = this.parse(CreateErrorReportSchema, input);
+    return this.writeOperational(source2 ?? {}, idempotencyKey, "report_error", parsed, () => this.operations().createErrorReport(parsed));
+  }
+  updateErrorReport(id2, input, source2) {
+    const parsed = this.parse(UpdateErrorReportSchema, input);
+    return this.writeOperational(source2 ?? {}, void 0, "update_error_report", { id: id2, parsed }, () => this.operations().updateErrorReport(id2, parsed));
   }
   updateProject(id2, input, source2) {
     const parsed = this.parse(UpdateProjectSchema, input);
@@ -10413,6 +10455,36 @@ const migrations = [{
       DELETE FROM artifact_references WHERE run_id IS NULL AND NOT EXISTS (SELECT 1 FROM evidence_artifact_links WHERE artifact_id=artifact_references.id);
     END;
   `
+}, {
+  version: 2,
+  name: "global_error_reports",
+  sql: `
+    CREATE TABLE error_reports (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK(kind IN ('bug','design')),
+      component TEXT NOT NULL CHECK(length(trim(component)) > 0 AND length(component) <= 200),
+      summary TEXT NOT NULL CHECK(length(trim(summary)) > 0 AND length(summary) <= 500),
+      observation TEXT NOT NULL CHECK(length(trim(observation)) > 0 AND length(observation) <= 20000),
+      expected_behaviour TEXT CHECK(expected_behaviour IS NULL OR (length(trim(expected_behaviour)) > 0 AND length(expected_behaviour) <= 20000)),
+      actual_behaviour TEXT CHECK(actual_behaviour IS NULL OR (length(trim(actual_behaviour)) > 0 AND length(actual_behaviour) <= 20000)),
+      reproduction_steps_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(reproduction_steps_json) AND json_type(reproduction_steps_json) = 'array' AND json_array_length(reproduction_steps_json) <= 20),
+      impact TEXT CHECK(impact IS NULL OR (length(trim(impact)) > 0 AND length(impact) <= 20000)),
+      project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+      workspace_path TEXT CHECK(workspace_path IS NULL OR (length(trim(workspace_path)) > 0 AND length(workspace_path) <= 4000)),
+      status TEXT NOT NULL CHECK(status IN ('open','acknowledged','resolved','dismissed')),
+      triage_note TEXT CHECK(triage_note IS NULL OR (length(trim(triage_note)) > 0 AND length(triage_note) <= 20000)),
+      source TEXT NOT NULL CHECK(source IN ('ui','mcp','import','system')),
+      client TEXT,
+      actor TEXT NOT NULL,
+      redaction_json TEXT NOT NULL DEFAULT '{"count":0,"fields":[]}' CHECK(json_valid(redaction_json)),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX error_reports_status_created ON error_reports(status, created_at DESC, id DESC);
+    CREATE INDEX error_reports_component_created ON error_reports(component, created_at DESC, id DESC);
+    CREATE INDEX error_reports_project_created ON error_reports(project_id, created_at DESC, id DESC);
+  `
 }];
 function resolveDatabasePaths(dataDir = process.env.ISTRA_DATA_DIR) {
   const platformDefault = process.platform === "darwin" ? join(homedir(), "Library", "Application Support", "Istra") : process.platform === "win32" ? join(process.env.LOCALAPPDATA ?? homedir(), "Istra") : join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "istra");
@@ -10882,6 +10954,7 @@ function revisionFromRow(row) {
 }
 const exportTables = {
   projects: ["id", "title", "description", "intent", "deadline", "completion_criteria", "state", "current_focus", "next_action", "blockers_json", "current_checkpoint_id", "archived_at", "version", "created_at", "updated_at", "last_activity_at"],
+  error_reports: ["id", "kind", "component", "summary", "observation", "expected_behaviour", "actual_behaviour", "reproduction_steps_json", "impact", "project_id", "workspace_path", "status", "triage_note", "source", "client", "actor", "redaction_json", "version", "created_at", "updated_at"],
   phases: ["id", "project_id", "name", "description", "status", "position", "archived_at", "version", "created_at", "updated_at"],
   work_items: ["id", "project_id", "phase_id", "stable_key", "parent_id", "kind", "title", "description", "status", "priority", "version", "created_at", "updated_at"],
   labels: ["id", "name", "colour", "version", "created_at", "updated_at"],
@@ -11476,12 +11549,12 @@ class SqliteIstraRepository {
   exportAll() {
     const tables = {};
     for (const [table, columns] of Object.entries(exportTables)) tables[table] = this.db.prepare(`SELECT ${columns.join(",")} FROM ${table}`).all();
-    return { format: "istra-export", formatVersion: 3, exportedAt: now$1(), tables };
+    return { format: "istra-export", formatVersion: 4, exportedAt: now$1(), tables };
   }
   validateImport(bundle) {
     const temp = new DatabaseSync(":memory:");
     try {
-      if (bundle.formatVersion !== 3) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`);
+      if (![3, 4].includes(bundle.formatVersion)) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`);
       temp.exec("PRAGMA foreign_keys=ON;");
       for (const migration of migrations) temp.exec(migration.sql);
       temp.exec("BEGIN; PRAGMA defer_foreign_keys=ON;");
@@ -11539,11 +11612,12 @@ class SqliteIstraRepository {
       });
       const redactors = /* @__PURE__ */ new Map();
       const redactorFor = (projectId) => {
-        const existing = redactors.get(projectId);
+        const cacheKey = projectId ?? "__global__";
+        const existing = redactors.get(cacheKey);
         if (existing) return existing;
-        const secretNames = temp.prepare("SELECT name FROM project_secret_names WHERE project_id=?").all(projectId).map((row) => String(row.name));
+        const secretNames = projectId ? temp.prepare("SELECT name FROM project_secret_names WHERE project_id=?").all(projectId).map((row) => String(row.name)) : [];
         const redactor = new SecretRedactor({ secretNames });
-        redactors.set(projectId, redactor);
+        redactors.set(cacheKey, redactor);
         return redactor;
       };
       const invalidRedactions = [];
@@ -11567,6 +11641,41 @@ class SqliteIstraRepository {
         LEFT JOIN evidence_artifact_links l ON l.artifact_id=a.id
         LEFT JOIN evidence e ON e.id=l.evidence_id`).all()) {
         if (artifact.project_id && redactorFor(String(artifact.project_id)).redact(String(artifact.uri)).redacted) invalidRedactions.push({ entityType: "artifact", entityId: String(artifact.id), field: "uri" });
+      }
+      const invalidErrorReports = [];
+      for (const report of temp.prepare("SELECT * FROM error_reports").all()) {
+        const reproductionSteps = parseJson(report.reproduction_steps_json, null);
+        const creation = CreateErrorReportSchema.safeParse({
+          kind: report.kind,
+          component: report.component,
+          summary: report.summary,
+          observation: report.observation,
+          expectedBehaviour: report.expected_behaviour,
+          actualBehaviour: report.actual_behaviour,
+          reproductionSteps,
+          impact: report.impact,
+          projectId: report.project_id,
+          workspacePath: report.workspace_path
+        });
+        const triage = UpdateErrorReportSchema.safeParse({ expectedVersion: report.version, status: report.status, triageNote: report.triage_note });
+        if (!creation.success || !triage.success) {
+          invalidErrorReports.push({ reportId: String(report.id), reason: "error report does not satisfy its input constraints" });
+          continue;
+        }
+        const validatedReproductionSteps = creation.data.reproductionSteps ?? [];
+        const redactor = redactorFor(textOrNull$1(report.project_id));
+        const fields = {
+          component: report.component,
+          summary: report.summary,
+          observation: report.observation,
+          expected_behaviour: report.expected_behaviour,
+          actual_behaviour: report.actual_behaviour,
+          reproduction_steps: validatedReproductionSteps.join("\n"),
+          impact: report.impact,
+          workspace_path: report.workspace_path,
+          triage_note: report.triage_note
+        };
+        for (const [field, value] of Object.entries(fields)) if (typeof value === "string" && redactor.redact(value).redacted) invalidRedactions.push({ entityType: "error_report", entityId: String(report.id), field });
       }
       const invalidStructuredSnapshots = temp.prepare(`SELECT s.id,s.document_json,s.digest,u.project_id
         FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id`).all().flatMap((snapshot) => {
@@ -11661,8 +11770,8 @@ class SqliteIstraRepository {
         const workItemCount = workItemIds.length ? Number(temp.prepare(`SELECT COUNT(*) AS count FROM work_items WHERE project_id=? AND id IN (${workItemIds.map(() => "?").join(",")})`).get(String(row.project_id), ...workItemIds).count) : 0;
         if (phaseCount !== new Set(phaseIds).size || workItemCount !== new Set(workItemIds).size) invalidSnapshots.push({ updateId: String(row.id), reason: "snapshot references an entity outside the project" });
       }
-      if (integrity.integrity_check !== "ok" || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length || invalidStructuredSnapshots.length || orphanArtifacts.length || invalidRuns.length || invalidEvidence.length || invalidRedactions.length) {
-        throw new ValidationError("Import failed database integrity checks", { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots, invalidStructuredSnapshots, orphanArtifacts, invalidRuns, invalidEvidence, invalidRedactions });
+      if (integrity.integrity_check !== "ok" || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length || invalidStructuredSnapshots.length || orphanArtifacts.length || invalidRuns.length || invalidEvidence.length || invalidErrorReports.length || invalidRedactions.length) {
+        throw new ValidationError("Import failed database integrity checks", { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots, invalidStructuredSnapshots, orphanArtifacts, invalidRuns, invalidEvidence, invalidErrorReports, invalidRedactions });
       }
     } catch (error) {
       if (error instanceof ValidationError) throw error;
@@ -11689,7 +11798,10 @@ class SqliteIstraRepository {
   loadTables(db, bundle) {
     for (const [table, columns] of Object.entries(exportTables)) {
       const rows = bundle.tables[table];
-      if (!Array.isArray(rows)) throw new ValidationError(`Import is missing table ${table}`);
+      if (!Array.isArray(rows)) {
+        if (bundle.formatVersion === 3 && table === "error_reports") continue;
+        throw new ValidationError(`Import is missing table ${table}`);
+      }
       const statement = db.prepare(`INSERT INTO ${table}(${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
       for (const row of rows) statement.run(...columns.map((column) => {
         const key = column.replaceAll('"', "");
@@ -12260,8 +12372,111 @@ class SqliteOperationalRepository {
     return selected.map((row) => ({ id: String(row.id), title: String(row.title), description: textOrNull(row.description), intent: textOrNull(row.intent), deadline: textOrNull(row.deadline), completionCriteria: textOrNull(row.completion_criteria), state: String(row.state), currentFocus: textOrNull(row.current_focus), nextAction: textOrNull(row.next_action), blockers: json(row.blockers_json, []), currentCheckpointId: textOrNull(row.current_checkpoint_id), archivedAt: textOrNull(row.archived_at), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at), lastActivityAt: String(row.last_activity_at) }));
   }
   secretRedactor(projectId) {
-    const secretNames = this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name));
+    const secretNames = projectId ? this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name)) : [];
     return new SecretRedactor({ secretNames });
+  }
+  errorReportFromRow(row) {
+    return {
+      id: String(row.id),
+      kind: String(row.kind),
+      component: String(row.component),
+      summary: String(row.summary),
+      observation: String(row.observation),
+      expectedBehaviour: textOrNull(row.expected_behaviour),
+      actualBehaviour: textOrNull(row.actual_behaviour),
+      reproductionSteps: json(row.reproduction_steps_json, []),
+      impact: textOrNull(row.impact),
+      projectId: textOrNull(row.project_id),
+      workspacePath: textOrNull(row.workspace_path),
+      status: String(row.status),
+      triageNote: textOrNull(row.triage_note),
+      source: String(row.source),
+      client: textOrNull(row.client),
+      actor: String(row.actor),
+      redaction: json(row.redaction_json, { count: 0, fields: [] }),
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    };
+  }
+  createErrorReport(input) {
+    if (input.projectId) this.project(input.projectId);
+    const id2 = randomUUID();
+    const timestamp = now();
+    const context = this.mutationContext();
+    const redactor = this.secretRedactor(input.projectId);
+    const component = redactor.redact(input.component);
+    const summary = redactor.redact(input.summary);
+    const observation = redactor.redact(input.observation);
+    const expectedBehaviour = input.expectedBehaviour ? redactor.redact(input.expectedBehaviour) : null;
+    const actualBehaviour = input.actualBehaviour ? redactor.redact(input.actualBehaviour) : null;
+    const reproductionSteps = (input.reproductionSteps ?? []).map((step) => redactor.redact(step));
+    const impact = input.impact ? redactor.redact(input.impact) : null;
+    const workspacePath = input.workspacePath ? redactor.redact(input.workspacePath) : null;
+    const redaction = redactionMetadata([
+      { field: "component", result: component },
+      { field: "summary", result: summary },
+      { field: "observation", result: observation },
+      ...expectedBehaviour ? [{ field: "expectedBehaviour", result: expectedBehaviour }] : [],
+      ...actualBehaviour ? [{ field: "actualBehaviour", result: actualBehaviour }] : [],
+      ...reproductionSteps.map((result2, index) => ({ field: `reproductionSteps.${index}`, result: result2 })),
+      ...impact ? [{ field: "impact", result: impact }] : [],
+      ...workspacePath ? [{ field: "workspacePath", result: workspacePath }] : []
+    ]);
+    return this.transaction(() => {
+      this.db.prepare("INSERT INTO error_reports(id,kind,component,summary,observation,expected_behaviour,actual_behaviour,reproduction_steps_json,impact,project_id,workspace_path,status,triage_note,source,client,actor,redaction_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, input.kind, component.value, summary.value, observation.value, expectedBehaviour?.value ?? null, actualBehaviour?.value ?? null, JSON.stringify(reproductionSteps.map((result2) => result2.value)), impact?.value ?? null, input.projectId ?? null, workspacePath?.value ?? null, "open", null, context.source, context.client ?? null, context.actor, JSON.stringify(redaction), timestamp, timestamp);
+      this.event(null, "error_report", id2, "error_report.created", { kind: input.kind, component: component.value, redactionCount: redaction.count });
+      return this.errorReportFromRow(this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2));
+    });
+  }
+  listErrorReportsPage(limit2, cursor, statuses, kinds, component) {
+    const selectedStatuses = statuses ?? ["open", "acknowledged"];
+    const clauses = [];
+    const parameters = [];
+    clauses.push(`status IN (${selectedStatuses.map(() => "?").join(",")})`);
+    parameters.push(...selectedStatuses);
+    if (kinds?.length) {
+      clauses.push(`kind IN (${kinds.map(() => "?").join(",")})`);
+      parameters.push(...kinds);
+    }
+    if (component) {
+      clauses.push("component=?");
+      parameters.push(component);
+    }
+    const rows = this.db.prepare(`SELECT * FROM error_reports WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC,id DESC`).all(...parameters);
+    return pageOf(rows.map((row) => this.errorReportFromRow(row)), limit2, cursor);
+  }
+  getErrorReport(id2) {
+    const row = this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2);
+    if (!row) return null;
+    const history = this.db.prepare("SELECT * FROM activity_events WHERE entity_type='error_report' AND entity_id=? ORDER BY created_at DESC,id DESC").all(id2).map((event) => ({
+      id: String(event.id),
+      projectId: textOrNull(event.project_id),
+      entityType: String(event.entity_type),
+      entityId: String(event.entity_id),
+      eventType: String(event.event_type),
+      payload: json(event.payload_json, {}),
+      source: String(event.source),
+      client: textOrNull(event.client),
+      actor: String(event.actor),
+      idempotencyKey: textOrNull(event.idempotency_key),
+      createdAt: String(event.created_at)
+    }));
+    return { report: this.errorReportFromRow(row), history };
+  }
+  updateErrorReport(id2, input) {
+    const row = this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2);
+    if (!row) throw new NotFoundError("Error report", id2);
+    const current = this.errorReportFromRow(row);
+    const redactor = this.secretRedactor(current.projectId);
+    const triageNote = input.triageNote === void 0 ? void 0 : input.triageNote === null ? null : redactor.redact(input.triageNote);
+    const redaction = triageNote && triageNote !== null ? { count: current.redaction.count + triageNote.count, fields: [.../* @__PURE__ */ new Set([...current.redaction.fields, ...redactionMetadata([{ field: "triageNote", result: triageNote }]).fields])] } : current.redaction;
+    return this.transaction(() => {
+      const result2 = this.db.prepare("UPDATE error_reports SET status=?,triage_note=?,redaction_json=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(input.status, triageNote === void 0 ? current.triageNote : triageNote?.value ?? null, JSON.stringify(redaction), now(), id2, input.expectedVersion);
+      if (!Number(result2.changes)) throw new ConflictError("Error report", id2);
+      this.event(null, "error_report", id2, "error_report.status_updated", { from: current.status, to: input.status, triageNoteUpdated: triageNote !== void 0, redactionCount: redaction.count });
+      return this.errorReportFromRow(this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2));
+    });
   }
   createRun(projectId, input) {
     this.project(projectId);
@@ -23280,6 +23495,29 @@ function createMcpServer(service) {
     inputSchema: objectType({ query: stringType().trim().min(1).max(500), limit: numberType().int().min(1).max(200).default(50), projectId: stringType().uuid().optional(), entityTypes: arrayType(enumType(["project", "phase", "work_item", "update", "requirement", "run", "evidence"])).max(10).optional(), state: stringType().trim().max(100).optional(), phaseId: stringType().uuid().optional(), requirementId: stringType().uuid().optional(), evidenceResult: enumType(["recorded", "verified", "failed", "interrupted"]).optional(), from: stringType().datetime({ offset: true }).optional(), to: stringType().datetime({ offset: true }).optional() }),
     annotations: readOnly
   }, async ({ query, limit: limit2, ...filters }) => result(service.search(query, limit2, filters)));
+  server2.registerTool("report_error", {
+    description: "Report a concrete or strongly suspected fault in Istra’s MCP tools, plugins, instructions or workflow. Report only Istra faults after a quick sanity check; do not report user-project bugs, expected validation errors, or failures of this tool itself. Keep evidence concise and sanitised, then continue the user’s task.",
+    inputSchema: CreateErrorReportSchema.extend({
+      idempotencyKey: stringType().trim().min(1).max(200).describe("A task-scoped key reused only to retry this identical report."),
+      client
+    }).strict(),
+    annotations: write
+  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.reportError(input, source(clientName), idempotencyKey)));
+  server2.registerTool("list_error_reports_page", {
+    description: "Read a bounded page of unresolved Istra error reports. Use only when explicitly asked to triage the inbox.",
+    inputSchema: ErrorReportPageRequestSchema,
+    annotations: readOnly
+  }, async (page) => result(service.listErrorReportsPage(page)));
+  server2.registerTool("get_error_report", {
+    description: "Read one Istra error report and its creation and triage history. Use only when explicitly asked to triage the inbox.",
+    inputSchema: objectType({ reportId: stringType().uuid() }),
+    annotations: readOnly
+  }, async ({ reportId }) => result(required(service.getErrorReport(reportId), "Error report", reportId)));
+  server2.registerTool("update_error_report", {
+    description: "Set the triage status or note for an Istra error report using optimistic concurrency. Use only when explicitly asked to triage the inbox.",
+    inputSchema: UpdateErrorReportSchema.extend({ reportId: stringType().uuid(), client }).strict(),
+    annotations: write
+  }, async ({ reportId, client: clientName, ...input }) => result(await service.updateErrorReport(reportId, input, source(clientName))));
   server2.registerTool("list_labels", {
     description: "List labels available to work items.",
     inputSchema: objectType({}),
@@ -23477,10 +23715,7 @@ function createMcpServer(service) {
   }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspaceRevision(input, idempotencyKey, source(clientName))));
   server2.registerTool("create_run", {
     description: "Record a bounded command/test execution with redacted excerpts.",
-    inputSchema: CreateRunObjectSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }).superRefine((run, context) => {
-      const parsed = CreateRunSchema.safeParse(run);
-      if (!parsed.success) for (const issue2 of parsed.error.issues) context.addIssue(issue2);
-    }),
+    inputSchema: CreateRunObjectSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }).strict(),
     annotations: write
   }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("list_runs", {

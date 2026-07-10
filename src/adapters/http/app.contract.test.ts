@@ -167,7 +167,7 @@ describe('HTTP API contract', () => {
     expect(exportResponse.statusCode).toBe(200)
     expect(exportResponse.headers['content-disposition']).toContain('attachment;')
     const exported = exportResponse.json() as ExportBundle
-    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 3 })
+    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 4 })
     expect(exported).not.toHaveProperty('data')
 
     const importResponse = await app.inject({

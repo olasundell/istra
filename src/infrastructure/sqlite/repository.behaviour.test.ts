@@ -231,13 +231,20 @@ describe('SQLite repository behaviour', () => {
     expect(repository.listWorkItems(project.id).find(({ id }) => id === child.id)?.parentId).toBe(parent.id)
   })
 
-  it('accepts current v3 exports and rejects obsolete format versions', () => {
+  it('exports v4 inbox data while accepting legacy v3 imports with an empty inbox', () => {
     const project = repository.createProject({ title: 'Current export' }, provenance)
     const current = repository.exportAll()
 
-    expect(current.formatVersion).toBe(3)
+    expect(current.formatVersion).toBe(4)
     expect(() => repository.validateImport(current)).not.toThrow()
     repository.importAll(current)
+    expect(repository.getProject(project.id)?.title).toBe('Current export')
+
+    const legacy = structuredClone(current) as unknown as ExportBundle
+    legacy.formatVersion = 3
+    delete legacy.tables.error_reports
+    expect(() => repository.validateImport(legacy)).not.toThrow()
+    repository.importAll(legacy)
     expect(repository.getProject(project.id)?.title).toBe('Current export')
 
     for (const formatVersion of [1, 2]) {

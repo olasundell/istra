@@ -7,6 +7,8 @@ description: Use Istra as durable operational project memory through its MCP too
 
 Use Istra as the only durable data path for project memory. Do not read or edit its SQLite database directly, and do not recreate Istra state in files, comments or another tracker.
 
+If Istra’s MCP tools, plugin packaging, bundled instructions or prescribed workflow appears faulty, invoke `$istra-error-reporting` and follow its bounded reporting policy. Do not use project work items to report Istra faults.
+
 ## Begin Work
 
 1. Call `resolve_project` first with the current checkout path.

@@ -2,6 +2,12 @@
 
 Use Istra as the only durable data path for project memory. Do not read or edit its SQLite database directly, and do not recreate Istra state in files, comments, or another tracker.
 
+## Report Istra faults
+
+Call `istra_report_error` autonomously after a quick sanity check when Istra’s MCP tools, plugin packaging, bundled instructions, or prescribed workflow appears to contradict its contract, lose or corrupt state, or present a materially unsafe, contradictory, impossible, or repeatedly misleading design. Use `kind: "bug"` for contradicted behaviour and `kind: "design"` for design concerns; keep observations separate from inferences and provide concise, sanitised evidence.
+
+Report once per root cause with a task-scoped idempotency key, reusing that key only for an identical retry. Do not search for duplicates, ask conversational permission, block the user’s task, or read or update the inbox unless explicitly asked to triage it. Never report user-project bugs, ordinary failed commands/tests, expected validation or concurrency errors, unrelated environment failures, stylistic preferences, or faults caused by your own invalid input. Do not include credentials, tokens, personal data, private source, or unbounded logs. Never recursively report a failure of `istra_report_error` or fall back to work items, updates, REST, or direct SQLite; mention the reporting failure once if material and continue.
+
 ## Begin work
 
 1. Call `istra_resolve_project` first with the current checkout path.

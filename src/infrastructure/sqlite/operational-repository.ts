@@ -32,11 +32,15 @@ import type {
   Workspace,
   WorkspaceRevision,
   ArtifactReference,
+  ActivityEvent,
+  CreateErrorReportInput,
+  ErrorReport,
   Page,
   SearchFilters,
   SearchResult,
   MutationContext,
   RedactionMetadata,
+  UpdateErrorReportInput,
   ValidationStatus,
 } from '../../domain/contracts.js'
 import { ConflictError, IdempotencyConflictError, NotFoundError, ValidationError } from '../../application/errors.js'
@@ -93,6 +97,10 @@ export interface OperationalRepository {
   createEvidence(projectId: string, input: CreateEvidenceInput): Evidence
   listEvidence(projectId: string, includeStale?: boolean): Evidence[]
   listEvidencePage(projectId: string, limit: number, cursor?: string | null, includeStale?: boolean): Page<Evidence>
+  createErrorReport(input: CreateErrorReportInput): ErrorReport
+  listErrorReportsPage(limit: number, cursor?: string | null, statuses?: ErrorReport['status'][], kinds?: ErrorReport['kind'][], component?: string): Page<ErrorReport>
+  getErrorReport(id: string): { report: ErrorReport; history: ActivityEvent[] } | null
+  updateErrorReport(id: string, input: UpdateErrorReportInput): ErrorReport
   captureCheckpointSnapshot(projectId: string, checkpointId: string): CheckpointSnapshot
   getCheckpointSnapshot(checkpointId: string): CheckpointSnapshot | null
   compareCheckpointSnapshots(leftCheckpointId: string, rightCheckpointId: string): CheckpointComparison
@@ -544,9 +552,86 @@ export class SqliteOperationalRepository implements OperationalRepository {
     return selected.map((row) => ({ id: String(row.id), title: String(row.title), description: textOrNull(row.description), intent: textOrNull(row.intent), deadline: textOrNull(row.deadline), completionCriteria: textOrNull(row.completion_criteria), state: String(row.state) as Project['state'], currentFocus: textOrNull(row.current_focus), nextAction: textOrNull(row.next_action), blockers: json<string[]>(row.blockers_json, []), currentCheckpointId: textOrNull(row.current_checkpoint_id), archivedAt: textOrNull(row.archived_at), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at), lastActivityAt: String(row.last_activity_at) }))
   }
 
-  private secretRedactor(projectId: string): SecretRedactor {
-    const secretNames = (this.db.prepare('SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name').all(projectId) as Row[]).map((row) => String(row.name))
+  private secretRedactor(projectId?: string | null): SecretRedactor {
+    const secretNames = projectId ? (this.db.prepare('SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name').all(projectId) as Row[]).map((row) => String(row.name)) : []
     return new SecretRedactor({ secretNames })
+  }
+
+  private errorReportFromRow(row: Row): ErrorReport {
+    return {
+      id: String(row.id), kind: String(row.kind) as ErrorReport['kind'], component: String(row.component), summary: String(row.summary), observation: String(row.observation),
+      expectedBehaviour: textOrNull(row.expected_behaviour), actualBehaviour: textOrNull(row.actual_behaviour), reproductionSteps: json<string[]>(row.reproduction_steps_json, []),
+      impact: textOrNull(row.impact), projectId: textOrNull(row.project_id), workspacePath: textOrNull(row.workspace_path),
+      status: String(row.status) as ErrorReport['status'], triageNote: textOrNull(row.triage_note), source: String(row.source) as ErrorReport['source'],
+      client: textOrNull(row.client), actor: String(row.actor), redaction: json<RedactionMetadata>(row.redaction_json, { count: 0, fields: [] }),
+      version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+    }
+  }
+
+  createErrorReport(input: CreateErrorReportInput): ErrorReport {
+    if (input.projectId) this.project(input.projectId)
+    const id = randomUUID(); const timestamp = now(); const context = this.mutationContext(); const redactor = this.secretRedactor(input.projectId)
+    const component = redactor.redact(input.component)
+    const summary = redactor.redact(input.summary)
+    const observation = redactor.redact(input.observation)
+    const expectedBehaviour = input.expectedBehaviour ? redactor.redact(input.expectedBehaviour) : null
+    const actualBehaviour = input.actualBehaviour ? redactor.redact(input.actualBehaviour) : null
+    const reproductionSteps = (input.reproductionSteps ?? []).map((step) => redactor.redact(step))
+    const impact = input.impact ? redactor.redact(input.impact) : null
+    const workspacePath = input.workspacePath ? redactor.redact(input.workspacePath) : null
+    const redaction = redactionMetadata([
+      { field: 'component', result: component }, { field: 'summary', result: summary }, { field: 'observation', result: observation },
+      ...(expectedBehaviour ? [{ field: 'expectedBehaviour', result: expectedBehaviour }] : []),
+      ...(actualBehaviour ? [{ field: 'actualBehaviour', result: actualBehaviour }] : []),
+      ...reproductionSteps.map((result, index) => ({ field: `reproductionSteps.${index}`, result })),
+      ...(impact ? [{ field: 'impact', result: impact }] : []),
+      ...(workspacePath ? [{ field: 'workspacePath', result: workspacePath }] : []),
+    ])
+    return this.transaction(() => {
+      this.db.prepare('INSERT INTO error_reports(id,kind,component,summary,observation,expected_behaviour,actual_behaviour,reproduction_steps_json,impact,project_id,workspace_path,status,triage_note,source,client,actor,redaction_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(id, input.kind, component.value, summary.value, observation.value, expectedBehaviour?.value ?? null, actualBehaviour?.value ?? null, JSON.stringify(reproductionSteps.map((result) => result.value)), impact?.value ?? null, input.projectId ?? null, workspacePath?.value ?? null, 'open', null, context.source, context.client ?? null, context.actor, JSON.stringify(redaction), timestamp, timestamp)
+      this.event(null, 'error_report', id, 'error_report.created', { kind: input.kind, component: component.value, redactionCount: redaction.count })
+      return this.errorReportFromRow(this.db.prepare('SELECT * FROM error_reports WHERE id=?').get(id) as Row)
+    })
+  }
+
+  listErrorReportsPage(limit: number, cursor?: string | null, statuses?: ErrorReport['status'][], kinds?: ErrorReport['kind'][], component?: string): Page<ErrorReport> {
+    const selectedStatuses = statuses ?? ['open', 'acknowledged']
+    const clauses: string[] = []
+    const parameters: string[] = []
+    clauses.push(`status IN (${selectedStatuses.map(() => '?').join(',')})`); parameters.push(...selectedStatuses)
+    if (kinds?.length) { clauses.push(`kind IN (${kinds.map(() => '?').join(',')})`); parameters.push(...kinds) }
+    if (component) { clauses.push('component=?'); parameters.push(component) }
+    const rows = this.db.prepare(`SELECT * FROM error_reports WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC,id DESC`).all(...parameters) as Row[]
+    return pageOf(rows.map((row) => this.errorReportFromRow(row)), limit, cursor)
+  }
+
+  getErrorReport(id: string): { report: ErrorReport; history: ActivityEvent[] } | null {
+    const row = this.db.prepare('SELECT * FROM error_reports WHERE id=?').get(id) as Row | undefined
+    if (!row) return null
+    const history = (this.db.prepare("SELECT * FROM activity_events WHERE entity_type='error_report' AND entity_id=? ORDER BY created_at DESC,id DESC").all(id) as Row[]).map((event) => ({
+      id: String(event.id), projectId: textOrNull(event.project_id), entityType: String(event.entity_type), entityId: String(event.entity_id), eventType: String(event.event_type),
+      payload: json<Record<string, unknown>>(event.payload_json, {}), source: String(event.source) as ActivityEvent['source'], client: textOrNull(event.client), actor: String(event.actor), idempotencyKey: textOrNull(event.idempotency_key), createdAt: String(event.created_at),
+    }))
+    return { report: this.errorReportFromRow(row), history }
+  }
+
+  updateErrorReport(id: string, input: UpdateErrorReportInput): ErrorReport {
+    const row = this.db.prepare('SELECT * FROM error_reports WHERE id=?').get(id) as Row | undefined
+    if (!row) throw new NotFoundError('Error report', id)
+    const current = this.errorReportFromRow(row)
+    const redactor = this.secretRedactor(current.projectId)
+    const triageNote = input.triageNote === undefined ? undefined : input.triageNote === null ? null : redactor.redact(input.triageNote)
+    const redaction = triageNote && triageNote !== null
+      ? { count: current.redaction.count + triageNote.count, fields: [...new Set([...current.redaction.fields, ...redactionMetadata([{ field: 'triageNote', result: triageNote }]).fields])] }
+      : current.redaction
+    return this.transaction(() => {
+      const result = this.db.prepare('UPDATE error_reports SET status=?,triage_note=?,redaction_json=?,version=version+1,updated_at=? WHERE id=? AND version=?')
+        .run(input.status, triageNote === undefined ? current.triageNote : triageNote?.value ?? null, JSON.stringify(redaction), now(), id, input.expectedVersion)
+      if (!Number(result.changes)) throw new ConflictError('Error report', id)
+      this.event(null, 'error_report', id, 'error_report.status_updated', { from: current.status, to: input.status, triageNoteUpdated: triageNote !== undefined, redactionCount: redaction.count })
+      return this.errorReportFromRow(this.db.prepare('SELECT * FROM error_reports WHERE id=?').get(id) as Row)
+    })
   }
 
   createRun(projectId: string, input: CreateRunInput): { run: Run; testSummary: TestSummary | null; artifacts: ArtifactReference[] } {

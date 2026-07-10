@@ -10,13 +10,14 @@
     "checkpoints",
     "requirements",
     "evidence",
+    "error-reporting",
     "local-first"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Istra",
     "shortDescription": "Operational memory with durable proof",
-    "longDescription": "Resolve the current checkout, maintain requirements, ordered work, blockers, runs and evidence, and save authoritative checkpoints through Istra's local MCP server.",
+    "longDescription": "Resolve the current checkout, maintain requirements, ordered work, blockers, runs and evidence, save authoritative checkpoints, and report perceived Istra faults through the local MCP server.",
     "developerName": "Istra contributors",
     "category": "Productivity",
     "capabilities": [
@@ -26,7 +27,7 @@
     "defaultPrompt": [
       "Open the Istra project linked to this checkout and show its current requirements and work queue.",
       "Record this verification run and link its evidence to the relevant acceptance criterion.",
-      "Reconcile blockers and stale evidence, then save an authoritative checkpoint."
+      "Report this perceived Istra MCP, plugin, instruction or workflow fault with concise sanitised evidence."
     ],
     "brandColor": "#2458B5"
   },

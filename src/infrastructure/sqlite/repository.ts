@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { ConflictError, NotFoundError, ValidationError } from '../../application/errors.js'
 import type { ExportBundle, IstraRepository } from '../../application/ports.js'
-import { PulseSnapshotSchema } from '../../domain/contracts.js'
+import { CreateErrorReportSchema, PulseSnapshotSchema, UpdateErrorReportSchema } from '../../domain/contracts.js'
 import type {
   ActivityEvent,
   CheckpointInput,
@@ -80,6 +80,7 @@ function revisionFromRow(row: SqlRow): UpdateRevision {
 
 const exportTables: Record<string, string[]> = {
   projects: ['id','title','description','intent','deadline','completion_criteria','state','current_focus','next_action','blockers_json','current_checkpoint_id','archived_at','version','created_at','updated_at','last_activity_at'],
+  error_reports: ['id','kind','component','summary','observation','expected_behaviour','actual_behaviour','reproduction_steps_json','impact','project_id','workspace_path','status','triage_note','source','client','actor','redaction_json','version','created_at','updated_at'],
   phases: ['id','project_id','name','description','status','position','archived_at','version','created_at','updated_at'],
   work_items: ['id','project_id','phase_id','stable_key','parent_id','kind','title','description','status','priority','version','created_at','updated_at'],
   labels: ['id','name','colour','version','created_at','updated_at'],
@@ -615,13 +616,13 @@ export class SqliteIstraRepository implements IstraRepository {
   exportAll(): ExportBundle {
     const tables: ExportBundle['tables'] = {}
     for (const [table, columns] of Object.entries(exportTables)) tables[table] = this.db.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all() as Array<Record<string, unknown>>
-    return { format: 'istra-export', formatVersion: 3, exportedAt: now(), tables }
+    return { format: 'istra-export', formatVersion: 4, exportedAt: now(), tables }
   }
 
   validateImport(bundle: ExportBundle): void {
     const temp = new DatabaseSync(':memory:')
     try {
-      if (bundle.formatVersion !== 3) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`)
+      if (![3, 4].includes(bundle.formatVersion)) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`)
       temp.exec('PRAGMA foreign_keys=ON;')
       for (const migration of migrations) temp.exec(migration.sql)
       temp.exec('BEGIN; PRAGMA defer_foreign_keys=ON;')
@@ -676,12 +677,13 @@ export class SqliteIstraRepository implements IstraRepository {
         return violations.length ? [{ evidenceId: String(evidence.id), violations }] : []
       })
       const redactors = new Map<string, SecretRedactor>()
-      const redactorFor = (projectId: string): SecretRedactor => {
-        const existing = redactors.get(projectId)
+      const redactorFor = (projectId: string | null): SecretRedactor => {
+        const cacheKey = projectId ?? '__global__'
+        const existing = redactors.get(cacheKey)
         if (existing) return existing
-        const secretNames = (temp.prepare('SELECT name FROM project_secret_names WHERE project_id=?').all(projectId) as SqlRow[]).map((row) => String(row.name))
+        const secretNames = projectId ? (temp.prepare('SELECT name FROM project_secret_names WHERE project_id=?').all(projectId) as SqlRow[]).map((row) => String(row.name)) : []
         const redactor = new SecretRedactor({ secretNames })
-        redactors.set(projectId, redactor)
+        redactors.set(cacheKey, redactor)
         return redactor
       }
       const invalidRedactions: Array<{ entityType: string; entityId: string; field: string }> = []
@@ -705,6 +707,29 @@ export class SqliteIstraRepository implements IstraRepository {
         LEFT JOIN evidence_artifact_links l ON l.artifact_id=a.id
         LEFT JOIN evidence e ON e.id=l.evidence_id`).all() as SqlRow[]) {
         if (artifact.project_id && redactorFor(String(artifact.project_id)).redact(String(artifact.uri)).redacted) invalidRedactions.push({ entityType: 'artifact', entityId: String(artifact.id), field: 'uri' })
+      }
+      const invalidErrorReports: Array<{ reportId: string; reason: string }> = []
+      for (const report of temp.prepare('SELECT * FROM error_reports').all() as SqlRow[]) {
+        const reproductionSteps = parseJson<unknown>(report.reproduction_steps_json, null)
+        const creation = CreateErrorReportSchema.safeParse({
+          kind: report.kind, component: report.component, summary: report.summary, observation: report.observation,
+          expectedBehaviour: report.expected_behaviour, actualBehaviour: report.actual_behaviour, reproductionSteps,
+          impact: report.impact, projectId: report.project_id, workspacePath: report.workspace_path,
+        })
+        const triage = UpdateErrorReportSchema.safeParse({ expectedVersion: report.version, status: report.status, triageNote: report.triage_note })
+        if (!creation.success || !triage.success) {
+          invalidErrorReports.push({ reportId: String(report.id), reason: 'error report does not satisfy its input constraints' })
+          continue
+        }
+        const validatedReproductionSteps = creation.data.reproductionSteps ?? []
+        const redactor = redactorFor(textOrNull(report.project_id))
+        const fields: Record<string, unknown> = {
+          component: report.component, summary: report.summary, observation: report.observation,
+          expected_behaviour: report.expected_behaviour, actual_behaviour: report.actual_behaviour,
+          reproduction_steps: validatedReproductionSteps.join('\n'), impact: report.impact,
+          workspace_path: report.workspace_path, triage_note: report.triage_note,
+        }
+        for (const [field, value] of Object.entries(fields)) if (typeof value === 'string' && redactor.redact(value).redacted) invalidRedactions.push({ entityType: 'error_report', entityId: String(report.id), field })
       }
       const invalidStructuredSnapshots = (temp.prepare(`SELECT s.id,s.document_json,s.digest,u.project_id
         FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id`).all() as SqlRow[]).flatMap((snapshot) => {
@@ -805,8 +830,8 @@ export class SqliteIstraRepository implements IstraRepository {
         const workItemCount = workItemIds.length ? Number((temp.prepare(`SELECT COUNT(*) AS count FROM work_items WHERE project_id=? AND id IN (${workItemIds.map(() => '?').join(',')})`).get(String(row.project_id), ...workItemIds) as SqlRow).count) : 0
         if (phaseCount !== new Set(phaseIds).size || workItemCount !== new Set(workItemIds).size) invalidSnapshots.push({ updateId: String(row.id), reason: 'snapshot references an entity outside the project' })
       }
-      if (integrity.integrity_check !== 'ok' || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length || invalidStructuredSnapshots.length || orphanArtifacts.length || invalidRuns.length || invalidEvidence.length || invalidRedactions.length) {
-        throw new ValidationError('Import failed database integrity checks', { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots, invalidStructuredSnapshots, orphanArtifacts, invalidRuns, invalidEvidence, invalidRedactions })
+      if (integrity.integrity_check !== 'ok' || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length || invalidStructuredSnapshots.length || orphanArtifacts.length || invalidRuns.length || invalidEvidence.length || invalidErrorReports.length || invalidRedactions.length) {
+        throw new ValidationError('Import failed database integrity checks', { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots, invalidStructuredSnapshots, orphanArtifacts, invalidRuns, invalidEvidence, invalidErrorReports, invalidRedactions })
       }
     } catch (error) {
       if (error instanceof ValidationError) throw error
@@ -835,7 +860,10 @@ export class SqliteIstraRepository implements IstraRepository {
   private loadTables(db: DatabaseSync, bundle: ExportBundle): void {
     for (const [table, columns] of Object.entries(exportTables)) {
       const rows = bundle.tables[table]
-      if (!Array.isArray(rows)) throw new ValidationError(`Import is missing table ${table}`)
+      if (!Array.isArray(rows)) {
+        if (bundle.formatVersion === 3 && table === 'error_reports') continue
+        throw new ValidationError(`Import is missing table ${table}`)
+      }
       const statement = db.prepare(`INSERT INTO ${table}(${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
       for (const row of rows) statement.run(...columns.map((column) => {
         const key = column.replaceAll('"', '')

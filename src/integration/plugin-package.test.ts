@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CheckpointSaveResult, Project } from "../domain/contracts.js";
+import type { CheckpointSaveResult, ErrorReport, Project } from "../domain/contracts.js";
 import { createRuntime } from "../infrastructure/runtime.js";
 
 const pluginRoot = resolve("plugins/istra");
@@ -22,6 +22,8 @@ describe("Codex plugin package", () => {
     const mcp = JSON.parse(await readFile(join(pluginRoot, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> };
     const skill = await readFile(join(pluginRoot, "skills/istra-project-memory/SKILL.md"), "utf8");
     const agentMetadata = await readFile(join(pluginRoot, "skills/istra-project-memory/agents/openai.yaml"), "utf8");
+    const reportingSkill = await readFile(join(pluginRoot, "skills/istra-error-reporting/SKILL.md"), "utf8");
+    const reportingMetadata = await readFile(join(pluginRoot, "skills/istra-error-reporting/agents/openai.yaml"), "utf8");
 
     expect(manifest).toMatchObject({
       name: "istra",
@@ -29,7 +31,7 @@ describe("Codex plugin package", () => {
       mcpServers: "./.mcp.json",
       skills: "./skills/",
       interface: {
-        longDescription: expect.stringMatching(/requirements, ordered work, blockers, runs and evidence/i),
+        longDescription: expect.stringMatching(/report perceived Istra faults/i),
         defaultPrompt: expect.arrayContaining([
           expect.stringMatching(/requirements and work queue/i),
           expect.stringMatching(/verification run and link its evidence/i),
@@ -38,6 +40,9 @@ describe("Codex plugin package", () => {
     });
     expect(mcp.mcpServers).toHaveProperty("istra");
     expect(agentMetadata).toMatch(/requirements, work and evidence/i);
+    expect(reportingMetadata).toMatch(/allow_implicit_invocation: true/);
+    expect(reportingSkill).toMatch(/report concrete or strongly suspected faults/i);
+    expect(reportingSkill).toContain("Never report a `report_error` failure");
     expect(skill).toContain("Call `resolve_project` first with the current checkout path.");
     expect(skill).toContain("Call `get_project_pulse_summary`");
     for (const tool of ["list_requirements_page", "list_operational_work_items_page", "list_external_blockers", "list_evidence_page"]) {
@@ -80,6 +85,10 @@ describe("Codex plugin package", () => {
         "list_evidence_page",
         "list_operational_work_items_page",
         "list_requirements_page",
+        "report_error",
+        "list_error_reports_page",
+        "get_error_report",
+        "update_error_report",
         "resolve_project",
         "save_checkpoint",
         "search",
@@ -117,8 +126,23 @@ describe("Codex plugin package", () => {
       expect(checkpoint.snapshot.id).not.toHaveLength(0);
       expect(checkpoint.snapshot.digest).toMatch(/^[a-f0-9]{64}$/);
 
+      const reported = await client.callTool({
+        name: "report_error",
+        arguments: {
+          kind: "design",
+          component: "instructions",
+          summary: "The error-reporting policy is misleading",
+          observation: "A workflow instruction contradicts the tool contract.",
+          idempotencyKey: "plugin-package-error-report",
+          client: "plugin-package-test",
+        },
+      });
+      const report = (reported.structuredContent as { result: ErrorReport }).result;
+      expect(report).toMatchObject({ kind: "design", status: "open" });
+
       const application = await createRuntime({ dataDir });
       expect(application.service.getProject(project.id)?.project.title).toBe("Plugin-visible project");
+      expect(application.service.getErrorReport(report.id)?.report).toMatchObject({ id: report.id, kind: "design" });
       application.close();
     } finally {
       await client.close();

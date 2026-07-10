@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { ActivityEvent, Project, ProjectDetail } from '../../domain/contracts.js'
+import type { ActivityEvent, ErrorReport, Project, ProjectDetail } from '../../domain/contracts.js'
 import { createRuntime } from '../../infrastructure/runtime.js'
 import { createMcpServer } from './server.js'
 
@@ -44,6 +44,10 @@ describe('MCP server contract', () => {
       'archive_project',
       'backfill_legacy_checkpoint_snapshot',
       'create_evidence',
+      'report_error',
+      'list_error_reports_page',
+      'get_error_report',
+      'update_error_report',
       'create_phase',
       'create_project',
       'create_update',
@@ -64,6 +68,36 @@ describe('MCP server contract', () => {
     expect(byName.has('hard_delete_update')).toBe(false)
     expect(byName.has('capture_checkpoint_snapshot')).toBe(false)
     expect((byName.get('create_evidence')?.inputSchema as { properties?: Record<string, unknown> }).properties).not.toHaveProperty('override')
+
+    const errorReportSchema = byName.get('report_error')?.inputSchema as { properties?: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }
+    expect(errorReportSchema.required).toEqual(expect.arrayContaining(['kind', 'component', 'summary', 'observation', 'idempotencyKey']))
+    expect(errorReportSchema.required).not.toContain('projectId')
+    expect(errorReportSchema.additionalProperties).toBe(false)
+
+    const createRunSchema = byName.get('create_run')?.inputSchema as {
+      properties?: Record<string, { type?: string; anyOf?: Array<{ type?: string }> }>
+      required?: string[]
+    }
+    expect(Object.keys(createRunSchema.properties ?? {})).toEqual(expect.arrayContaining([
+      'projectId',
+      'idempotencyKey',
+      'command',
+      'workingDirectory',
+      'startedAt',
+      'endedAt',
+      'outcome',
+      'exitCode',
+      'toolchain',
+      'stdoutExcerpt',
+      'stderrExcerpt',
+      'testSummary',
+    ]))
+    expect(createRunSchema.required).toEqual(expect.arrayContaining(['projectId', 'idempotencyKey', 'command']))
+    expect(createRunSchema.properties?.exitCode?.anyOf).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'integer' }),
+    ]))
+    expect(createRunSchema.properties?.toolchain).toMatchObject({ type: 'object' })
+    expect(createRunSchema.properties?.testSummary).toMatchObject({ type: 'object' })
 
     for (const tool of tools) expect(tool.annotations?.destructiveHint).toBe(false)
     for (const readTool of ['list_projects', 'get_project_pulse', 'list_work_items', 'search']) {
@@ -128,6 +162,39 @@ describe('MCP server contract', () => {
       arguments: { title: 'Visible to HTTP services' },
     }))
     expect(runtime.service.getProject(mcpProject.id)?.project.title).toBe('Visible to HTTP services')
+  })
+
+  it('reports and triages Istra faults through strict, idempotent MCP tools', async () => {
+    const arguments_ = {
+      kind: 'bug', component: 'mcp:create_run', summary: 'Secret leaked in an error response',
+      observation: 'TOKEN=secret appeared in an MCP response.', expectedBehaviour: 'Secrets are redacted.', actualBehaviour: 'TOKEN=secret was visible.',
+      reproductionSteps: ['Call create_run with TOKEN=secret.'], impact: 'Sensitive data could be exposed.',
+      idempotencyKey: 'mcp-error-report-1', client: 'codex-error-reporter',
+    }
+    const created = await client.callTool({ name: 'report_error', arguments: arguments_ })
+    expect(created.isError).not.toBe(true)
+    const report = structured<ErrorReport>(created)
+    expect(report).toMatchObject({ kind: 'bug', status: 'open', source: 'mcp', client: 'codex-error-reporter' })
+    expect(report.observation).toContain('[REDACTED]')
+
+    const replay = structured<ErrorReport>(await client.callTool({ name: 'report_error', arguments: arguments_ }))
+    expect(replay.id).toBe(report.id)
+    const changedPayload = await client.callTool({ name: 'report_error', arguments: { ...arguments_, summary: 'Different report' } })
+    expect(changedPayload.isError).toBe(true)
+    const invalidPayload = await client.callTool({ name: 'report_error', arguments: { ...arguments_, idempotencyKey: 'mcp-error-report-invalid', unexpected: true } })
+    expect(invalidPayload.isError).toBe(true)
+    const invalidKind = await client.callTool({ name: 'report_error', arguments: { ...arguments_, idempotencyKey: 'mcp-error-report-kind', kind: 'incident' } })
+    expect(invalidKind.isError).toBe(true)
+
+    const listed = structured<{ items: ErrorReport[] }>(await client.callTool({ name: 'list_error_reports_page', arguments: {} }))
+    expect(listed.items.map(({ id }) => id)).toContain(report.id)
+    const detail = structured<{ report: ErrorReport; history: ActivityEvent[] }>(await client.callTool({ name: 'get_error_report', arguments: { reportId: report.id } }))
+    expect(detail.history).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'error_report.created' })]))
+
+    const acknowledged = structured<ErrorReport>(await client.callTool({ name: 'update_error_report', arguments: { reportId: report.id, expectedVersion: report.version, status: 'acknowledged', triageNote: 'Investigating the redaction boundary.', client: 'codex-triage' } }))
+    expect(acknowledged).toMatchObject({ status: 'acknowledged', version: report.version + 1 })
+    const stale = await client.callTool({ name: 'update_error_report', arguments: { reportId: report.id, expectedVersion: report.version, status: 'resolved' } })
+    expect(stale.isError).toBe(true)
   })
 
   it('preserves existing MCP write call shapes without idempotency keys', async () => {
