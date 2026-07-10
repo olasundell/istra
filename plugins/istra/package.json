@@ -2,6 +2,7 @@
   "name": "opencode-istra",
   "version": "0.1.0",
   "description": "Durable operational project memory for OpenCode.",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/server.mjs",
   "exports": {
@@ -27,5 +28,5 @@
     "project-memory",
     "local-first"
   ],
-  "license": "UNLICENSED"
+  "license": "MIT"
 }

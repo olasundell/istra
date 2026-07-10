@@ -1,6 +1,33 @@
 # Istra
 
-Istra is a local, single-user project memory for work that does not necessarily have a fixed goal or finish line. It keeps a structured current pulse alongside a durable journal of checkpoints, decisions, discoveries, issues and state changes.
+> Durable project memory for the work between the plan and the proof.
+
+Istra is a local-first command centre for open-ended work. It keeps the current pulse visible, turns decisions and next actions into a searchable journal, and connects requirements to work, runs, evidence and checkpoints so the next session can start with context instead of archaeology.
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.jpg" alt="Istra dashboard showing a list of projects and recent activity" width="49%">
+  <img src="docs/screenshots/project-detail.jpg" alt="Istra project detail showing the current pulse and operational memory" width="49%">
+</p>
+<p align="center"><sub>A focused dashboard for the whole portfolio, then a deep project view for the work that matters today.</sub></p>
+
+<p align="center">
+  <img src="docs/screenshots/search.jpg" alt="Istra search showing results across project memory" width="49%">
+  <img src="docs/screenshots/project-detail-mobile.jpg" alt="Istra project detail on a mobile viewport" width="32%">
+</p>
+<p align="center"><sub>Search the whole memory, and keep the hand-off usable when the screen gets small.</sub></p>
+
+## Why Istra
+
+Most tools capture tasks. Istra captures continuity.
+
+- **Current pulse** — Keep focus, next action and blockers visible at the top of every project.
+- **Operational memory** — Trace intent through requirements, work queues, external blockers, runs and evidence.
+- **Durable journal** — Record progress, decisions, discoveries and checkpoints with revision history.
+- **Searchable by default** — Find a project, phase, work item or remembered decision without reconstructing the story.
+- **Local and calm** — SQLite, loopback-only HTTP, portable exports and backups; no accounts, remote sync or collaboration layer required.
+- **Agent-ready** — Use the same application service from the web UI, MCP, Codex and OpenCode.
+
+Istra is designed for the moment after the meeting, the interrupted investigation or the half-finished build: the important thing is not only what exists, but why it exists, what was proved, and what should happen next.
 
 ## Requirements
 
@@ -113,3 +140,7 @@ pnpm test:e2e       # Playwright browser journeys
 - `src/web` contains the React application.
 
 All HTTP listeners bind to loopback. Browser mutations require JSON and reject foreign Host and Origin values. There are no accounts, remote synchronisation or collaboration features in v1.
+
+## Licence
+
+Istra is licensed under the [MIT License](LICENSE).

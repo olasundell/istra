@@ -2,6 +2,8 @@
   "name": "istra",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
+  "description": "Durable, local-first project memory for open-ended work in Codex.",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
