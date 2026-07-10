@@ -57,16 +57,30 @@ default_tools_approval_mode = "writes"
 
 MCP provides read/search and non-destructive create, edit and archive tools. It deliberately does not expose hard deletion, import or backup restoration.
 
+## Codex plugin
+
+The installable plugin source lives in `plugins/istra`. It packages the stdio MCP server and the `istra-project-memory` skill, which reads the current pulse before substantive work and records durable decisions, unresolved work and closing checkpoints afterwards.
+
+Build the self-contained plugin runtime with:
+
+```bash
+pnpm build:plugin
+```
+
+The resulting `plugins/istra/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Its `.mcp.json` uses the same platform data directory and `ISTRA_DATA_DIR` override as the web application, so the plugin does not create a second data path.
+
 ## Commands
 
 ```bash
 pnpm dev            # API and Vite development servers
 pnpm build          # server and production web build
+pnpm build:plugin   # self-contained MCP runtime for the Codex plugin
 pnpm start          # production-style loopback server
 pnpm migrate        # open the database and apply pending migrations
 pnpm mcp            # stdio MCP server from source
 pnpm typecheck      # browser and server TypeScript checks
 pnpm test           # unit and integration tests
+pnpm test:plugin    # spawn and verify the packaged plugin MCP server
 pnpm test:e2e       # Playwright browser journeys
 ```
 

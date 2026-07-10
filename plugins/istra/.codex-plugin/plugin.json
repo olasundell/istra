@@ -1,0 +1,33 @@
+{
+  "name": "istra",
+  "version": "0.1.0",
+  "description": "Durable local project memory for open-ended work in Codex.",
+  "author": {
+    "name": "Istra contributors"
+  },
+  "keywords": [
+    "project-memory",
+    "checkpoints",
+    "issues",
+    "local-first"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Istra",
+    "shortDescription": "Durable memory for open-ended projects",
+    "longDescription": "Read a project's current pulse before work, search its durable history, capture decisions and issues, and record a closing checkpoint through Istra's local MCP server.",
+    "developerName": "Istra contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Open my current Istra project pulse and help me continue.",
+      "Capture this decision and record a closing checkpoint.",
+      "Search my Istra project memory for related issues."
+    ],
+    "brandColor": "#2458B5"
+  },
+  "mcpServers": "./.mcp.json"
+}

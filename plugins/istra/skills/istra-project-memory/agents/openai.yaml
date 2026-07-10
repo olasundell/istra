@@ -1,0 +1,12 @@
+interface:
+  display_name: "Istra Project Memory"
+  short_description: "Keep durable project pulse and history"
+  default_prompt: "Use $istra-project-memory to pick up this project from its current pulse and record what changes."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "istra"
+      description: "Istra local project-memory MCP server"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true
