@@ -21,9 +21,23 @@ describe("Codex plugin package", () => {
     const manifest = JSON.parse(await readFile(join(pluginRoot, ".codex-plugin/plugin.json"), "utf8")) as Record<string, unknown>;
     const mcp = JSON.parse(await readFile(join(pluginRoot, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> };
     const skill = await readFile(join(pluginRoot, "skills/istra-project-memory/SKILL.md"), "utf8");
+    const agentMetadata = await readFile(join(pluginRoot, "skills/istra-project-memory/agents/openai.yaml"), "utf8");
 
-    expect(manifest).toMatchObject({ name: "istra", mcpServers: "./.mcp.json", skills: "./skills/" });
+    expect(manifest).toMatchObject({
+      name: "istra",
+      description: "Durable operational project memory for open-ended work in Codex.",
+      mcpServers: "./.mcp.json",
+      skills: "./skills/",
+      interface: {
+        longDescription: expect.stringMatching(/requirements, ordered work, blockers, runs and evidence/i),
+        defaultPrompt: expect.arrayContaining([
+          expect.stringMatching(/requirements and work queue/i),
+          expect.stringMatching(/verification run and link its evidence/i),
+        ]),
+      },
+    });
     expect(mcp.mcpServers).toHaveProperty("istra");
+    expect(agentMetadata).toMatch(/requirements, work and evidence/i);
     expect(skill).toContain("Call `resolve_project` first with the current checkout path.");
     expect(skill).toContain("Call `get_project_pulse_summary`");
     for (const tool of ["list_requirements_page", "list_operational_work_items_page", "list_external_blockers", "list_evidence_page"]) {
@@ -58,7 +72,15 @@ describe("Codex plugin package", () => {
       await client.connect(transport);
       const tools = await client.listTools();
       expect(tools.tools.map(({ name }) => name)).toEqual(expect.arrayContaining([
+        "create_evidence",
+        "create_requirement",
+        "create_run",
+        "get_project_pulse_summary",
         "get_project_pulse",
+        "list_evidence_page",
+        "list_operational_work_items_page",
+        "list_requirements_page",
+        "resolve_project",
         "save_checkpoint",
         "search",
       ]));

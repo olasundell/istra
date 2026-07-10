@@ -1,21 +1,22 @@
 {
   "name": "istra",
   "version": "0.1.0",
-  "description": "Durable local project memory for open-ended work in Codex.",
+  "description": "Durable operational project memory for open-ended work in Codex.",
   "author": {
     "name": "Istra contributors"
   },
   "keywords": [
     "project-memory",
     "checkpoints",
-    "issues",
+    "requirements",
+    "evidence",
     "local-first"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Istra",
-    "shortDescription": "Durable memory for open-ended projects",
-    "longDescription": "Read a project's current pulse before work, search its durable history, capture decisions and issues, and record a closing checkpoint through Istra's local MCP server.",
+    "shortDescription": "Operational memory with durable proof",
+    "longDescription": "Resolve the current checkout, maintain requirements, ordered work, blockers, runs and evidence, and save authoritative checkpoints through Istra's local MCP server.",
     "developerName": "Istra contributors",
     "category": "Productivity",
     "capabilities": [
@@ -23,9 +24,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Open my current Istra project pulse and help me continue.",
-      "Capture this decision and record a closing checkpoint.",
-      "Search my Istra project memory for related issues."
+      "Open the Istra project linked to this checkout and show its current requirements and work queue.",
+      "Record this verification run and link its evidence to the relevant acceptance criterion.",
+      "Reconcile blockers and stale evidence, then save an authoritative checkpoint."
     ],
     "brandColor": "#2458B5"
   },

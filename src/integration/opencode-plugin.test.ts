@@ -20,6 +20,7 @@ describe("OpenCode plugin package", () => {
 
     expect(manifest).toMatchObject({
       name: "opencode-istra",
+      description: "Durable operational project memory for OpenCode.",
       type: "module",
       main: "./dist/server.mjs",
       exports: { "./server": "./dist/server.mjs" },

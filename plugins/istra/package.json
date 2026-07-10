@@ -1,7 +1,7 @@
 {
   "name": "opencode-istra",
   "version": "0.1.0",
-  "description": "Durable local project memory for OpenCode.",
+  "description": "Durable operational project memory for OpenCode.",
   "type": "module",
   "main": "./dist/server.mjs",
   "exports": {

@@ -61,7 +61,7 @@ MCP provides read/search and non-destructive create, edit and archive tools. It 
 
 ## Codex plugin
 
-The installable plugin source lives in `plugins/istra`. It packages the stdio MCP server and the `istra-project-memory` skill, which reads the current pulse before substantive work and records durable decisions, unresolved work and closing checkpoints afterwards.
+The installable plugin source lives in `plugins/istra`. It packages the stdio MCP server and the `istra-project-memory` skill, which resolves the current checkout, reconciles requirements, ordered work, blockers and evidence before substantive work, records verification runs, and saves authoritative closing checkpoints afterwards.
 
 Build the self-contained plugin runtime with:
 
@@ -79,7 +79,7 @@ The same `plugins/istra` directory is an npm package named `opencode-istra`. Onc
 opencode plugin opencode-istra --global
 ```
 
-The OpenCode entrypoint adds the bundled local `istra` MCP server and the Istra project-memory instructions. It preserves a pre-existing `mcp.istra` configuration, and uses the same default data directory and `ISTRA_DATA_DIR` override as the application.
+The OpenCode entrypoint adds the bundled local `istra` MCP server and matching operational project-memory instructions. It preserves a pre-existing `mcp.istra` configuration, and uses the same default data directory and `ISTRA_DATA_DIR` override as the application.
 
 For local development before publishing, add the absolute `plugins/istra` path to the `plugin` array in `opencode.json`:
 

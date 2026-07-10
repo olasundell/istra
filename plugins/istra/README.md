@@ -1,6 +1,6 @@
 # Istra for OpenCode
 
-Istra adds durable, local-first project memory to OpenCode. It starts the bundled Node.js MCP server against the same database used by the Istra web application, then supplies the project-memory workflow as OpenCode instructions.
+Istra adds durable, local-first operational project memory to OpenCode. It starts the bundled Node.js MCP server against the same database used by the Istra web application, then supplies the requirements, work-queue, run, evidence and checkpoint workflow as OpenCode instructions.
 
 ## Install
 
