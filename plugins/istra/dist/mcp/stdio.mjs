@@ -9347,7 +9347,7 @@ const unknownType = ZodUnknown.create;
 ZodNever.create;
 const arrayType = ZodArray.create;
 const objectType = ZodObject.create;
-const unionType = ZodUnion.create;
+ZodUnion.create;
 ZodIntersection.create;
 ZodTuple.create;
 const recordType = ZodRecord.create;
@@ -9366,6 +9366,92 @@ const coerce = {
   bigint: ((arg) => ZodBigInt.create({ ...arg, coerce: true })),
   date: ((arg) => ZodDate.create({ ...arg, coerce: true }))
 };
+class RunEvidenceInvariantError extends Error {
+  violations;
+  constructor(violations) {
+    super(violations.map(({ message }) => message).join("; "));
+    this.name = "RunEvidenceInvariantError";
+    this.violations = violations;
+  }
+}
+function violation(code2, path, message) {
+  return { code: code2, path, message };
+}
+function hasExactTestTotal(summary) {
+  return summary.passed + summary.failed + summary.skipped === summary.targetCount;
+}
+function validateRunInvariants(input) {
+  const violations = [];
+  const startedAt = Date.parse(input.startedAt);
+  const hasEnded = input.endedAt !== null && input.endedAt !== void 0;
+  const endedAt = hasEnded ? Date.parse(input.endedAt) : null;
+  if (!Number.isFinite(startedAt)) {
+    violations.push(violation("RUN_STARTED_AT_INVALID", "startedAt", "Run start time must be a valid timestamp"));
+  }
+  if (hasEnded && !Number.isFinite(endedAt)) {
+    violations.push(violation("RUN_ENDED_AT_INVALID", "endedAt", "Run end time must be a valid timestamp"));
+  }
+  if (Number.isFinite(startedAt) && endedAt !== null && Number.isFinite(endedAt) && endedAt < startedAt) {
+    violations.push(violation("RUN_END_BEFORE_START", "endedAt", "Run end time cannot be earlier than its start time"));
+  }
+  const testSummary = input.testSummary ?? null;
+  const exactTestTotal = testSummary === null || hasExactTestTotal(testSummary);
+  if (!exactTestTotal) {
+    violations.push(violation("TEST_TOTAL_MISMATCH", "testSummary.targetCount", "Test target count must equal passed, failed and skipped tests"));
+  }
+  if (input.outcome === "verified") {
+    if (!hasEnded) {
+      violations.push(violation("VERIFIED_RUN_INCOMPLETE", "endedAt", "A verified run must be complete"));
+    }
+    if (input.exitCode !== null && input.exitCode !== void 0 && input.exitCode !== 0) {
+      violations.push(violation("VERIFIED_RUN_NONZERO_EXIT", "exitCode", "A verified run cannot have a non-zero exit code"));
+    }
+    if (testSummary && testSummary.failed > 0) {
+      violations.push(violation("VERIFIED_RUN_FAILED_TESTS", "testSummary.failed", "A verified run cannot contain failed tests"));
+    }
+    const hasSuccessfulExit = input.exitCode === 0;
+    const hasSuccessfulTests = Boolean(testSummary && exactTestTotal && testSummary.passed > 0 && testSummary.failed === 0);
+    if (!hasSuccessfulExit && !hasSuccessfulTests) {
+      violations.push(violation("VERIFIED_RUN_SUCCESS_SIGNAL_REQUIRED", "outcome", "A verified run requires a zero exit code or at least one passing test"));
+    }
+  }
+  if (input.outcome === "failed") {
+    if (!hasEnded) {
+      violations.push(violation("FAILED_RUN_INCOMPLETE", "endedAt", "A failed run must be complete"));
+    }
+    const hasFailedExit = input.exitCode !== null && input.exitCode !== void 0 && input.exitCode !== 0;
+    const hasFailedTests = Boolean(testSummary && testSummary.failed > 0);
+    if (!hasFailedExit && !hasFailedTests) {
+      violations.push(violation("FAILED_RUN_FAILURE_SIGNAL_REQUIRED", "outcome", "A failed run requires a non-zero exit code or at least one failed test"));
+    }
+  }
+  return violations;
+}
+function validateEvidenceInvariants(input, context = {}) {
+  if (input.result !== "verified") return [];
+  if (context.verifiedOverride?.reason.trim()) return [];
+  if (!input.runId) {
+    return [violation("VERIFIED_EVIDENCE_RUN_REQUIRED", "runId", "Verified evidence requires a linked verified run")];
+  }
+  if (!context.linkedRun) {
+    return [violation("VERIFIED_EVIDENCE_RUN_NOT_VALIDATED", "runId", "Verified evidence requires validation of its linked run")];
+  }
+  const violations = [];
+  if (context.linkedRun.id !== input.runId) {
+    violations.push(violation("VERIFIED_EVIDENCE_RUN_MISMATCH", "runId", "Validated run does not match the evidence run"));
+  }
+  if (!context.linkedRun.invariantsValid) {
+    violations.push(violation("VERIFIED_EVIDENCE_RUN_NOT_VALIDATED", "runId", "Verified evidence cannot use a run that failed invariant validation"));
+  }
+  if (context.linkedRun.outcome !== "verified") {
+    violations.push(violation("VERIFIED_EVIDENCE_RUN_NOT_VERIFIED", "runId", "Verified evidence requires a run with verified outcome"));
+  }
+  return violations;
+}
+function assertEvidenceInvariants(input, context = {}) {
+  const violations = validateEvidenceInvariants(input, context);
+  if (violations.length) throw new RunEvidenceInvariantError(violations);
+}
 const projectStates = ["active", "paused", "dormant", "completed"];
 const phaseStates = ["planned", "active", "completed", "abandoned"];
 const workItemKinds = ["issue", "task", "idea", "question", "risk"];
@@ -9377,6 +9463,8 @@ const requirementStateSemantics = ["open", "partial", "proven", "defect"];
 const relationKinds = ["depends_on", "blocks", "relates_to"];
 const runOutcomes = ["recorded", "verified", "failed", "interrupted"];
 const evidenceResults = ["recorded", "verified", "failed", "interrupted"];
+const proofStatuses = ["open", "partial", "proven", "defect"];
+const validationStatuses = ["validated", "legacy_unvalidated", "overridden"];
 const ProjectStateSchema = enumType(projectStates);
 const PhaseStateSchema = enumType(phaseStates);
 const WorkItemKindSchema = enumType(workItemKinds);
@@ -9388,6 +9476,8 @@ const RequirementStateSemanticSchema = enumType(requirementStateSemantics);
 const RelationKindSchema = enumType(relationKinds);
 const RunOutcomeSchema = enumType(runOutcomes);
 const EvidenceResultSchema = enumType(evidenceResults);
+enumType(proofStatuses);
+enumType(validationStatuses);
 const PulseSnapshotSchema = objectType({
   state: ProjectStateSchema,
   currentFocus: stringType().nullable(),
@@ -9474,6 +9564,16 @@ const CreateRequirementStateSchema = objectType({
   position: numberType().int().nonnegative().optional(),
   colour: stringType().regex(/^#[0-9a-fA-F]{6}$/).nullable().optional()
 });
+const AcceptanceCriterionInputSchema = objectType({
+  id: stringType().uuid().optional(),
+  expectedVersion: numberType().int().positive().optional(),
+  title: stringType().trim().min(1).max(500),
+  description: nullableText,
+  required: booleanType().default(true)
+}).superRefine((criterion, context) => {
+  if (criterion.id && criterion.expectedVersion === void 0) context.addIssue({ code: ZodIssueCode.custom, path: ["expectedVersion"], message: "expectedVersion is required when updating an existing criterion" });
+  if (!criterion.id && criterion.expectedVersion !== void 0) context.addIssue({ code: ZodIssueCode.custom, path: ["expectedVersion"], message: "expectedVersion requires an existing criterion id" });
+});
 const CreateRequirementSchema = objectType({
   stableKey: stringType().trim().min(1).max(80).regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
   kind: RequirementKindSchema,
@@ -9483,11 +9583,7 @@ const CreateRequirementSchema = objectType({
   stateId: stringType().uuid().optional(),
   responsiblePhaseId: stringType().uuid().nullable().optional(),
   relatedPhaseIds: arrayType(stringType().uuid()).max(100).optional(),
-  criteria: arrayType(objectType({
-    title: stringType().trim().min(1).max(500),
-    description: nullableText,
-    required: booleanType().default(true)
-  })).max(100).optional()
+  criteria: arrayType(AcceptanceCriterionInputSchema).max(100).optional()
 });
 const UpdateRequirementSchema = CreateRequirementSchema.partial().extend({ expectedVersion: numberType().int().positive() });
 objectType({
@@ -9526,7 +9622,7 @@ const CreateArtifactSchema = objectType({
   byteCount: numberType().int().nonnegative().nullable().optional(),
   digest: stringType().trim().max(200).nullable().optional()
 });
-const CreateRunSchema = objectType({
+const CreateRunObjectSchema = objectType({
   workspaceRevisionId: stringType().uuid().nullable().optional(),
   command: stringType().trim().min(1).max(4e3),
   workingDirectory: stringType().trim().max(4e3).nullable().optional(),
@@ -9548,16 +9644,29 @@ const CreateRunSchema = objectType({
     targetCount: numberType().int().nonnegative()
   }).optional()
 });
+const CreateRunSchema = CreateRunObjectSchema.superRefine((run, context) => {
+  const startedAt = run.startedAt ?? (/* @__PURE__ */ new Date()).toISOString();
+  const endedAt = run.endedAt ?? null;
+  for (const violation2 of validateRunInvariants({ ...run, startedAt, endedAt })) {
+    context.addIssue({
+      code: ZodIssueCode.custom,
+      path: violation2.path.split("."),
+      message: violation2.message
+    });
+  }
+});
 const CreateEvidenceSchema = objectType({
   runId: stringType().uuid().nullable().optional(),
   result: EvidenceResultSchema,
   summary: stringType().trim().min(1).max(4e3),
   targetVersion: numberType().int().positive().nullable().optional(),
   requirementIds: arrayType(stringType().uuid()).max(100).optional(),
+  criterionIds: arrayType(stringType().uuid()).max(100).optional(),
   workItemIds: arrayType(stringType().uuid()).max(100).optional(),
   updateIds: arrayType(stringType().uuid()).max(100).optional(),
   checkpointIds: arrayType(stringType().uuid()).max(100).optional(),
-  artifacts: arrayType(CreateArtifactSchema).max(100).optional()
+  artifacts: arrayType(CreateArtifactSchema).max(100).optional(),
+  override: objectType({ reason: stringType().trim().min(20).max(2e3) }).optional()
 });
 const PageRequestSchema = objectType({
   limit: coerce.number().int().min(1).max(200).default(50),
@@ -9596,11 +9705,10 @@ class IdempotencyConflictError extends AppError {
 }
 const ExportBundleSchema = objectType({
   format: literalType("istra-export"),
-  formatVersion: unionType([literalType(1), literalType(2)]),
+  formatVersion: literalType(3),
   exportedAt: stringType().datetime({ offset: true }),
   tables: recordType(arrayType(recordType(unknownType())))
 }).strict();
-const provenance = (value) => ({ source: value?.source ?? "ui", client: value?.client });
 const queryBoolean = (value) => value === true || value === "true";
 class IstraService {
   constructor(repository, backups, operational) {
@@ -9620,16 +9728,25 @@ class IstraService {
     if (!result2.success) throw new ValidationError("Input validation failed", result2.error.flatten());
     return result2.data;
   }
-  async write(operation) {
-    await this.backups.beforeWrite();
-    return operation();
+  mutationContext(caller = {}, key) {
+    const provenance = typeof caller === "string" ? { source: "ui", client: caller } : caller;
+    const client2 = provenance.client ?? provenance.actor ?? provenance.source ?? "ui";
+    return {
+      source: provenance.source ?? "ui",
+      actor: (provenance.actor ?? client2) || "local-user",
+      client: client2,
+      idempotencyKey: key ?? provenance.idempotencyKey ?? null,
+      occurredAt: provenance.occurredAt ?? (/* @__PURE__ */ new Date()).toISOString()
+    };
   }
-  async writeIdempotent(clientName, key, operationName, payload, operation) {
+  async writeOperational(caller, key, operationName, payload, operation) {
     await this.backups.beforeWrite();
-    return this.operations().runIdempotent(clientName, key, operationName, payload, operation);
+    return this.operations().runMutation(this.mutationContext(caller, key), operationName, payload, operation);
   }
-  writeOperational(clientName, key, operationName, payload, operation) {
-    return key ? this.writeIdempotent(clientName, key, operationName, payload, operation) : this.write(operation);
+  async writeCore(source2, key, operationName, payload, operation) {
+    await this.backups.beforeWrite();
+    const context = this.mutationContext(source2, key);
+    return this.operations().runMutation(context, operationName, payload, () => operation(context));
   }
   listProjects(filters = {}) {
     const parsed = this.parse(objectType({ state: ProjectStateSchema.optional(), includeArchived: booleanType().optional(), q: stringType().max(500).optional() }), filters);
@@ -9701,81 +9818,79 @@ class IstraService {
   }
   createProject(input, source2, idempotencyKey) {
     const parsed = this.parse(CreateProjectSchema, input);
-    const operation = () => this.repository.createProject(parsed, provenance(source2));
-    return idempotencyKey ? this.writeIdempotent(source2?.client ?? "ui", idempotencyKey, "create_project", parsed, operation) : this.write(operation);
+    return this.writeCore(source2, idempotencyKey, "create_project", parsed, (context) => this.repository.createProject(parsed, context));
   }
   updateProject(id2, input, source2) {
     const parsed = this.parse(UpdateProjectSchema, input);
-    return this.write(() => this.repository.updateProject(id2, parsed, provenance(source2)));
+    return this.writeCore(source2, void 0, "update_project", { id: id2, parsed }, (context) => this.repository.updateProject(id2, parsed, context));
   }
   archiveProject(id2, input, source2) {
     const parsed = this.parse(objectType({ expectedVersion: numberType().int().positive(), archived: booleanType() }), input);
-    return this.write(() => this.repository.archiveProject(id2, parsed.expectedVersion, parsed.archived, provenance(source2)));
+    return this.writeCore(source2, void 0, "archive_project", { id: id2, parsed }, (context) => this.repository.archiveProject(id2, parsed.expectedVersion, parsed.archived, context));
   }
   createPhase(projectId, input, source2, idempotencyKey) {
     const parsed = this.parse(CreatePhaseSchema, input);
-    const operation = () => this.repository.createPhase(projectId, parsed, provenance(source2));
-    return idempotencyKey ? this.writeIdempotent(source2?.client ?? "ui", idempotencyKey, "create_phase", { projectId, parsed }, operation) : this.write(operation);
+    return this.writeCore(source2, idempotencyKey, "create_phase", { projectId, parsed }, (context) => this.repository.createPhase(projectId, parsed, context));
   }
   updatePhase(id2, input, source2) {
     const parsed = this.parse(UpdatePhaseSchema, input);
-    return this.write(() => this.repository.updatePhase(id2, parsed, provenance(source2)));
+    return this.writeCore(source2, void 0, "update_phase", { id: id2, parsed }, (context) => this.repository.updatePhase(id2, parsed, context));
   }
   createWorkItem(projectId, input, source2, idempotencyKey) {
     const parsed = this.parse(CreateWorkItemSchema, input);
-    const operation = () => this.repository.createWorkItem(projectId, parsed, provenance(source2));
-    return idempotencyKey ? this.writeIdempotent(source2?.client ?? "ui", idempotencyKey, "create_work_item", { projectId, parsed }, operation) : this.write(operation);
+    return this.writeCore(source2, idempotencyKey, "create_work_item", { projectId, parsed }, (context) => this.repository.createWorkItem(projectId, parsed, context));
   }
   updateWorkItem(id2, input, source2) {
     const parsed = this.parse(UpdateWorkItemSchema, input);
-    return this.write(() => this.repository.updateWorkItem(id2, parsed, provenance(source2)));
+    return this.writeCore(source2, void 0, "update_work_item", { id: id2, parsed }, (context) => this.repository.updateWorkItem(id2, parsed, context));
   }
   createUpdate(projectId, input, source2, idempotencyKey) {
     const parsed = this.parse(CreateUpdateSchema, input);
-    const operation = () => this.repository.createUpdate(projectId, parsed, provenance(source2));
-    return idempotencyKey ? this.writeIdempotent(source2?.client ?? "ui", idempotencyKey, "create_update", { projectId, parsed }, operation) : this.write(operation);
+    return this.writeCore(source2, idempotencyKey, "create_update", { projectId, parsed }, (context) => this.repository.createUpdate(projectId, parsed, context));
   }
   reviseUpdate(id2, input, source2, idempotencyKey) {
     const parsed = this.parse(ReviseUpdateSchema, input);
-    const operation = () => this.repository.reviseUpdate(id2, parsed, provenance(source2));
-    return idempotencyKey ? this.writeIdempotent(source2?.client ?? "ui", idempotencyKey, "revise_update", { id: id2, parsed }, operation) : this.write(operation);
+    return this.writeCore(source2, idempotencyKey, "revise_update", { id: id2, parsed }, (context) => this.repository.reviseUpdate(id2, parsed, context));
   }
   deleteUpdate(id2, input, source2) {
     const parsed = this.parse(objectType({ expectedVersion: numberType().int().positive() }), input);
-    return this.write(() => this.repository.softDeleteUpdate(id2, parsed.expectedVersion, provenance(source2)));
+    return this.writeCore(source2, void 0, "delete_update", { id: id2, parsed }, (context) => this.repository.softDeleteUpdate(id2, parsed.expectedVersion, context));
   }
-  saveCheckpoint(projectId, input, source2, idempotencyKey) {
+  async saveCheckpoint(projectId, input, source2, idempotencyKey) {
     const parsed = this.parse(CheckpointSchema, input);
-    const operation = () => this.repository.saveCheckpoint(projectId, parsed, provenance(source2));
-    return idempotencyKey ? this.writeIdempotent(source2?.client ?? "ui", idempotencyKey, "save_checkpoint", { projectId, parsed }, operation) : this.write(operation);
+    const context = this.mutationContext(source2, idempotencyKey);
+    await this.backups.beforeWrite();
+    return this.operations().runMutation(context, "save_checkpoint", { projectId, parsed }, () => {
+      const checkpoint = this.repository.saveCheckpoint(projectId, parsed, context);
+      const snapshot = this.operations().captureCheckpointSnapshot(projectId, checkpoint.id);
+      return { checkpoint, snapshot: { id: snapshot.id, digest: snapshot.digest, schemaVersion: snapshot.schemaVersion, capturedAt: snapshot.capturedAt } };
+    });
   }
   createLabel(input, source2, idempotencyKey) {
     const parsed = this.parse(CreateLabelSchema, input);
-    const operation = () => this.repository.createLabel(parsed, provenance(source2));
-    return idempotencyKey ? this.writeIdempotent(source2?.client ?? "ui", idempotencyKey, "create_label", parsed, operation) : this.write(operation);
+    return this.writeCore(source2, idempotencyKey, "create_label", parsed, (context) => this.repository.createLabel(parsed, context));
   }
   attachLabel(workItemId, labelId, input, source2) {
     const parsed = this.parse(objectType({ expectedVersion: numberType().int().positive() }), input);
-    return this.write(() => this.repository.attachLabel(workItemId, labelId, parsed.expectedVersion, provenance(source2)));
+    return this.writeCore(source2, void 0, "attach_label", { workItemId, labelId, parsed }, (context) => this.repository.attachLabel(workItemId, labelId, parsed.expectedVersion, context));
   }
   detachLabel(workItemId, labelId, input, source2) {
     const parsed = this.parse(objectType({ expectedVersion: numberType().int().positive() }), input);
-    return this.write(() => this.repository.detachLabel(workItemId, labelId, parsed.expectedVersion, provenance(source2)));
+    return this.writeCore(source2, void 0, "detach_label", { workItemId, labelId, parsed }, (context) => this.repository.detachLabel(workItemId, labelId, parsed.expectedVersion, context));
   }
   async importAll(value) {
     const bundle = this.parse(ExportBundleSchema, value);
     this.repository.validateImport(bundle);
-    await this.backups.beforeWrite();
     await this.backups.create("pre-import");
     this.repository.importAll(bundle);
   }
   listRequirementStates(projectId) {
     return this.operations().listRequirementStates(projectId);
   }
-  createRequirementState(projectId, input, idempotencyKey, clientName = "ui") {
+  createRequirementState(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateRequirementStateSchema, input);
     const operation = () => this.operations().createRequirementState(projectId, parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_requirement_state", { projectId, parsed }, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_requirement_state", { projectId, parsed }, operation);
   }
   listRequirements(projectId) {
     return this.operations().listRequirements(projectId);
@@ -9787,20 +9902,20 @@ class IstraService {
   getRequirement(id2) {
     return this.operations().getRequirement(id2);
   }
-  createRequirement(projectId, input, idempotencyKey, clientName = "ui") {
+  createRequirement(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateRequirementSchema, input);
     const operation = () => this.operations().createRequirement(projectId, parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_requirement", { projectId, parsed }, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_requirement", { projectId, parsed }, operation);
   }
-  updateRequirement(id2, input) {
+  updateRequirement(id2, input, caller = "ui") {
     const parsed = this.parse(UpdateRequirementSchema, input);
-    return this.write(() => this.operations().updateRequirement(id2, parsed));
+    return this.writeOperational(caller, void 0, "update_requirement", { id: id2, parsed }, () => this.operations().updateRequirement(id2, parsed));
   }
-  linkRequirementWork(projectId, requirementId, workItemId) {
-    return this.write(() => this.operations().linkRequirementWork(projectId, requirementId, workItemId));
+  linkRequirementWork(projectId, requirementId, workItemId, caller = "ui") {
+    return this.writeOperational(caller, void 0, "link_requirement_work", { projectId, requirementId, workItemId }, () => this.operations().linkRequirementWork(projectId, requirementId, workItemId));
   }
-  unlinkRequirementWork(requirementId, workItemId) {
-    return this.write(() => this.operations().unlinkRequirementWork(requirementId, workItemId));
+  unlinkRequirementWork(requirementId, workItemId, caller = "ui") {
+    return this.writeOperational(caller, void 0, "unlink_requirement_work", { requirementId, workItemId }, () => this.operations().unlinkRequirementWork(requirementId, workItemId));
   }
   getRequirementRollup(projectId) {
     return this.operations().getRequirementRollup(projectId);
@@ -9808,10 +9923,10 @@ class IstraService {
   listWorkQueues(projectId) {
     return this.operations().listWorkQueues(projectId);
   }
-  createWorkQueue(projectId, input, idempotencyKey, clientName = "ui") {
+  createWorkQueue(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateWorkQueueSchema, input);
     const operation = () => this.operations().createWorkQueue(projectId, parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_work_queue", { projectId, parsed }, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_work_queue", { projectId, parsed }, operation);
   }
   listOperationalWorkItems(projectId, queueId) {
     return this.operations().listWorkItems(projectId, queueId);
@@ -9820,49 +9935,49 @@ class IstraService {
     const parsed = this.parse(PageRequestSchema, input);
     return this.operations().listWorkItemsPage(projectId, parsed.limit, parsed.cursor, input?.queueId);
   }
-  linkWorkItems(projectId, input, idempotencyKey, clientName = "ui") {
+  linkWorkItems(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateWorkRelationSchema, input);
     const operation = () => this.operations().linkWorkItems(projectId, parsed);
-    return this.writeOperational(clientName, idempotencyKey, "link_work_items", { projectId, parsed }, operation);
+    return this.writeOperational(caller, idempotencyKey, "link_work_items", { projectId, parsed }, operation);
   }
-  unlinkWorkItems(id2) {
-    return this.write(() => this.operations().unlinkWorkItems(id2));
+  unlinkWorkItems(id2, caller = "ui") {
+    return this.writeOperational(caller, void 0, "unlink_work_items", { id: id2 }, () => this.operations().unlinkWorkItems(id2));
   }
   listWorkRelations(projectId) {
     return this.operations().listWorkRelations(projectId);
   }
-  createExternalBlocker(projectId, input, idempotencyKey, clientName = "ui") {
+  createExternalBlocker(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateExternalBlockerSchema, input);
     const operation = () => this.operations().createExternalBlocker(projectId, parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_external_blocker", { projectId, parsed }, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_external_blocker", { projectId, parsed }, operation);
   }
   listExternalBlockers(projectId, includeResolved = false) {
     return this.operations().listExternalBlockers(projectId, includeResolved);
   }
-  resolveExternalBlocker(id2) {
-    return this.write(() => this.operations().resolveExternalBlocker(id2));
+  resolveExternalBlocker(id2, caller = "ui") {
+    return this.writeOperational(caller, void 0, "resolve_external_blocker", { id: id2 }, () => this.operations().resolveExternalBlocker(id2));
   }
-  createWorkspace(input, idempotencyKey, clientName = "ui") {
+  createWorkspace(input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateWorkspaceSchema, input);
     const operation = () => this.operations().createWorkspace(parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_workspace", parsed, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_workspace", parsed, operation);
   }
-  linkProjectWorkspace(projectId, workspaceId, idempotencyKey, clientName = "ui") {
+  linkProjectWorkspace(projectId, workspaceId, idempotencyKey, caller = "ui") {
     const operation = () => this.operations().linkProjectWorkspace(projectId, workspaceId);
-    return this.writeOperational(clientName, idempotencyKey, "link_project_workspace", { projectId, workspaceId }, operation);
+    return this.writeOperational(caller, idempotencyKey, "link_project_workspace", { projectId, workspaceId }, operation);
   }
-  createWorkspaceRevision(input, idempotencyKey, clientName = "ui") {
+  createWorkspaceRevision(input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateWorkspaceRevisionSchema, input);
     const operation = () => this.operations().createWorkspaceRevision(parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_workspace_revision", parsed, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_workspace_revision", parsed, operation);
   }
   resolveProject(workspacePath) {
     return this.operations().resolveProject(workspacePath);
   }
-  createRun(projectId, input, idempotencyKey, clientName = "ui") {
+  createRun(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateRunSchema, input);
     const operation = () => this.operations().createRun(projectId, parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_run", { projectId, parsed }, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_run", { projectId, parsed }, operation);
   }
   listRuns(projectId) {
     return this.operations().listRuns(projectId);
@@ -9871,10 +9986,10 @@ class IstraService {
     const parsed = this.parse(PageRequestSchema, input);
     return this.operations().listRunsPage(projectId, parsed.limit, parsed.cursor);
   }
-  createEvidence(projectId, input, idempotencyKey, clientName = "ui") {
+  createEvidence(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateEvidenceSchema, input);
     const operation = () => this.operations().createEvidence(projectId, parsed);
-    return this.writeOperational(clientName, idempotencyKey, "create_evidence", { projectId, parsed }, operation);
+    return this.writeOperational(caller, idempotencyKey, "create_evidence", { projectId, parsed }, operation);
   }
   listEvidence(projectId, includeStale = false) {
     return this.operations().listEvidence(projectId, includeStale);
@@ -9883,9 +9998,9 @@ class IstraService {
     const parsed = this.parse(PageRequestSchema, input);
     return this.operations().listEvidencePage(projectId, parsed.limit, parsed.cursor, queryBoolean(input?.includeStale));
   }
-  captureCheckpointSnapshot(projectId, checkpointId, idempotencyKey, clientName = "ui") {
+  backfillLegacyCheckpointSnapshot(projectId, checkpointId, idempotencyKey, caller = "ui") {
     const operation = () => this.operations().captureCheckpointSnapshot(projectId, checkpointId);
-    return this.writeOperational(clientName, idempotencyKey, "capture_checkpoint_snapshot", { projectId, checkpointId }, operation);
+    return this.writeOperational(caller, idempotencyKey, "legacy_backfill_checkpoint_snapshot", { projectId, checkpointId }, operation);
   }
   getCheckpointSnapshot(checkpointId) {
     return this.operations().getCheckpointSnapshot(checkpointId);
@@ -9900,474 +10015,405 @@ class IstraService {
     return this.operations().getProjectPulseSummary(projectId);
   }
 }
-const migrations = [
-  {
-    version: 1,
-    name: "initial_project_memory",
-    sql: `
-      CREATE TABLE projects (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-        description TEXT,
-        intent TEXT,
-        deadline TEXT,
-        completion_criteria TEXT,
-        state TEXT NOT NULL CHECK(state IN ('active','paused','dormant','completed')),
-        current_focus TEXT,
-        next_action TEXT,
-        blockers_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers_json)),
-        current_checkpoint_id TEXT,
-        archived_at TEXT,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        last_activity_at TEXT NOT NULL DEFAULT ''
-      ) STRICT;
+const migrations = [{
+  version: 1,
+  name: "authoritative_ledger",
+  sql: `
+    CREATE TABLE projects (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      intent TEXT,
+      deadline TEXT,
+      completion_criteria TEXT,
+      state TEXT NOT NULL CHECK(state IN ('active','paused','dormant','completed')),
+      current_focus TEXT,
+      next_action TEXT,
+      blockers_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers_json)),
+      current_checkpoint_id TEXT,
+      archived_at TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_activity_at TEXT NOT NULL DEFAULT ''
+    ) STRICT;
 
-      CREATE TABLE phases (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        name TEXT NOT NULL CHECK(length(trim(name)) > 0),
-        description TEXT,
-        status TEXT NOT NULL CHECK(status IN ('planned','active','completed','abandoned')),
-        position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
-        archived_at TEXT,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX phases_project_position ON phases(project_id, position, created_at);
+    CREATE TABLE phases (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      description TEXT,
+      status TEXT NOT NULL CHECK(status IN ('planned','active','completed','abandoned')),
+      position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
+      archived_at TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX phases_project_position ON phases(project_id, position, created_at);
 
-      CREATE TABLE work_items (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        phase_id TEXT REFERENCES phases(id) ON DELETE SET NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('issue','task','idea','question','risk')),
-        title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-        description TEXT,
-        status TEXT NOT NULL CHECK(status IN ('open','in_progress','blocked','resolved','dropped')),
-        priority TEXT CHECK(priority IS NULL OR priority IN ('low','medium','high','critical')),
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX work_items_project_status ON work_items(project_id, status, updated_at DESC);
-      CREATE INDEX work_items_phase ON work_items(phase_id);
+    CREATE TABLE work_items (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      phase_id TEXT REFERENCES phases(id) ON DELETE SET NULL,
+      stable_key TEXT,
+      parent_id TEXT REFERENCES work_items(id) ON DELETE SET NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('issue','task','idea','question','risk')),
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      status TEXT NOT NULL CHECK(status IN ('open','in_progress','blocked','resolved','dropped')),
+      priority TEXT CHECK(priority IS NULL OR priority IN ('low','medium','high','critical')),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX work_items_project_status ON work_items(project_id, status, updated_at DESC);
+    CREATE INDEX work_items_phase ON work_items(phase_id);
+    CREATE INDEX work_items_parent ON work_items(parent_id);
+    CREATE UNIQUE INDEX work_items_project_stable_key ON work_items(project_id, stable_key COLLATE NOCASE) WHERE stable_key IS NOT NULL;
 
-      CREATE TRIGGER work_items_phase_project_insert
-      BEFORE INSERT ON work_items
-      WHEN NEW.phase_id IS NOT NULL
-      BEGIN
-        SELECT CASE WHEN NOT EXISTS (
-          SELECT 1 FROM phases WHERE id=NEW.phase_id AND project_id=NEW.project_id
-        ) THEN RAISE(ABORT, 'work-item phase belongs to another project') END;
-      END;
-      CREATE TRIGGER work_items_phase_project_update
-      BEFORE UPDATE OF phase_id,project_id ON work_items
-      WHEN NEW.phase_id IS NOT NULL
-      BEGIN
-        SELECT CASE WHEN NOT EXISTS (
-          SELECT 1 FROM phases WHERE id=NEW.phase_id AND project_id=NEW.project_id
-        ) THEN RAISE(ABORT, 'work-item phase belongs to another project') END;
-      END;
+    CREATE TABLE labels (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(name)) > 0),
+      colour TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE work_item_labels (
+      work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(work_item_id, label_id)
+    ) STRICT;
 
-      CREATE TABLE labels (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(name)) > 0),
-        colour TEXT,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
+    CREATE TABLE updates (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('note','progress','decision','discovery','checkpoint')),
+      current_revision_id TEXT,
+      deleted_at TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX updates_project_created ON updates(project_id, created_at DESC);
+    CREATE TABLE update_revisions (
+      id TEXT PRIMARY KEY,
+      update_id TEXT NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL CHECK(revision > 0),
+      content TEXT NOT NULL,
+      snapshot_json TEXT CHECK(snapshot_json IS NULL OR json_valid(snapshot_json)),
+      source TEXT NOT NULL,
+      client TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(update_id, revision)
+    ) STRICT;
+    CREATE INDEX update_revisions_update ON update_revisions(update_id, revision DESC);
 
-      CREATE TABLE work_item_labels (
-        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(work_item_id, label_id)
-      ) STRICT;
+    CREATE TABLE activity_events (
+      id TEXT PRIMARY KEY,
+      project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+      source TEXT NOT NULL,
+      client TEXT,
+      actor TEXT NOT NULL,
+      idempotency_key TEXT,
+      created_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX activity_project_created ON activity_events(project_id, created_at DESC, id DESC);
+    CREATE INDEX activity_global_created ON activity_events(created_at DESC, id DESC);
 
-      CREATE TABLE updates (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK(kind IN ('note','progress','decision','discovery','checkpoint')),
-        current_revision_id TEXT,
-        deleted_at TEXT,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX updates_project_created ON updates(project_id, created_at DESC);
+    CREATE VIRTUAL TABLE search_index USING fts5(
+      entity_type UNINDEXED,
+      entity_id UNINDEXED,
+      project_id UNINDEXED,
+      title,
+      body,
+      tokenize='unicode61 remove_diacritics 2'
+    );
+    CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+    CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL) STRICT;
 
-      CREATE TABLE update_revisions (
-        id TEXT PRIMARY KEY,
-        update_id TEXT NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
-        revision INTEGER NOT NULL CHECK(revision > 0),
-        content TEXT NOT NULL,
-        snapshot_json TEXT CHECK(snapshot_json IS NULL OR json_valid(snapshot_json)),
-        source TEXT NOT NULL,
-        client TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(update_id, revision)
-      ) STRICT;
-      CREATE INDEX update_revisions_update ON update_revisions(update_id, revision DESC);
+    CREATE TABLE requirement_states (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      semantic TEXT NOT NULL CHECK(semantic IN ('open','partial','proven','defect')),
+      position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
+      colour TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(project_id, name COLLATE NOCASE)
+    ) STRICT;
+    CREATE INDEX requirement_states_project_position ON requirement_states(project_id, position, created_at);
 
-      CREATE TABLE activity_events (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-        source TEXT NOT NULL,
-        client TEXT,
-        created_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX activity_project_created ON activity_events(project_id, created_at DESC);
+    CREATE TABLE requirements (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      stable_key TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('goal','capability','requirement')),
+      parent_id TEXT REFERENCES requirements(id) ON DELETE SET NULL,
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      state_id TEXT NOT NULL REFERENCES requirement_states(id),
+      responsible_phase_id TEXT REFERENCES phases(id) ON DELETE SET NULL,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(project_id, stable_key COLLATE NOCASE)
+    ) STRICT;
+    CREATE INDEX requirements_project_updated ON requirements(project_id, updated_at DESC, id);
+    CREATE INDEX requirements_parent ON requirements(parent_id);
 
-      CREATE VIRTUAL TABLE search_index USING fts5(
-        entity_type UNINDEXED,
-        entity_id UNINDEXED,
-        project_id UNINDEXED,
-        title,
-        body,
-        tokenize='unicode61 remove_diacritics 2'
-      );
+    CREATE TABLE requirement_key_aliases (
+      requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      alias TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(requirement_id, alias COLLATE NOCASE),
+      UNIQUE(alias COLLATE NOCASE)
+    ) STRICT;
 
-      CREATE TABLE app_metadata (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      ) STRICT;
+    CREATE TABLE acceptance_criteria (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
+      required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0,1)),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      archived_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX acceptance_criteria_requirement ON acceptance_criteria(requirement_id, archived_at, position, id);
 
-      CREATE TABLE schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TEXT NOT NULL
-      ) STRICT;
+    CREATE TABLE requirement_phase_links (
+      requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      phase_id TEXT NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('responsible','related')),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(requirement_id, phase_id)
+    ) STRICT;
 
-      CREATE TRIGGER projects_current_checkpoint_guard
-      BEFORE UPDATE OF current_checkpoint_id ON projects
-      WHEN NEW.current_checkpoint_id IS NOT NULL
-      BEGIN
-        SELECT CASE WHEN NOT EXISTS (
-          SELECT 1 FROM updates
-          WHERE id = NEW.current_checkpoint_id
-            AND project_id = NEW.id
-            AND kind = 'checkpoint'
-            AND deleted_at IS NULL
-        ) THEN RAISE(ABORT, 'invalid current checkpoint') END;
-      END;
-    `
-  },
-  {
-    version: 2,
-    name: "hack_project_operational_memory",
-    sql: `
-      CREATE TABLE requirement_states (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        name TEXT NOT NULL CHECK(length(trim(name)) > 0),
-        semantic TEXT NOT NULL CHECK(semantic IN ('open','partial','proven','defect')),
-        position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
-        colour TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(project_id, name COLLATE NOCASE)
-      ) STRICT;
-      CREATE INDEX requirement_states_project_position ON requirement_states(project_id, position, created_at);
+    CREATE TABLE work_queues (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      description TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(project_id, name COLLATE NOCASE)
+    ) STRICT;
+    CREATE TABLE work_queue_items (
+      queue_id TEXT NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+      work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      rank TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(queue_id, work_item_id),
+      UNIQUE(queue_id, rank)
+    ) STRICT;
+    CREATE INDEX work_queue_items_order ON work_queue_items(queue_id, rank, work_item_id);
 
-      CREATE TABLE requirements (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        stable_key TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('goal','capability','requirement')),
-        parent_id TEXT REFERENCES requirements(id) ON DELETE SET NULL,
-        title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-        description TEXT,
-        state_id TEXT NOT NULL REFERENCES requirement_states(id),
-        responsible_phase_id TEXT REFERENCES phases(id) ON DELETE SET NULL,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(project_id, stable_key COLLATE NOCASE)
-      ) STRICT;
-      CREATE INDEX requirements_project_updated ON requirements(project_id, updated_at DESC, id);
-      CREATE INDEX requirements_parent ON requirements(parent_id);
+    CREATE TABLE requirement_work_links (
+      requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(requirement_id, work_item_id)
+    ) STRICT;
+    CREATE TABLE work_phase_links (
+      work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      phase_id TEXT NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('responsible','related')),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(work_item_id, phase_id)
+    ) STRICT;
 
-      CREATE TABLE requirement_key_aliases (
-        requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
-        alias TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(requirement_id, alias COLLATE NOCASE),
-        UNIQUE(alias COLLATE NOCASE)
-      ) STRICT;
+    CREATE TABLE work_relations (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      from_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      to_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('depends_on','blocks','relates_to')),
+      created_at TEXT NOT NULL,
+      CHECK(from_work_item_id <> to_work_item_id),
+      UNIQUE(from_work_item_id, to_work_item_id, kind)
+    ) STRICT;
+    CREATE INDEX work_relations_from ON work_relations(from_work_item_id, kind);
+    CREATE INDEX work_relations_to ON work_relations(to_work_item_id, kind);
 
-      CREATE TABLE acceptance_criteria (
-        id TEXT PRIMARY KEY,
-        requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
-        title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-        description TEXT,
-        position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
-        required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0,1)),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX acceptance_criteria_requirement ON acceptance_criteria(requirement_id, position, id);
+    CREATE TABLE external_blockers (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      work_item_id TEXT REFERENCES work_items(id) ON DELETE CASCADE,
+      content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+      resolved_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX external_blockers_open ON external_blockers(project_id, resolved_at, created_at DESC);
 
-      CREATE TABLE requirement_phase_links (
-        requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
-        phase_id TEXT NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
-        role TEXT NOT NULL CHECK(role IN ('responsible','related')),
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(requirement_id, phase_id)
-      ) STRICT;
+    CREATE TABLE workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      canonical_root TEXT NOT NULL UNIQUE,
+      remote TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE workspace_aliases (
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      alias TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(workspace_id, alias)
+    ) STRICT;
+    CREATE TABLE project_workspaces (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(project_id, workspace_id)
+    ) STRICT;
+    CREATE TABLE workspace_revisions (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      branch TEXT,
+      "commit" TEXT,
+      dirty INTEGER NOT NULL DEFAULT 0 CHECK(dirty IN (0,1)),
+      diff_hash TEXT,
+      captured_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX workspace_revisions_captured ON workspace_revisions(workspace_id, captured_at DESC, id);
 
-      CREATE TABLE work_queues (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        name TEXT NOT NULL CHECK(length(trim(name)) > 0),
-        description TEXT,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(project_id, name COLLATE NOCASE)
-      ) STRICT;
-      CREATE TABLE work_queue_items (
-        queue_id TEXT NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
-        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        rank TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(queue_id, work_item_id),
-        UNIQUE(queue_id, rank)
-      ) STRICT;
-      CREATE INDEX work_queue_items_order ON work_queue_items(queue_id, rank, work_item_id);
+    CREATE TABLE project_secret_names (
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL COLLATE NOCASE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(project_id, name)
+    ) STRICT;
 
-      ALTER TABLE work_items ADD COLUMN stable_key TEXT;
-      ALTER TABLE work_items ADD COLUMN parent_id TEXT REFERENCES work_items(id) ON DELETE SET NULL;
-      CREATE UNIQUE INDEX work_items_project_stable_key ON work_items(project_id, stable_key COLLATE NOCASE) WHERE stable_key IS NOT NULL;
-      CREATE INDEX work_items_parent ON work_items(parent_id);
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      workspace_revision_id TEXT REFERENCES workspace_revisions(id) ON DELETE SET NULL,
+      command TEXT NOT NULL CHECK(length(trim(command)) > 0),
+      working_directory TEXT,
+      started_at TEXT NOT NULL,
+      ended_at TEXT,
+      duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+      outcome TEXT NOT NULL CHECK(outcome IN ('recorded','verified','failed','interrupted')),
+      exit_code INTEGER,
+      toolchain_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(toolchain_json)),
+      stdout_excerpt TEXT,
+      stderr_excerpt TEXT,
+      stdout_truncated INTEGER NOT NULL DEFAULT 0 CHECK(stdout_truncated IN (0,1)),
+      stderr_truncated INTEGER NOT NULL DEFAULT 0 CHECK(stderr_truncated IN (0,1)),
+      validation_status TEXT NOT NULL CHECK(validation_status = 'validated'),
+      redaction_json TEXT NOT NULL DEFAULT '{"count":0,"fields":[]}' CHECK(json_valid(redaction_json)),
+      created_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX runs_project_started ON runs(project_id, started_at DESC, id);
+    CREATE TABLE test_summaries (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL,
+      passed INTEGER NOT NULL CHECK(passed >= 0),
+      failed INTEGER NOT NULL CHECK(failed >= 0),
+      skipped INTEGER NOT NULL CHECK(skipped >= 0),
+      target_count INTEGER NOT NULL CHECK(target_count >= 0 AND target_count=passed+failed+skipped),
+      created_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE artifact_references (
+      id TEXT PRIMARY KEY,
+      run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+      uri TEXT NOT NULL,
+      media_type TEXT,
+      byte_count INTEGER CHECK(byte_count IS NULL OR byte_count >= 0),
+      digest TEXT,
+      created_at TEXT NOT NULL
+    ) STRICT;
 
-      CREATE TABLE requirement_work_links (
-        requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
-        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(requirement_id, work_item_id)
-      ) STRICT;
-      CREATE TABLE work_phase_links (
-        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        phase_id TEXT NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
-        role TEXT NOT NULL CHECK(role IN ('responsible','related')),
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(work_item_id, phase_id)
-      ) STRICT;
+    CREATE TABLE evidence (
+      id TEXT PRIMARY KEY,
+      ordinal INTEGER NOT NULL UNIQUE CHECK(ordinal > 0),
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+      result TEXT NOT NULL CHECK(result IN ('recorded','verified','failed','interrupted')),
+      summary TEXT NOT NULL,
+      target_version INTEGER,
+      stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0,1)),
+      stale_reason TEXT,
+      validation_status TEXT NOT NULL CHECK(validation_status IN ('validated','overridden')),
+      redaction_json TEXT NOT NULL DEFAULT '{"count":0,"fields":[]}' CHECK(json_valid(redaction_json)),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX evidence_project_created ON evidence(project_id, ordinal DESC);
+    CREATE TABLE evidence_requirement_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, requirement_id)) STRICT;
+    CREATE TABLE evidence_criterion_links (
+      evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      criterion_id TEXT NOT NULL REFERENCES acceptance_criteria(id) ON DELETE CASCADE,
+      criterion_version INTEGER NOT NULL CHECK(criterion_version > 0),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(evidence_id, criterion_id)
+    ) STRICT;
+    CREATE INDEX evidence_criterion_lookup ON evidence_criterion_links(criterion_id, created_at DESC, evidence_id DESC);
+    CREATE TABLE evidence_work_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, work_item_id)) STRICT;
+    CREATE TABLE evidence_update_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, update_id TEXT NOT NULL REFERENCES updates(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, update_id)) STRICT;
+    CREATE TABLE evidence_checkpoint_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, checkpoint_id TEXT NOT NULL REFERENCES updates(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, checkpoint_id)) STRICT;
+    CREATE TABLE evidence_artifact_links (
+      evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      artifact_id TEXT NOT NULL REFERENCES artifact_references(id) ON DELETE CASCADE,
+      PRIMARY KEY(evidence_id, artifact_id)
+    ) STRICT;
+    CREATE TABLE evidence_overrides (
+      evidence_id TEXT PRIMARY KEY REFERENCES evidence(id) ON DELETE CASCADE,
+      reason TEXT NOT NULL CHECK(length(trim(reason)) >= 20),
+      actor TEXT NOT NULL,
+      source TEXT NOT NULL CHECK(source IN ('ui','import','system')),
+      client TEXT,
+      created_at TEXT NOT NULL
+    ) STRICT;
 
-      CREATE TABLE work_relations (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        from_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        to_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK(kind IN ('depends_on','blocks','relates_to')),
-        created_at TEXT NOT NULL,
-        CHECK(from_work_item_id <> to_work_item_id),
-        UNIQUE(from_work_item_id, to_work_item_id, kind)
-      ) STRICT;
-      CREATE INDEX work_relations_from ON work_relations(from_work_item_id, kind);
-      CREATE INDEX work_relations_to ON work_relations(to_work_item_id, kind);
+    CREATE TABLE checkpoint_snapshots (
+      id TEXT PRIMARY KEY,
+      checkpoint_id TEXT NOT NULL UNIQUE REFERENCES updates(id) ON DELETE CASCADE,
+      schema_version INTEGER NOT NULL DEFAULT 3 CHECK(schema_version = 3),
+      captured_at TEXT NOT NULL,
+      document_json TEXT NOT NULL CHECK(json_valid(document_json)),
+      digest TEXT NOT NULL
+    ) STRICT;
 
-      CREATE TABLE external_blockers (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        work_item_id TEXT REFERENCES work_items(id) ON DELETE CASCADE,
-        content TEXT NOT NULL CHECK(length(trim(content)) > 0),
-        resolved_at TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX external_blockers_open ON external_blockers(project_id, resolved_at, created_at DESC);
+    CREATE TABLE idempotency_records (
+      client TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      result_json TEXT NOT NULL CHECK(json_valid(result_json)),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(client, idempotency_key)
+    ) STRICT;
 
-      CREATE TABLE workspaces (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL CHECK(length(trim(name)) > 0),
-        canonical_root TEXT NOT NULL UNIQUE,
-        remote TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE workspace_aliases (
-        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-        alias TEXT NOT NULL UNIQUE,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(workspace_id, alias)
-      ) STRICT;
-      CREATE TABLE project_workspaces (
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(project_id, workspace_id)
-      ) STRICT;
-      CREATE TABLE workspace_revisions (
-        id TEXT PRIMARY KEY,
-        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-        branch TEXT,
-        "commit" TEXT,
-        dirty INTEGER NOT NULL DEFAULT 0 CHECK(dirty IN (0,1)),
-        diff_hash TEXT,
-        captured_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX workspace_revisions_captured ON workspace_revisions(workspace_id, captured_at DESC, id);
-
-      CREATE TABLE runs (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        workspace_revision_id TEXT REFERENCES workspace_revisions(id) ON DELETE SET NULL,
-        command TEXT NOT NULL CHECK(length(trim(command)) > 0),
-        working_directory TEXT,
-        started_at TEXT NOT NULL,
-        ended_at TEXT,
-        duration_ms INTEGER,
-        outcome TEXT NOT NULL CHECK(outcome IN ('recorded','verified','failed','interrupted')),
-        exit_code INTEGER,
-        toolchain_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(toolchain_json)),
-        stdout_excerpt TEXT,
-        stderr_excerpt TEXT,
-        stdout_truncated INTEGER NOT NULL DEFAULT 0 CHECK(stdout_truncated IN (0,1)),
-        stderr_truncated INTEGER NOT NULL DEFAULT 0 CHECK(stderr_truncated IN (0,1)),
-        created_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX runs_project_started ON runs(project_id, started_at DESC, id);
-      CREATE TABLE test_summaries (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-        scope TEXT NOT NULL,
-        passed INTEGER NOT NULL CHECK(passed >= 0),
-        failed INTEGER NOT NULL CHECK(failed >= 0),
-        skipped INTEGER NOT NULL CHECK(skipped >= 0),
-        target_count INTEGER NOT NULL CHECK(target_count >= 0),
-        created_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE artifact_references (
-        id TEXT PRIMARY KEY,
-        run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
-        uri TEXT NOT NULL,
-        media_type TEXT,
-        byte_count INTEGER CHECK(byte_count IS NULL OR byte_count >= 0),
-        digest TEXT,
-        created_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE evidence (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
-        result TEXT NOT NULL CHECK(result IN ('recorded','verified','failed','interrupted')),
-        summary TEXT NOT NULL,
-        target_version INTEGER,
-        stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0,1)),
-        stale_reason TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX evidence_project_created ON evidence(project_id, created_at DESC, id);
-      CREATE TABLE evidence_requirement_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, requirement_id TEXT NOT NULL REFERENCES requirements(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, requirement_id)) STRICT;
-      CREATE TABLE evidence_work_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, work_item_id)) STRICT;
-      CREATE TABLE evidence_update_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, update_id TEXT NOT NULL REFERENCES updates(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, update_id)) STRICT;
-      CREATE TABLE evidence_checkpoint_links (evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE, checkpoint_id TEXT NOT NULL REFERENCES updates(id) ON DELETE CASCADE, PRIMARY KEY(evidence_id, checkpoint_id)) STRICT;
-
-      CREATE TABLE checkpoint_snapshots (
-        id TEXT PRIMARY KEY,
-        checkpoint_id TEXT NOT NULL UNIQUE REFERENCES updates(id) ON DELETE CASCADE,
-        schema_version INTEGER NOT NULL DEFAULT 2 CHECK(schema_version = 2),
-        captured_at TEXT NOT NULL,
-        document_json TEXT NOT NULL CHECK(json_valid(document_json)),
-        digest TEXT NOT NULL
-      ) STRICT;
-
-      CREATE TABLE idempotency_records (
-        client TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        request_hash TEXT NOT NULL,
-        result_json TEXT NOT NULL CHECK(json_valid(result_json)),
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(client, idempotency_key)
-      ) STRICT;
-    `
-  },
-  {
-    version: 3,
-    name: "allow_explicit_blocking_relations",
-    sql: `
-      DROP INDEX IF EXISTS work_relations_from;
-      DROP INDEX IF EXISTS work_relations_to;
-      ALTER TABLE work_relations RENAME TO work_relations_v2;
-      CREATE TABLE work_relations (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        from_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        to_work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK(kind IN ('depends_on','blocks','relates_to')),
-        created_at TEXT NOT NULL,
-        CHECK(from_work_item_id <> to_work_item_id),
-        UNIQUE(from_work_item_id, to_work_item_id, kind)
-      ) STRICT;
-      INSERT INTO work_relations(id,project_id,from_work_item_id,to_work_item_id,kind,created_at)
-        SELECT id,project_id,from_work_item_id,to_work_item_id,kind,created_at FROM work_relations_v2;
-      DROP TABLE work_relations_v2;
-      CREATE INDEX work_relations_from ON work_relations(from_work_item_id, kind);
-      CREATE INDEX work_relations_to ON work_relations(to_work_item_id, kind);
-    `
-  },
-  {
-    version: 4,
-    name: "operational_persistence_integrity",
-    sql: `
-      CREATE TABLE evidence_artifact_links (
-        evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
-        artifact_id TEXT NOT NULL REFERENCES artifact_references(id) ON DELETE CASCADE,
-        PRIMARY KEY(evidence_id, artifact_id)
-      ) STRICT;
-
-      WITH defaults(name,semantic,position,colour) AS (
-        VALUES
-          ('Missing','open',0,'#7A8594'),
-          ('Partial','partial',1,'#C18401'),
-          ('Proven','proven',2,'#2D7A4B'),
-          ('Defect','defect',3,'#B64D3A')
-      )
-      INSERT INTO requirement_states(id,project_id,name,semantic,position,colour,created_at,updated_at)
-      SELECT
-        lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1,1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
-        p.id,d.name,d.semantic,d.position,d.colour,
-        strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      FROM projects p CROSS JOIN defaults d
-      WHERE NOT EXISTS (
-        SELECT 1 FROM requirement_states existing
-        WHERE existing.project_id=p.id AND existing.name=d.name COLLATE NOCASE
-      );
-
-      INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at)
-      SELECT
-        lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1,1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
-        p.id,'Main queue','Default ordered work queue',
-        strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      FROM projects p
-      WHERE NOT EXISTS (SELECT 1 FROM work_queues q WHERE q.project_id=p.id);
-
-      INSERT OR IGNORE INTO work_queue_items(queue_id,work_item_id,rank,created_at)
-      SELECT
-        (SELECT q.id FROM work_queues q WHERE q.project_id=wi.project_id ORDER BY q.created_at,q.id LIMIT 1),
-        wi.id,
-        'legacy:' || wi.created_at || ':' || wi.id,
-        wi.created_at
-      FROM work_items wi
-      WHERE NOT EXISTS (SELECT 1 FROM work_queue_items existing WHERE existing.work_item_id=wi.id);
-
-      INSERT OR IGNORE INTO work_phase_links(work_item_id,phase_id,role,created_at)
-      SELECT wi.id,wi.phase_id,'responsible',wi.created_at
-      FROM work_items wi
-      WHERE wi.phase_id IS NOT NULL;
-    `
-  }
-];
+    CREATE TRIGGER work_items_phase_project_insert BEFORE INSERT ON work_items WHEN NEW.phase_id IS NOT NULL BEGIN
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM phases WHERE id=NEW.phase_id AND project_id=NEW.project_id) THEN RAISE(ABORT, 'work-item phase belongs to another project') END;
+    END;
+    CREATE TRIGGER work_items_phase_project_update BEFORE UPDATE OF phase_id,project_id ON work_items WHEN NEW.phase_id IS NOT NULL BEGIN
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM phases WHERE id=NEW.phase_id AND project_id=NEW.project_id) THEN RAISE(ABORT, 'work-item phase belongs to another project') END;
+    END;
+    CREATE TRIGGER projects_current_checkpoint_guard BEFORE UPDATE OF current_checkpoint_id ON projects WHEN NEW.current_checkpoint_id IS NOT NULL BEGIN
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM updates WHERE id=NEW.current_checkpoint_id AND project_id=NEW.id AND kind='checkpoint' AND deleted_at IS NULL) THEN RAISE(ABORT, 'invalid current checkpoint') END;
+    END;
+    CREATE TRIGGER cleanup_evidence_artifact AFTER DELETE ON evidence_artifact_links BEGIN
+      DELETE FROM artifact_references WHERE id=OLD.artifact_id AND run_id IS NULL AND NOT EXISTS (SELECT 1 FROM evidence_artifact_links WHERE artifact_id=OLD.artifact_id);
+    END;
+    CREATE TRIGGER cleanup_run_artifacts AFTER DELETE ON runs BEGIN
+      DELETE FROM artifact_references WHERE run_id IS NULL AND NOT EXISTS (SELECT 1 FROM evidence_artifact_links WHERE artifact_id=artifact_references.id);
+    END;
+  `
+}];
 function resolveDatabasePaths(dataDir = process.env.ISTRA_DATA_DIR) {
   const platformDefault = process.platform === "darwin" ? join(homedir(), "Library", "Application Support", "Istra") : process.platform === "win32" ? join(process.env.LOCALAPPDATA ?? homedir(), "Istra") : join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "istra");
   const absolute = resolve$1(dataDir ?? platformDefault);
@@ -10521,6 +10567,16 @@ function currentMigrationVersion(db) {
   const row = db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get();
   return Number(row.version);
 }
+function assertCompatibleMigrationHistory(db, databasePath) {
+  const table = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'").get();
+  if (!table) return;
+  const expected = new Map(migrations.map((migration) => [migration.version, migration.name]));
+  const applied = db.prepare("SELECT version,name FROM schema_migrations ORDER BY version").all();
+  const incompatible = applied.find((migration) => expected.get(Number(migration.version)) !== String(migration.name));
+  if (incompatible) {
+    throw new Error(`Database ${databasePath} uses an incompatible legacy schema. Recreate it before starting Istra.`);
+  }
+}
 async function openIstraDatabase(options = {}) {
   const resolved = resolveDatabasePaths(options.dataDir);
   const databasePath = options.databasePath ? resolve$1(options.databasePath) : resolved.databasePath;
@@ -10530,6 +10586,12 @@ async function openIstraDatabase(options = {}) {
   const db = new DatabaseSync(databasePath);
   db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;");
   const backupManager = new BackupManager(db, paths);
+  try {
+    assertCompatibleMigrationHistory(db, databasePath);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
   const version2 = currentMigrationVersion(db);
   const pending = migrations.filter((migration) => migration.version > version2);
   if (pending.length > 0 && existed) await backupManager.create("pre-migration", `v${version2}-to-v${pending.at(-1)?.version}-${isoFileTimestamp()}`);
@@ -10566,6 +10628,195 @@ function pageOf(items2, limit2, cursor) {
   const nextOffset = start + pageItems.length;
   const hasMore = nextOffset < items2.length;
   return { items: pageItems, nextCursor: hasMore ? encodeCursor(nextOffset) : null, hasMore };
+}
+function canonicaliseJson(value) {
+  if (Array.isArray(value)) {
+    return value.map(canonicaliseJson).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonicaliseJson(entry)])
+    );
+  }
+  return value;
+}
+function canonicalJson(value) {
+  return JSON.stringify(canonicaliseJson(value));
+}
+const DEFAULT_REPLACEMENT = "[REDACTED]";
+const DEFAULT_SECRET_NAMES = [
+  "access_token",
+  "api_key",
+  "authorization",
+  "bearer_token",
+  "client_secret",
+  "client_token",
+  "connection_string",
+  "cookie",
+  "database_url",
+  "id_token",
+  "password",
+  "passwd",
+  "private_key",
+  "refresh_token",
+  "secret",
+  "session",
+  "session_id",
+  "session_token",
+  "token"
+];
+const normaliseName = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+const DEFAULT_SECRET_SUFFIXES = DEFAULT_SECRET_NAMES.map(normaliseName).filter((name) => name.length >= 5);
+const SENSITIVE_NAME_SEGMENTS = /* @__PURE__ */ new Set(["authorization", "cookie", "credential", "credentials", "passwd", "password", "secret", "session", "token"]);
+function hasSensitiveNameSegment(value) {
+  const separated = value.replace(/([a-z\d])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return separated.some((segment) => SENSITIVE_NAME_SEGMENTS.has(segment));
+}
+function displayName(value) {
+  try {
+    return decodeURIComponent(value).toLowerCase();
+  } catch {
+    return value.toLowerCase();
+  }
+}
+function findJsonStringEnd(value, start) {
+  if (value[start] !== '"') return null;
+  for (let index = start + 1; index < value.length; index += 1) {
+    if (value[index] === "\\") index += 1;
+    else if (value[index] === '"') return index + 1;
+  }
+  return null;
+}
+function findJsonCompositeEnd(value, start) {
+  const opening = value[start];
+  if (opening !== "{" && opening !== "[") return null;
+  const closings = [opening === "{" ? "}" : "]"];
+  for (let index = start + 1; index < value.length; index += 1) {
+    if (value[index] === '"') {
+      const end = findJsonStringEnd(value, index);
+      if (end === null) return null;
+      index = end - 1;
+      continue;
+    }
+    if (value[index] === "{") closings.push("}");
+    else if (value[index] === "[") closings.push("]");
+    else if (value[index] === closings.at(-1)) {
+      closings.pop();
+      if (closings.length === 0) return index + 1;
+    }
+  }
+  return null;
+}
+function findJsonValueEnd(value, start) {
+  if (value[start] === '"') return findJsonStringEnd(value, start);
+  if (value[start] === "{" || value[start] === "[") return findJsonCompositeEnd(value, start);
+  const primitive = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:e[+-]?\d+)?)/i.exec(value.slice(start));
+  return primitive ? start + primitive[0].length : null;
+}
+function unquote(value) {
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && value.at(-1) === quote ? value.slice(1, -1) : value;
+}
+function replacePreservingQuote(value, replacement) {
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && value.at(-1) === quote ? `${quote}${replacement}${quote}` : replacement;
+}
+class SecretRedactor {
+  replacement;
+  sensitiveNames;
+  sensitiveSuffixes;
+  constructor(options = {}) {
+    this.replacement = options.replacement ?? DEFAULT_REPLACEMENT;
+    if (!this.replacement) throw new Error("Secret redaction replacement must not be empty");
+    const configured = options.secretNames ?? [];
+    const names2 = options.includeDefaultSecretNames === false ? configured : [...DEFAULT_SECRET_NAMES, ...configured];
+    this.sensitiveNames = new Set(names2.map(normaliseName).filter(Boolean));
+    this.sensitiveSuffixes = options.includeDefaultSecretNames === false ? [] : DEFAULT_SECRET_SUFFIXES;
+  }
+  redact(input) {
+    let value = input;
+    let count = 0;
+    const metadata2 = /* @__PURE__ */ new Map();
+    const isSensitive = (name) => {
+      const normalised = normaliseName(name);
+      return this.sensitiveNames.has(normalised) || this.sensitiveSuffixes.some((suffix) => normalised.length > suffix.length && normalised.endsWith(suffix)) || this.sensitiveSuffixes.length > 0 && hasSensitiveNameSegment(name);
+    };
+    const record2 = (kind, name) => {
+      count += 1;
+      const displayed = displayName(name);
+      const key = `${kind}:${normaliseName(displayed)}`;
+      const existing = metadata2.get(key);
+      if (existing) existing.count += 1;
+      else metadata2.set(key, { kind, name: displayed, count: 1 });
+    };
+    const isReplacement = (candidate) => unquote(candidate).trim() === this.replacement;
+    let output = "";
+    let copiedUntil = 0;
+    for (let index = 0; index < value.length; ) {
+      if (value[index] !== '"') {
+        index += 1;
+        continue;
+      }
+      const keyEnd = findJsonStringEnd(value, index);
+      if (keyEnd === null) break;
+      let separator = keyEnd;
+      while (/\s/.test(value[separator] ?? "")) separator += 1;
+      if (value[separator] !== ":") {
+        index = keyEnd;
+        continue;
+      }
+      let key = null;
+      try {
+        const parsed = JSON.parse(value.slice(index, keyEnd));
+        if (typeof parsed === "string") key = parsed;
+      } catch {
+        key = null;
+      }
+      let valueStart = separator + 1;
+      while (/\s/.test(value[valueStart] ?? "")) valueStart += 1;
+      const valueEnd = key && isSensitive(key) ? findJsonValueEnd(value, valueStart) : null;
+      if (key && valueEnd !== null && !isReplacement(value.slice(valueStart, valueEnd))) {
+        output += value.slice(copiedUntil, valueStart) + JSON.stringify(this.replacement);
+        copiedUntil = valueEnd;
+        record2("json-key", key);
+        index = valueEnd;
+      } else {
+        index = keyEnd;
+      }
+    }
+    if (copiedUntil > 0) value = output + value.slice(copiedUntil);
+    value = value.replace(/\b([a-z][a-z\d+.-]*:\/\/)([^/\s?#@]+)@/gi, (match, scheme, userinfo) => {
+      if (userinfo === this.replacement) return match;
+      record2("url-userinfo", "userinfo");
+      return `${scheme}${this.replacement}@`;
+    });
+    value = value.replace(/\b((?:proxy-)?authorization|cookie|set-cookie)(\s*:\s*)([^\r\n"']+)/gi, (match, name, separator, secret) => {
+      if (isReplacement(secret)) return match;
+      record2("header", name);
+      return `${name}${separator}${this.replacement}`;
+    });
+    value = value.replace(/([?&])([a-z0-9_.%~-]+)(=)([^&#\s"'`]*)/gi, (match, prefix, name, equals, secret) => {
+      let decodedName = name;
+      try {
+        decodedName = decodeURIComponent(name.replaceAll("+", " "));
+      } catch {
+      }
+      if (!secret || !isSensitive(decodedName) || isReplacement(secret)) return match;
+      record2("query-parameter", decodedName);
+      return `${prefix}${name}${equals}${this.replacement}`;
+    });
+    value = value.replace(/(^|[\s;(])(--?)([a-z][a-z0-9_.-]*)(?:(\s*=\s*)|(\s+))("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,&|)]+)/gim, (match, boundary, dashes, name, equals, spacing, secret) => {
+      if (!isSensitive(name) || isReplacement(secret)) return match;
+      record2("shell-flag", name);
+      return `${boundary}${dashes}${name}${equals ?? spacing ?? ""}${replacePreservingQuote(secret, this.replacement)}`;
+    });
+    value = value.replace(/(^|[\s;,(])((?:export\s+)?)([a-z_][a-z0-9_.-]*)(\s*=\s*)("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,&|)]+)/gim, (match, boundary, declaration, name, equals, secret) => {
+      if (!isSensitive(name) || isReplacement(secret)) return match;
+      record2("environment", name);
+      return `${boundary}${declaration}${name}${equals}${replacePreservingQuote(secret, this.replacement)}`;
+    });
+    return { value, redacted: count > 0, count, redactions: [...metadata2.values()] };
+  }
 }
 const now$1 = () => (/* @__PURE__ */ new Date()).toISOString();
 const textOrNull$1 = (value) => value == null ? null : String(value);
@@ -10637,11 +10888,11 @@ const exportTables = {
   work_item_labels: ["work_item_id", "label_id", "created_at"],
   updates: ["id", "project_id", "kind", "current_revision_id", "deleted_at", "version", "created_at", "updated_at"],
   update_revisions: ["id", "update_id", "revision", "content", "snapshot_json", "source", "client", "created_at"],
-  activity_events: ["id", "project_id", "entity_type", "entity_id", "event_type", "payload_json", "source", "client", "created_at"],
+  activity_events: ["id", "project_id", "entity_type", "entity_id", "event_type", "payload_json", "source", "client", "actor", "idempotency_key", "created_at"],
   requirement_states: ["id", "project_id", "name", "semantic", "position", "colour", "created_at", "updated_at"],
   requirements: ["id", "project_id", "stable_key", "kind", "parent_id", "title", "description", "state_id", "responsible_phase_id", "version", "created_at", "updated_at"],
   requirement_key_aliases: ["requirement_id", "alias", "created_at"],
-  acceptance_criteria: ["id", "requirement_id", "title", "description", "position", "required", "created_at", "updated_at"],
+  acceptance_criteria: ["id", "requirement_id", "title", "description", "position", "required", "version", "archived_at", "created_at", "updated_at"],
   requirement_phase_links: ["requirement_id", "phase_id", "role", "created_at"],
   work_queues: ["id", "project_id", "name", "description", "version", "created_at", "updated_at"],
   work_queue_items: ["queue_id", "work_item_id", "rank", "created_at"],
@@ -10653,19 +10904,21 @@ const exportTables = {
   workspace_aliases: ["workspace_id", "alias", "created_at"],
   project_workspaces: ["project_id", "workspace_id", "created_at"],
   workspace_revisions: ["id", "workspace_id", "branch", '"commit"', "dirty", "diff_hash", "captured_at"],
-  runs: ["id", "project_id", "workspace_revision_id", "command", "working_directory", "started_at", "ended_at", "duration_ms", "outcome", "exit_code", "toolchain_json", "stdout_excerpt", "stderr_excerpt", "stdout_truncated", "stderr_truncated", "created_at"],
+  project_secret_names: ["project_id", "name", "created_at"],
+  runs: ["id", "project_id", "workspace_revision_id", "command", "working_directory", "started_at", "ended_at", "duration_ms", "outcome", "exit_code", "toolchain_json", "stdout_excerpt", "stderr_excerpt", "stdout_truncated", "stderr_truncated", "validation_status", "redaction_json", "created_at"],
   test_summaries: ["id", "run_id", "scope", "passed", "failed", "skipped", "target_count", "created_at"],
   artifact_references: ["id", "run_id", "uri", "media_type", "byte_count", "digest", "created_at"],
-  evidence: ["id", "project_id", "run_id", "result", "summary", "target_version", "stale", "stale_reason", "created_at", "updated_at"],
+  evidence: ["id", "ordinal", "project_id", "run_id", "result", "summary", "target_version", "stale", "stale_reason", "validation_status", "redaction_json", "created_at", "updated_at"],
   evidence_artifact_links: ["evidence_id", "artifact_id"],
   evidence_requirement_links: ["evidence_id", "requirement_id"],
+  evidence_criterion_links: ["evidence_id", "criterion_id", "criterion_version", "created_at"],
   evidence_work_links: ["evidence_id", "work_item_id"],
   evidence_update_links: ["evidence_id", "update_id"],
   evidence_checkpoint_links: ["evidence_id", "checkpoint_id"],
+  evidence_overrides: ["evidence_id", "reason", "actor", "source", "client", "created_at"],
   checkpoint_snapshots: ["id", "checkpoint_id", "schema_version", "captured_at", "document_json", "digest"],
   idempotency_records: ["client", "idempotency_key", "operation", "request_hash", "result_json", "created_at"]
 };
-const legacyRequiredExportTables = /* @__PURE__ */ new Set(["projects", "phases", "work_items", "labels", "work_item_labels", "updates", "update_revisions", "activity_events"]);
 class SqliteIstraRepository {
   constructor(db) {
     this.db = db;
@@ -10709,19 +10962,10 @@ class SqliteIstraRepository {
       this.db.prepare("INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(randomUUID(), projectId, "Main queue", "Default ordered work queue", timestamp, timestamp);
     }
   }
-  backfillLegacyOperationalProjections(projectId) {
-    const queueId = this.ensureDefaultQueue(projectId);
-    this.db.prepare(`INSERT OR IGNORE INTO work_queue_items(queue_id,work_item_id,rank,created_at)
-      SELECT ?,wi.id,'legacy:' || wi.created_at || ':' || wi.id,wi.created_at
-      FROM work_items wi
-      WHERE wi.project_id=? AND NOT EXISTS (SELECT 1 FROM work_queue_items existing WHERE existing.work_item_id=wi.id)`).run(queueId, projectId);
-    this.db.prepare(`INSERT OR IGNORE INTO work_phase_links(work_item_id,phase_id,role,created_at)
-      SELECT wi.id,wi.phase_id,'responsible',wi.created_at
-      FROM work_items wi WHERE wi.project_id=? AND wi.phase_id IS NOT NULL`).run(projectId);
-  }
-  event(projectId, entityType, entityId, eventType, payload, provenance2) {
-    this.db.prepare(`INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?,?)`).run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), provenance2.source, provenance2.client ?? null, now$1());
-    this.db.prepare("UPDATE projects SET last_activity_at=? WHERE id=?").run(now$1(), projectId);
+  event(projectId, entityType, entityId, eventType, payload, provenance) {
+    const occurredAt = provenance.occurredAt ?? now$1();
+    this.db.prepare(`INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), provenance.source, provenance.client ?? null, provenance.actor ?? provenance.client ?? provenance.source, provenance.idempotencyKey ?? null, occurredAt);
+    if (projectId) this.db.prepare("UPDATE projects SET last_activity_at=? WHERE id=?").run(occurredAt, projectId);
   }
   replaceSearch(type2, id2, projectId, title2, body) {
     this.db.prepare("DELETE FROM search_index WHERE entity_type=? AND entity_id=?").run(type2, id2);
@@ -10816,18 +11060,18 @@ class SqliteIstraRepository {
       activity: this.listActivity(id2)
     };
   }
-  createProject(input, provenance2) {
+  createProject(input, provenance) {
     const id2 = randomUUID();
     const timestamp = now$1();
     return this.transaction(() => {
       this.db.prepare(`INSERT INTO projects(id,title,description,intent,deadline,completion_criteria,state,created_at,updated_at,last_activity_at) VALUES (?,?,?,?,?,?,'active',?,?,?)`).run(id2, input.title, input.description ?? null, input.intent ?? null, input.deadline ?? null, input.completionCriteria ?? null, timestamp, timestamp, timestamp);
       this.seedOperationalDefaults(id2, timestamp);
       this.replaceSearch("project", id2, id2, input.title, [input.description, input.intent, input.completionCriteria].filter(Boolean).join("\n"));
-      this.event(id2, "project", id2, "project.created", { title: input.title }, provenance2);
+      this.event(id2, "project", id2, "project.created", { title: input.title }, provenance);
       return this.getProject(id2);
     });
   }
-  updateProject(id2, input, provenance2) {
+  updateProject(id2, input, provenance) {
     const current = this.getProject(id2);
     if (!current) throw new NotFoundError("Project", id2);
     const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([key, value]) => key !== "expectedVersion" && value !== void 0)) };
@@ -10836,25 +11080,25 @@ class SqliteIstraRepository {
       if (Number(result2.changes) === 0) throw new ConflictError("Project", id2);
       this.replaceSearch("project", id2, id2, next.title, [next.description, next.intent, next.completionCriteria].filter(Boolean).join("\n"));
       const changes = beforeAfter(current, next, ["title", "description", "intent", "deadline", "completionCriteria", "state", "currentFocus", "nextAction", "blockers"]);
-      this.event(id2, "project", id2, "project.updated", { changed: Object.keys(changes), changes }, provenance2);
+      this.event(id2, "project", id2, "project.updated", { changed: Object.keys(changes), changes }, provenance);
       return this.getProject(id2);
     });
   }
-  archiveProject(id2, expectedVersion, archived, provenance2) {
+  archiveProject(id2, expectedVersion, archived, provenance) {
     const current = this.getProject(id2);
     if (!current) throw new NotFoundError("Project", id2);
     return this.transaction(() => {
       const result2 = this.db.prepare("UPDATE projects SET archived_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(archived ? now$1() : null, now$1(), id2, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Project", id2);
       const updated = this.getProject(id2);
-      this.event(id2, "project", id2, archived ? "project.archived" : "project.unarchived", { changes: { archivedAt: { before: current.archivedAt, after: updated.archivedAt } } }, provenance2);
+      this.event(id2, "project", id2, archived ? "project.archived" : "project.unarchived", { changes: { archivedAt: { before: current.archivedAt, after: updated.archivedAt } } }, provenance);
       return this.getProject(id2);
     });
   }
   listPhases(projectId, includeArchived = false) {
     return this.db.prepare(`SELECT * FROM phases WHERE project_id=? ${includeArchived ? "" : "AND archived_at IS NULL"} ORDER BY position,created_at`).all(projectId).map(phaseFromRow);
   }
-  createPhase(projectId, input, provenance2) {
+  createPhase(projectId, input, provenance) {
     if (!this.getProject(projectId)) throw new NotFoundError("Project", projectId);
     const id2 = randomUUID();
     const timestamp = now$1();
@@ -10862,11 +11106,11 @@ class SqliteIstraRepository {
     return this.transaction(() => {
       this.db.prepare("INSERT INTO phases(id,project_id,name,description,status,position,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id2, projectId, input.name, input.description ?? null, input.status, position, timestamp, timestamp);
       this.replaceSearch("phase", id2, projectId, input.name, input.description ?? "");
-      this.event(projectId, "phase", id2, "phase.created", { name: input.name }, provenance2);
+      this.event(projectId, "phase", id2, "phase.created", { name: input.name }, provenance);
       return phaseFromRow(this.db.prepare("SELECT * FROM phases WHERE id=?").get(id2));
     });
   }
-  updatePhase(id2, input, provenance2) {
+  updatePhase(id2, input, provenance) {
     const row = this.db.prepare("SELECT * FROM phases WHERE id=?").get(id2);
     if (!row) throw new NotFoundError("Phase", id2);
     const current = phaseFromRow(row);
@@ -10877,7 +11121,7 @@ class SqliteIstraRepository {
       this.replaceSearch("phase", id2, current.projectId, next.name, next.description ?? "");
       const updated = phaseFromRow(this.db.prepare("SELECT * FROM phases WHERE id=?").get(id2));
       const changes = beforeAfter(current, updated, ["name", "description", "status", "position", "archivedAt"]);
-      this.event(current.projectId, "phase", id2, "phase.updated", { changed: Object.keys(changes), changes }, provenance2);
+      this.event(current.projectId, "phase", id2, "phase.updated", { changed: Object.keys(changes), changes }, provenance);
       return updated;
     });
   }
@@ -10888,7 +11132,7 @@ class SqliteIstraRepository {
   listWorkItemsPage(projectId, limit2, cursor, statuses) {
     return pageOf(this.listWorkItems(projectId, statuses), limit2, cursor);
   }
-  createWorkItem(projectId, input, provenance2) {
+  createWorkItem(projectId, input, provenance) {
     if (!this.getProject(projectId)) throw new NotFoundError("Project", projectId);
     if (input.phaseId) this.assertPhaseInProject(input.phaseId, projectId);
     if (input.parentId) this.assertParentInProject(input.parentId, projectId);
@@ -10907,12 +11151,12 @@ class SqliteIstraRepository {
       for (const phaseId of new Set(input.relatedPhaseIds ?? [])) if (phaseId !== input.phaseId) this.insertWorkPhaseLink(id2, phaseId, "related", projectId);
       for (const requirementId of new Set(input.requirementIds ?? [])) this.db.prepare("INSERT OR IGNORE INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)").run(requirementId, id2, timestamp);
       this.replaceSearch("work_item", id2, projectId, input.title, input.description ?? "");
-      this.event(projectId, "work_item", id2, "work_item.created", { title: input.title, kind: input.kind, status: input.status ?? "open", phaseId: input.phaseId ?? null, stableKey: input.stableKey ?? null, parentId: input.parentId ?? null, queueId, rank: input.rank ?? null, labelIds }, provenance2);
-      for (const labelId of labelIds) this.event(projectId, "work_item", id2, "work_item.label_attached", { labelId }, provenance2);
+      this.event(projectId, "work_item", id2, "work_item.created", { title: input.title, kind: input.kind, status: input.status ?? "open", phaseId: input.phaseId ?? null, stableKey: input.stableKey ?? null, parentId: input.parentId ?? null, queueId, rank: input.rank ?? null, labelIds }, provenance);
+      for (const labelId of labelIds) this.event(projectId, "work_item", id2, "work_item.label_attached", { labelId }, provenance);
       return this.workItemFromRow(this.db.prepare("SELECT * FROM work_items WHERE id=?").get(id2));
     });
   }
-  updateWorkItem(id2, input, provenance2) {
+  updateWorkItem(id2, input, provenance) {
     const row = this.db.prepare("SELECT * FROM work_items WHERE id=?").get(id2);
     if (!row) throw new NotFoundError("Work item", id2);
     const current = this.workItemFromRow(row);
@@ -10951,9 +11195,9 @@ class SqliteIstraRepository {
       const currentEventState = { ...current, labelIds: previousLabelIds };
       const updatedEventState = { ...updated, labelIds: updated.labels.map((label) => label.id) };
       const changes = beforeAfter(currentEventState, updatedEventState, ["title", "description", "kind", "status", "priority", "phaseId", "stableKey", "parentId", "queueId", "rank", "labelIds"]);
-      this.event(current.projectId, "work_item", id2, "work_item.updated", { changed: Object.keys(changes), changes }, provenance2);
-      for (const labelId of updated.labels.map((label) => label.id).filter((labelId2) => !previousLabelIds.includes(labelId2))) this.event(current.projectId, "work_item", id2, "work_item.label_attached", { labelId }, provenance2);
-      for (const labelId of previousLabelIds.filter((labelId2) => !updated.labels.some((label) => label.id === labelId2))) this.event(current.projectId, "work_item", id2, "work_item.label_detached", { labelId }, provenance2);
+      this.event(current.projectId, "work_item", id2, "work_item.updated", { changed: Object.keys(changes), changes }, provenance);
+      for (const labelId of updated.labels.map((label) => label.id).filter((labelId2) => !previousLabelIds.includes(labelId2))) this.event(current.projectId, "work_item", id2, "work_item.label_attached", { labelId }, provenance);
+      for (const labelId of previousLabelIds.filter((labelId2) => !updated.labels.some((label) => label.id === labelId2))) this.event(current.projectId, "work_item", id2, "work_item.label_detached", { labelId }, provenance);
       return updated;
     });
   }
@@ -11015,21 +11259,21 @@ class SqliteIstraRepository {
     if (!this.db.prepare("SELECT 1 FROM updates WHERE id=?").get(updateId)) throw new NotFoundError("Update", updateId);
     return this.db.prepare("SELECT * FROM update_revisions WHERE update_id=? ORDER BY revision DESC").all(updateId).map(revisionFromRow);
   }
-  createUpdate(projectId, input, provenance2) {
-    return this.transaction(() => this.insertUpdate(projectId, input.kind, input.content, null, provenance2));
+  createUpdate(projectId, input, provenance) {
+    return this.transaction(() => this.insertUpdate(projectId, input.kind, input.content, null, provenance));
   }
-  insertUpdate(projectId, kind, content, snapshot, provenance2) {
+  insertUpdate(projectId, kind, content, snapshot, provenance) {
     if (!this.getProject(projectId)) throw new NotFoundError("Project", projectId);
     const id2 = randomUUID();
     const revisionId = randomUUID();
     const timestamp = now$1();
     this.db.prepare("INSERT INTO updates(id,project_id,kind,current_revision_id,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, kind, revisionId, timestamp, timestamp);
-    this.db.prepare("INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?)").run(revisionId, id2, 1, content, snapshot ? JSON.stringify(snapshot) : null, provenance2.source, provenance2.client ?? null, timestamp);
+    this.db.prepare("INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?)").run(revisionId, id2, 1, content, snapshot ? JSON.stringify(snapshot) : null, provenance.source, provenance.client ?? null, timestamp);
     this.replaceSearch("update", id2, projectId, kind, content);
-    this.event(projectId, "update", id2, kind === "checkpoint" ? "checkpoint.created" : "update.created", { kind, content }, provenance2);
+    this.event(projectId, "update", id2, kind === "checkpoint" ? "checkpoint.created" : "update.created", { kind, content }, provenance);
     return this.updateFromRow(this.db.prepare("SELECT * FROM updates WHERE id=?").get(id2));
   }
-  reviseUpdate(updateId, input, provenance2) {
+  reviseUpdate(updateId, input, provenance) {
     const row = this.db.prepare("SELECT * FROM updates WHERE id=?").get(updateId);
     if (!row) throw new NotFoundError("Update", updateId);
     if (row.deleted_at) throw new ValidationError("Deleted updates cannot be revised");
@@ -11041,14 +11285,14 @@ class SqliteIstraRepository {
       const revisionId = randomUUID();
       const timestamp = now$1();
       const currentRevision = this.db.prepare("SELECT snapshot_json FROM update_revisions WHERE id=?").get(String(row.current_revision_id));
-      this.db.prepare("INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?)").run(revisionId, updateId, revision, input.content, textOrNull$1(currentRevision.snapshot_json), provenance2.source, provenance2.client ?? null, timestamp);
+      this.db.prepare("INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?)").run(revisionId, updateId, revision, input.content, textOrNull$1(currentRevision.snapshot_json), provenance.source, provenance.client ?? null, timestamp);
       this.db.prepare("UPDATE updates SET current_revision_id=? WHERE id=?").run(revisionId, updateId);
       this.replaceSearch("update", updateId, projectId, String(row.kind), input.content);
-      this.event(projectId, "update", updateId, "update.revised", { revision, content: input.content }, provenance2);
+      this.event(projectId, "update", updateId, "update.revised", { revision, content: input.content }, provenance);
       return this.updateFromRow(this.db.prepare("SELECT * FROM updates WHERE id=?").get(updateId));
     });
   }
-  softDeleteUpdate(updateId, expectedVersion, provenance2) {
+  softDeleteUpdate(updateId, expectedVersion, provenance) {
     const row = this.db.prepare("SELECT * FROM updates WHERE id=?").get(updateId);
     if (!row) throw new NotFoundError("Update", updateId);
     if (row.kind === "checkpoint" && this.db.prepare("SELECT 1 FROM projects WHERE current_checkpoint_id=?").get(updateId)) throw new ValidationError("The current checkpoint cannot be deleted until another checkpoint is saved");
@@ -11056,11 +11300,11 @@ class SqliteIstraRepository {
       const result2 = this.db.prepare("UPDATE updates SET deleted_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(now$1(), now$1(), updateId, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Update", updateId);
       this.db.prepare("DELETE FROM search_index WHERE entity_type=? AND entity_id=?").run("update", updateId);
-      this.event(String(row.project_id), "update", updateId, "update.deleted", {}, provenance2);
+      this.event(String(row.project_id), "update", updateId, "update.deleted", {}, provenance);
       return this.updateFromRow(this.db.prepare("SELECT * FROM updates WHERE id=?").get(updateId));
     });
   }
-  saveCheckpoint(projectId, input, provenance2) {
+  saveCheckpoint(projectId, input, provenance) {
     const project = this.getProject(projectId);
     if (!project) throw new NotFoundError("Project", projectId);
     return this.transaction(() => {
@@ -11077,28 +11321,31 @@ class SqliteIstraRepository {
         unresolvedWorkItemIds: this.listWorkItems(projectId).filter((item) => !["resolved", "dropped"].includes(item.status)).map((item) => item.id),
         capturedAt: now$1()
       };
-      const checkpoint = this.insertUpdate(projectId, "checkpoint", input.content, snapshot, provenance2);
+      const checkpoint = this.insertUpdate(projectId, "checkpoint", input.content, snapshot, provenance);
       const result2 = this.db.prepare("UPDATE projects SET current_focus=?,next_action=?,blockers_json=?,current_checkpoint_id=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(currentFocus, nextAction, JSON.stringify(blockers), checkpoint.id, now$1(), projectId, input.expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Project", projectId);
-      this.event(projectId, "project", projectId, "project.checkpoint_selected", { checkpointId: checkpoint.id }, provenance2);
+      this.event(projectId, "project", projectId, "project.checkpoint_selected", { checkpointId: checkpoint.id }, provenance);
       return checkpoint;
     });
   }
   listLabels() {
     return this.db.prepare("SELECT * FROM labels ORDER BY name COLLATE NOCASE").all().map(labelFromRow);
   }
-  createLabel(input, provenance2) {
+  createLabel(input, provenance) {
     const id2 = randomUUID();
     const timestamp = now$1();
-    try {
-      this.db.prepare("INSERT INTO labels(id,name,colour,created_at,updated_at) VALUES (?,?,?,?,?)").run(id2, input.name, input.colour ?? null, timestamp, timestamp);
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("UNIQUE")) throw new ValidationError(`A label named “${input.name}” already exists`);
-      throw error;
-    }
-    return labelFromRow(this.db.prepare("SELECT * FROM labels WHERE id=?").get(id2));
+    return this.transaction(() => {
+      try {
+        this.db.prepare("INSERT INTO labels(id,name,colour,created_at,updated_at) VALUES (?,?,?,?,?)").run(id2, input.name, input.colour ?? null, timestamp, timestamp);
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("UNIQUE")) throw new ValidationError(`A label named “${input.name}” already exists`);
+        throw error;
+      }
+      this.event(null, "label", id2, "label.created", { name: input.name }, provenance);
+      return labelFromRow(this.db.prepare("SELECT * FROM labels WHERE id=?").get(id2));
+    });
   }
-  attachLabel(workItemId, labelId, expectedVersion, provenance2) {
+  attachLabel(workItemId, labelId, expectedVersion, provenance) {
     const row = this.db.prepare("SELECT * FROM work_items WHERE id=?").get(workItemId);
     if (!row) throw new NotFoundError("Work item", workItemId);
     return this.transaction(() => {
@@ -11109,11 +11356,11 @@ class SqliteIstraRepository {
       const result2 = this.db.prepare("UPDATE work_items SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now$1(), workItemId, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Work item", workItemId);
       this.insertWorkItemLabel(workItemId, labelId);
-      this.event(String(row.project_id), "work_item", workItemId, "work_item.label_attached", { labelId }, provenance2);
+      this.event(String(row.project_id), "work_item", workItemId, "work_item.label_attached", { labelId }, provenance);
       return this.workItemFromRow(this.db.prepare("SELECT * FROM work_items WHERE id=?").get(workItemId));
     });
   }
-  detachLabel(workItemId, labelId, expectedVersion, provenance2) {
+  detachLabel(workItemId, labelId, expectedVersion, provenance) {
     const row = this.db.prepare("SELECT * FROM work_items WHERE id=?").get(workItemId);
     if (!row) throw new NotFoundError("Work item", workItemId);
     return this.transaction(() => {
@@ -11123,20 +11370,22 @@ class SqliteIstraRepository {
       const result2 = this.db.prepare("UPDATE work_items SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now$1(), workItemId, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Work item", workItemId);
       this.db.prepare("DELETE FROM work_item_labels WHERE work_item_id=? AND label_id=?").run(workItemId, labelId);
-      this.event(String(row.project_id), "work_item", workItemId, "work_item.label_detached", { labelId }, provenance2);
+      this.event(String(row.project_id), "work_item", workItemId, "work_item.label_detached", { labelId }, provenance);
       return this.workItemFromRow(this.db.prepare("SELECT * FROM work_items WHERE id=?").get(workItemId));
     });
   }
   listActivity(projectId, limit2 = 200) {
     return this.db.prepare("SELECT * FROM activity_events WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT ?").all(projectId, Math.min(Math.max(limit2, 1), 1e3)).map((row) => ({
       id: String(row.id),
-      projectId: String(row.project_id),
+      projectId: textOrNull$1(row.project_id),
       entityType: String(row.entity_type),
       entityId: String(row.entity_id),
       eventType: String(row.event_type),
       payload: parseJson(row.payload_json, {}),
       source: String(row.source),
       client: textOrNull$1(row.client),
+      actor: String(row.actor),
+      idempotencyKey: textOrNull$1(row.idempotency_key),
       createdAt: String(row.created_at)
     }));
   }
@@ -11147,13 +11396,15 @@ class SqliteIstraRepository {
     const hasMore = rows.length > boundedLimit;
     const items2 = rows.slice(0, boundedLimit).map((row) => ({
       id: String(row.id),
-      projectId: String(row.project_id),
+      projectId: textOrNull$1(row.project_id),
       entityType: String(row.entity_type),
       entityId: String(row.entity_id),
       eventType: String(row.event_type),
       payload: parseJson(row.payload_json, {}),
       source: String(row.source),
       client: textOrNull$1(row.client),
+      actor: String(row.actor),
+      idempotencyKey: textOrNull$1(row.idempotency_key),
       createdAt: String(row.created_at)
     }));
     return { items: items2, nextCursor: hasMore ? encodeCursor(start + items2.length) : null, hasMore };
@@ -11170,6 +11421,8 @@ class SqliteIstraRepository {
       payload: parseJson(row.payload_json, {}),
       source: String(row.source),
       client: textOrNull$1(row.client),
+      actor: String(row.actor),
+      idempotencyKey: textOrNull$1(row.idempotency_key),
       createdAt: String(row.created_at)
     }));
   }
@@ -11223,12 +11476,12 @@ class SqliteIstraRepository {
   exportAll() {
     const tables = {};
     for (const [table, columns] of Object.entries(exportTables)) tables[table] = this.db.prepare(`SELECT ${columns.join(",")} FROM ${table}`).all();
-    return { format: "istra-export", formatVersion: 2, exportedAt: now$1(), tables };
+    return { format: "istra-export", formatVersion: 3, exportedAt: now$1(), tables };
   }
   validateImport(bundle) {
     const temp = new DatabaseSync(":memory:");
     try {
-      if (bundle.formatVersion !== 1 && bundle.formatVersion !== 2) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`);
+      if (bundle.formatVersion !== 3) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`);
       temp.exec("PRAGMA foreign_keys=ON;");
       for (const migration of migrations) temp.exec(migration.sql);
       temp.exec("BEGIN; PRAGMA defer_foreign_keys=ON;");
@@ -11253,13 +11506,147 @@ class SqliteIstraRepository {
           UNION ALL SELECT 'run_workspace',r.id FROM runs r JOIN workspace_revisions revision ON revision.id=r.workspace_revision_id WHERE NOT EXISTS (SELECT 1 FROM project_workspaces pw WHERE pw.project_id=r.project_id AND pw.workspace_id=revision.workspace_id)
           UNION ALL SELECT 'evidence_run',e.id FROM evidence e JOIN runs r ON r.id=e.run_id WHERE e.project_id<>r.project_id
           UNION ALL SELECT 'evidence_requirement',l.evidence_id FROM evidence_requirement_links l JOIN evidence e ON e.id=l.evidence_id JOIN requirements r ON r.id=l.requirement_id WHERE e.project_id<>r.project_id
+          UNION ALL SELECT 'evidence_criterion',l.evidence_id FROM evidence_criterion_links l JOIN evidence e ON e.id=l.evidence_id JOIN acceptance_criteria c ON c.id=l.criterion_id JOIN requirements r ON r.id=c.requirement_id WHERE e.project_id<>r.project_id OR l.criterion_version>c.version
+          UNION ALL SELECT 'evidence_criterion_requirement',l.evidence_id FROM evidence_criterion_links l JOIN acceptance_criteria c ON c.id=l.criterion_id WHERE NOT EXISTS (SELECT 1 FROM evidence_requirement_links erl WHERE erl.evidence_id=l.evidence_id AND erl.requirement_id=c.requirement_id)
           UNION ALL SELECT 'evidence_work',l.evidence_id FROM evidence_work_links l JOIN evidence e ON e.id=l.evidence_id JOIN work_items w ON w.id=l.work_item_id WHERE e.project_id<>w.project_id
           UNION ALL SELECT 'evidence_update',l.evidence_id FROM evidence_update_links l JOIN evidence e ON e.id=l.evidence_id JOIN updates u ON u.id=l.update_id WHERE e.project_id<>u.project_id
           UNION ALL SELECT 'evidence_checkpoint',l.evidence_id FROM evidence_checkpoint_links l JOIN evidence e ON e.id=l.evidence_id JOIN updates u ON u.id=l.checkpoint_id WHERE e.project_id<>u.project_id OR u.kind<>'checkpoint'
           UNION ALL SELECT 'evidence_artifact',l.evidence_id FROM evidence_artifact_links l JOIN evidence e ON e.id=l.evidence_id JOIN artifact_references a ON a.id=l.artifact_id WHERE a.run_id IS NOT e.run_id
-          UNION ALL SELECT 'checkpoint_snapshot',s.id FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id WHERE u.kind<>'checkpoint'
+          UNION ALL SELECT 'evidence_override',e.id FROM evidence e LEFT JOIN evidence_overrides o ON o.evidence_id=e.id WHERE (e.validation_status='overridden')<>(o.evidence_id IS NOT NULL)
+          UNION ALL SELECT 'checkpoint_snapshot',s.id FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id WHERE u.kind<>'checkpoint' OR s.schema_version<>3
         )
       `).all();
+      const orphanArtifacts = temp.prepare(`SELECT a.id FROM artifact_references a LEFT JOIN evidence_artifact_links l ON l.artifact_id=a.id WHERE a.run_id IS NULL GROUP BY a.id HAVING COUNT(l.evidence_id)=0`).all();
+      const invalidRuns = temp.prepare("SELECT * FROM runs").all().flatMap((run) => {
+        const summary = temp.prepare("SELECT passed,failed,skipped,target_count FROM test_summaries WHERE run_id=?").get(String(run.id));
+        const violations = validateRunInvariants({
+          startedAt: String(run.started_at),
+          endedAt: textOrNull$1(run.ended_at),
+          outcome: String(run.outcome),
+          exitCode: run.exit_code === null ? null : Number(run.exit_code),
+          testSummary: summary ? { passed: Number(summary.passed), failed: Number(summary.failed), skipped: Number(summary.skipped), targetCount: Number(summary.target_count) } : null
+        });
+        return violations.length ? [{ runId: String(run.id), violations }] : [];
+      });
+      const invalidEvidence = temp.prepare("SELECT * FROM evidence").all().flatMap((evidence) => {
+        const run = evidence.run_id ? temp.prepare("SELECT * FROM runs WHERE id=?").get(String(evidence.run_id)) : void 0;
+        const override = temp.prepare("SELECT reason FROM evidence_overrides WHERE evidence_id=?").get(String(evidence.id));
+        const violations = validateEvidenceInvariants({ result: String(evidence.result), runId: textOrNull$1(evidence.run_id) }, {
+          linkedRun: run ? { id: String(run.id), outcome: String(run.outcome), invariantsValid: String(run.validation_status) === "validated" } : null,
+          verifiedOverride: override ? { reason: String(override.reason) } : null
+        });
+        return violations.length ? [{ evidenceId: String(evidence.id), violations }] : [];
+      });
+      const redactors = /* @__PURE__ */ new Map();
+      const redactorFor = (projectId) => {
+        const existing = redactors.get(projectId);
+        if (existing) return existing;
+        const secretNames = temp.prepare("SELECT name FROM project_secret_names WHERE project_id=?").all(projectId).map((row) => String(row.name));
+        const redactor = new SecretRedactor({ secretNames });
+        redactors.set(projectId, redactor);
+        return redactor;
+      };
+      const invalidRedactions = [];
+      for (const run of temp.prepare("SELECT * FROM runs").all()) {
+        const redactor = redactorFor(String(run.project_id));
+        const fields = {
+          command: run.command,
+          working_directory: run.working_directory,
+          stdout_excerpt: run.stdout_excerpt,
+          stderr_excerpt: run.stderr_excerpt,
+          ...Object.fromEntries(Object.entries(parseJson(run.toolchain_json, {})).map(([name, value]) => [`toolchain.${name}`, value]))
+        };
+        for (const [field, value] of Object.entries(fields)) if (typeof value === "string" && redactor.redact(value).redacted) invalidRedactions.push({ entityType: "run", entityId: String(run.id), field });
+      }
+      for (const evidence of temp.prepare("SELECT id,project_id,summary FROM evidence").all()) {
+        if (redactorFor(String(evidence.project_id)).redact(String(evidence.summary)).redacted) invalidRedactions.push({ entityType: "evidence", entityId: String(evidence.id), field: "summary" });
+      }
+      for (const artifact of temp.prepare(`SELECT a.id,a.uri,COALESCE(r.project_id,e.project_id) AS project_id
+        FROM artifact_references a
+        LEFT JOIN runs r ON r.id=a.run_id
+        LEFT JOIN evidence_artifact_links l ON l.artifact_id=a.id
+        LEFT JOIN evidence e ON e.id=l.evidence_id`).all()) {
+        if (artifact.project_id && redactorFor(String(artifact.project_id)).redact(String(artifact.uri)).redacted) invalidRedactions.push({ entityType: "artifact", entityId: String(artifact.id), field: "uri" });
+      }
+      const invalidStructuredSnapshots = temp.prepare(`SELECT s.id,s.document_json,s.digest,u.project_id
+        FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id`).all().flatMap((snapshot) => {
+        const document = parseJson(snapshot.document_json, null);
+        if (!document || typeof document !== "object" || Array.isArray(document)) return [{ snapshotId: String(snapshot.id), reason: "structured snapshot document must be an object" }];
+        const structured = document;
+        const snapshotProject = structured.project;
+        if (!snapshotProject || typeof snapshotProject !== "object" || Array.isArray(snapshotProject) || String(snapshotProject.id) !== String(snapshot.project_id)) {
+          return [{ snapshotId: String(snapshot.id), reason: "structured snapshot project does not match its checkpoint" }];
+        }
+        const requiredArrays = [
+          "phases",
+          "requirementStates",
+          "requirements",
+          "workItems",
+          "queues",
+          "relations",
+          "blockers",
+          "workspaces",
+          "workspaceRevisions",
+          "runs",
+          "testSummaries",
+          "evidence",
+          "updates",
+          "updateRevisions",
+          "labels",
+          "projectSecretNames",
+          "evidenceHeads"
+        ];
+        if (requiredArrays.some((section) => !Array.isArray(structured[section]))) return [{ snapshotId: String(snapshot.id), reason: "structured snapshot is missing a required v3 section" }];
+        const links = structured.links;
+        const requiredLinkSections = ["requirementAliases", "requirementPhases", "requirementWork", "workPhases"];
+        if (!links || typeof links !== "object" || Array.isArray(links) || requiredLinkSections.some((section) => !Array.isArray(links[section]))) {
+          return [{ snapshotId: String(snapshot.id), reason: "structured snapshot is missing required v3 ownership links" }];
+        }
+        const projectId = String(snapshot.project_id);
+        const projectScopedSections = [
+          ["phases", "project_id"],
+          ["requirementStates", "projectId"],
+          ["requirements", "projectId"],
+          ["workItems", "projectId"],
+          ["queues", "projectId"],
+          ["relations", "projectId"],
+          ["blockers", "projectId"],
+          ["workspaces", "project_id"],
+          ["runs", "projectId"],
+          ["evidence", "projectId"],
+          ["updates", "project_id"]
+        ];
+        const containsForeignProject = projectScopedSections.some(([section, projectField]) => structured[section].some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry) || String(entry[projectField]) !== projectId));
+        if (containsForeignProject) return [{ snapshotId: String(snapshot.id), reason: "structured snapshot contains data owned by another project" }];
+        const ids = (section, field) => new Set(structured[section].map((entry) => String(entry[field])));
+        const workspaceIds = ids("workspaces", "id");
+        const workspaceRevisionIds = ids("workspaceRevisions", "id");
+        const phaseIds = ids("phases", "id");
+        const requirementStateIds = ids("requirementStates", "id");
+        const requirementIds = ids("requirements", "id");
+        const workItemIds = ids("workItems", "id");
+        const queueIds = ids("queues", "id");
+        const runIds = ids("runs", "id");
+        const evidenceIds = ids("evidence", "id");
+        const updateIds = ids("updates", "id");
+        const updateRevisionIds = ids("updateRevisions", "id");
+        const labelIds = ids("labels", "id");
+        if (structured.workspaceRevisions.some((entry) => !workspaceIds.has(String(entry.workspace_id))) || structured.testSummaries.some((entry) => !runIds.has(String(entry.run_id))) || structured.updateRevisions.some((entry) => !updateIds.has(String(entry.update_id))) || structured.evidenceHeads.some((entry) => !evidenceIds.has(String(entry.id)))) {
+          return [{ snapshotId: String(snapshot.id), reason: "structured snapshot contains an invalid nested ownership link" }];
+        }
+        const criteriaOwned = structured.requirements.every((requirement) => Array.isArray(requirement.criteria) && requirement.criteria.every((criterion) => String(criterion.requirementId) === String(requirement.id)));
+        if (!criteriaOwned || !structured.projectSecretNames.every((name) => typeof name === "string")) {
+          return [{ snapshotId: String(snapshot.id), reason: "structured snapshot contains invalid criterion or redaction ownership data" }];
+        }
+        const criterionIds = new Set(structured.requirements.flatMap((requirement) => requirement.criteria.map((criterion) => String(criterion.id))));
+        const belongsOrNull = (set, value) => value === null || value === void 0 || set.has(String(value));
+        const nestedOwnershipInvalid = structured.requirements.some((requirement) => !belongsOrNull(requirementIds, requirement.parentId) || !requirementStateIds.has(String(requirement.stateId)) || !belongsOrNull(phaseIds, requirement.responsiblePhaseId) || !Array.isArray(requirement.relatedPhaseIds) || requirement.relatedPhaseIds.some((id2) => !phaseIds.has(String(id2))) || !Array.isArray(requirement.linkedWorkItemIds) || requirement.linkedWorkItemIds.some((id2) => !workItemIds.has(String(id2))) || !Array.isArray(requirement.linkedEvidenceIds) || requirement.linkedEvidenceIds.some((id2) => !evidenceIds.has(String(id2))) || requirement.criteria.some((criterion) => !belongsOrNull(evidenceIds, criterion.proofEvidenceId))) || structured.workItems.some((item) => !belongsOrNull(phaseIds, item.phaseId) || !belongsOrNull(workItemIds, item.parentId) || !belongsOrNull(queueIds, item.queueId) || !Array.isArray(item.labels) || item.labels.some((label) => !labelIds.has(String(label.id)))) || structured.relations.some((relation) => !workItemIds.has(String(relation.fromWorkItemId)) || !workItemIds.has(String(relation.toWorkItemId))) || structured.blockers.some((blocker) => !belongsOrNull(workItemIds, blocker.workItemId)) || structured.runs.some((run) => !belongsOrNull(workspaceRevisionIds, run.workspaceRevisionId) || !Array.isArray(run.artifacts) || run.artifacts.some((artifact) => String(artifact.runId) !== String(run.id))) || structured.evidence.some((evidence) => !belongsOrNull(runIds, evidence.runId) || !Array.isArray(evidence.requirementIds) || evidence.requirementIds.some((id2) => !requirementIds.has(String(id2))) || !Array.isArray(evidence.workItemIds) || evidence.workItemIds.some((id2) => !workItemIds.has(String(id2))) || !Array.isArray(evidence.updateIds) || evidence.updateIds.some((id2) => !updateIds.has(String(id2))) || !Array.isArray(evidence.checkpointIds) || evidence.checkpointIds.some((id2) => !updateIds.has(String(id2))) || !Array.isArray(evidence.criterionLinks) || evidence.criterionLinks.some((link) => !criterionIds.has(String(link.criterionId))) || !Array.isArray(evidence.artifacts) || evidence.artifacts.some((artifact) => String(artifact.runId ?? "") !== String(evidence.runId ?? ""))) || structured.updates.some((update) => !updateRevisionIds.has(String(update.current_revision_id))) || structured.workspaces.some((workspace) => !Array.isArray(workspace.aliases) || workspace.aliases.some((alias) => typeof alias !== "string")) || !belongsOrNull(updateIds, snapshotProject.current_checkpoint_id);
+        const ownershipLinks = links;
+        const rawOwnershipInvalid = ownershipLinks.requirementAliases.some((link) => !requirementIds.has(String(link.requirement_id))) || ownershipLinks.requirementPhases.some((link) => !requirementIds.has(String(link.requirement_id)) || !phaseIds.has(String(link.phase_id))) || ownershipLinks.requirementWork.some((link) => !requirementIds.has(String(link.requirement_id)) || !workItemIds.has(String(link.work_item_id))) || ownershipLinks.workPhases.some((link) => !workItemIds.has(String(link.work_item_id)) || !phaseIds.has(String(link.phase_id)));
+        if (nestedOwnershipInvalid || rawOwnershipInvalid) return [{ snapshotId: String(snapshot.id), reason: "structured snapshot contains a cross-project nested reference" }];
+        const digest = createHash("sha256").update(canonicalJson(document)).digest("hex");
+        return digest === String(snapshot.digest) ? [] : [{ snapshotId: String(snapshot.id), reason: "structured snapshot digest does not match its document" }];
+      });
       const invalidSnapshots = [];
       const snapshots = temp.prepare(`SELECT u.id,u.project_id,r.snapshot_json FROM updates u JOIN update_revisions r ON r.update_id=u.id WHERE u.kind='checkpoint'`).all();
       for (const row of snapshots) {
@@ -11274,8 +11661,8 @@ class SqliteIstraRepository {
         const workItemCount = workItemIds.length ? Number(temp.prepare(`SELECT COUNT(*) AS count FROM work_items WHERE project_id=? AND id IN (${workItemIds.map(() => "?").join(",")})`).get(String(row.project_id), ...workItemIds).count) : 0;
         if (phaseCount !== new Set(phaseIds).size || workItemCount !== new Set(workItemIds).size) invalidSnapshots.push({ updateId: String(row.id), reason: "snapshot references an entity outside the project" });
       }
-      if (integrity.integrity_check !== "ok" || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length) {
-        throw new ValidationError("Import failed database integrity checks", { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots });
+      if (integrity.integrity_check !== "ok" || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length || invalidStructuredSnapshots.length || orphanArtifacts.length || invalidRuns.length || invalidEvidence.length || invalidRedactions.length) {
+        throw new ValidationError("Import failed database integrity checks", { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots, invalidStructuredSnapshots, orphanArtifacts, invalidRuns, invalidEvidence, invalidRedactions });
       }
     } catch (error) {
       if (error instanceof ValidationError) throw error;
@@ -11295,7 +11682,6 @@ class SqliteIstraRepository {
       for (const row of this.db.prepare("SELECT id FROM projects").all()) {
         const projectId = String(row.id);
         this.seedOperationalDefaults(projectId);
-        if (bundle.formatVersion === 1) this.backfillLegacyOperationalProjections(projectId);
       }
       this.rebuildSearch();
     });
@@ -11303,10 +11689,7 @@ class SqliteIstraRepository {
   loadTables(db, bundle) {
     for (const [table, columns] of Object.entries(exportTables)) {
       const rows = bundle.tables[table];
-      if (!Array.isArray(rows)) {
-        if (bundle.formatVersion === 1 && !legacyRequiredExportTables.has(table)) continue;
-        throw new ValidationError(`Import is missing table ${table}`);
-      }
+      if (!Array.isArray(rows)) throw new ValidationError(`Import is missing table ${table}`);
       const statement = db.prepare(`INSERT INTO ${table}(${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
       for (const row of rows) statement.run(...columns.map((column) => {
         const key = column.replaceAll('"', "");
@@ -11322,6 +11705,44 @@ class SqliteIstraRepository {
     for (const row of updateRows) this.replaceSearch("update", String(row.id), String(row.project_id), String(row.kind), String(row.content));
   }
 }
+function newestFirst(left, right) {
+  return right.ordinal - left.ordinal;
+}
+function evaluateCriterionProof(input) {
+  const current = input.evidence.filter((entry) => !entry.stale && entry.validationStatus !== "legacy_unvalidated").sort(newestFirst);
+  const decisive = current.find((entry) => entry.result === "verified" || entry.result === "failed");
+  if (decisive?.result === "verified") return { status: "proven", evidenceId: decisive.id, reason: "Latest decisive evidence is verified" };
+  if (decisive?.result === "failed") return { status: "defect", evidenceId: decisive.id, reason: "Latest decisive evidence failed" };
+  const partial2 = current.find((entry) => entry.result === "recorded" || entry.result === "interrupted");
+  if (partial2) return { status: "partial", evidenceId: partial2.id, reason: `Latest current evidence is ${partial2.result}` };
+  return { status: "open", evidenceId: null, reason: "No current validated evidence" };
+}
+function explainRequirementProof(criteria) {
+  const activeRequired = criteria.filter((criterion) => criterion.required && !criterion.archivedAt);
+  const count = (status2) => activeRequired.filter((criterion) => criterion.status === status2).length;
+  const defectiveCriteria = count("defect");
+  const provenCriteria = count("proven");
+  const partialCriteria = count("partial");
+  const openCriteria = count("open");
+  const status = activeRequired.length === 0 ? "open" : defectiveCriteria > 0 ? "defect" : provenCriteria === activeRequired.length ? "proven" : provenCriteria + partialCriteria > 0 ? "partial" : "open";
+  return {
+    status,
+    requiredCriteria: activeRequired.length,
+    provenCriteria,
+    defectiveCriteria,
+    partialCriteria,
+    openCriteria,
+    criteria: criteria.map((criterion) => ({
+      id: criterion.id,
+      title: criterion.title,
+      required: criterion.required,
+      archivedAt: criterion.archivedAt ?? null,
+      proofStatus: criterion.status,
+      proofEvidenceId: criterion.evidenceId,
+      proofReason: criterion.reason
+    }))
+  };
+}
 const now = () => (/* @__PURE__ */ new Date()).toISOString();
 const textOrNull = (value) => value === null || value === void 0 ? null : String(value);
 const bool = (value) => Number(value) === 1;
@@ -11332,12 +11753,18 @@ const json = (value, fallback) => {
     return fallback;
   }
 };
+const stripAnsi = (value) => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+const redactionMetadata = (entries) => ({
+  count: entries.reduce((total, entry) => total + entry.result.count, 0),
+  fields: [...new Set(entries.flatMap((entry) => entry.result.redactions.map((redaction) => `${entry.field}:${redaction.kind}:${redaction.name}`)))]
+});
 class SqliteOperationalRepository {
   constructor(db) {
     this.db = db;
   }
   db;
   savepointSequence = 0;
+  activeContext = null;
   transaction(work) {
     if (this.db.isTransaction) {
       const savepoint = `operational_${this.savepointSequence++}`;
@@ -11363,17 +11790,37 @@ class SqliteOperationalRepository {
     }
   }
   runIdempotent(client2, key, operation, payload, work) {
+    return this.runMutation({ source: "system", actor: client2, client: client2, idempotencyKey: key, occurredAt: now() }, operation, payload, work);
+  }
+  runMutation(context, operation, payload, work) {
     const requestHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
     return this.transaction(() => {
-      const existing = this.db.prepare("SELECT operation,request_hash,result_json FROM idempotency_records WHERE client=? AND idempotency_key=?").get(client2, key);
-      if (existing) {
-        if (String(existing.operation) !== operation || String(existing.request_hash) !== requestHash) throw new IdempotencyConflictError(key);
-        return json(existing.result_json, void 0);
+      const previousContext = this.activeContext;
+      this.activeContext = context;
+      try {
+        const idempotencyClient = context.client ?? context.actor;
+        if (context.idempotencyKey) {
+          const existing = this.db.prepare("SELECT operation,request_hash,result_json FROM idempotency_records WHERE client=? AND idempotency_key=?").get(idempotencyClient, context.idempotencyKey);
+          if (existing) {
+            if (String(existing.operation) !== operation || String(existing.request_hash) !== requestHash) throw new IdempotencyConflictError(context.idempotencyKey);
+            return json(existing.result_json, void 0);
+          }
+        }
+        const result2 = work();
+        if (context.idempotencyKey) this.db.prepare("INSERT INTO idempotency_records(client,idempotency_key,operation,request_hash,result_json,created_at) VALUES (?,?,?,?,?,?)").run(idempotencyClient, context.idempotencyKey, operation, requestHash, JSON.stringify(result2) ?? "null", context.occurredAt);
+        return result2;
+      } finally {
+        this.activeContext = previousContext;
       }
-      const result2 = work();
-      this.db.prepare("INSERT INTO idempotency_records(client,idempotency_key,operation,request_hash,result_json,created_at) VALUES (?,?,?,?,?,?)").run(client2, key, operation, requestHash, JSON.stringify(result2) ?? "null", now());
-      return result2;
     });
+  }
+  mutationContext() {
+    return this.activeContext ?? { source: "system", actor: "internal", client: "internal", idempotencyKey: null, occurredAt: now() };
+  }
+  event(projectId, entityType, entityId, eventType, payload = {}) {
+    const context = this.mutationContext();
+    this.db.prepare("INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), context.source, context.client ?? null, context.actor, context.idempotencyKey, context.occurredAt);
+    if (projectId) this.db.prepare("UPDATE projects SET last_activity_at=? WHERE id=?").run(context.occurredAt, projectId);
   }
   project(projectId) {
     const row = this.db.prepare("SELECT * FROM projects WHERE id=?").get(projectId);
@@ -11403,30 +11850,80 @@ class SqliteOperationalRepository {
     } catch (error) {
       throw new ValidationError(error instanceof Error ? error.message : "Could not create requirement state");
     }
+    this.event(projectId, "requirement_state", id2, "requirement_state.created", { name: input.name, semantic: input.semantic });
     return this.listRequirementStates(projectId).find((state) => state.id === id2);
   }
+  evidenceStaleness(row) {
+    const id2 = String(row.id);
+    const targetVersion = row.target_version === null ? null : Number(row.target_version);
+    const storedStale = bool(row.stale);
+    const storedStaleReason = textOrNull(row.stale_reason);
+    let stale = storedStale;
+    let staleReason = storedStaleReason;
+    if (targetVersion !== null) {
+      const versions = [
+        ...this.db.prepare("SELECT version FROM requirements r JOIN evidence_requirement_links l ON l.requirement_id=r.id WHERE l.evidence_id=?").all(id2),
+        ...this.db.prepare("SELECT version FROM work_items w JOIN evidence_work_links l ON l.work_item_id=w.id WHERE l.evidence_id=?").all(id2),
+        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_update_links l ON l.update_id=u.id WHERE l.evidence_id=?").all(id2),
+        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_checkpoint_links l ON l.checkpoint_id=u.id WHERE l.evidence_id=?").all(id2)
+      ].map((entry) => Number(entry.version));
+      const currentVersion = versions.length ? Math.max(...versions) : targetVersion;
+      const derivedStale = currentVersion > targetVersion;
+      stale = storedStale || derivedStale;
+      staleReason = storedStale ? storedStaleReason ?? "Evidence was explicitly marked stale" : derivedStale ? `Linked entity advanced from version ${targetVersion} to ${currentVersion}` : null;
+    }
+    return { stale, staleReason };
+  }
   criteria(requirementId) {
-    return this.db.prepare("SELECT * FROM acceptance_criteria WHERE requirement_id=? ORDER BY position,created_at").all(requirementId).map((row) => ({
-      id: String(row.id),
-      requirementId: String(row.requirement_id),
-      title: String(row.title),
-      description: textOrNull(row.description),
-      position: Number(row.position),
-      required: bool(row.required),
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at)
-    }));
+    return this.db.prepare("SELECT * FROM acceptance_criteria WHERE requirement_id=? ORDER BY archived_at IS NOT NULL,position,created_at").all(requirementId).map((row) => {
+      const evidence = this.db.prepare(`SELECT e.*,l.criterion_version
+        FROM evidence_criterion_links l JOIN evidence e ON e.id=l.evidence_id WHERE l.criterion_id=? ORDER BY e.ordinal DESC`).all(String(row.id)).map((entry) => {
+        const effective = this.evidenceStaleness(entry);
+        return {
+          id: String(entry.id),
+          ordinal: Number(entry.ordinal),
+          result: String(entry.result),
+          createdAt: String(entry.created_at),
+          stale: effective.stale || Number(entry.criterion_version) !== Number(row.version),
+          validationStatus: String(entry.validation_status)
+        };
+      });
+      const proof = evaluateCriterionProof({ id: String(row.id), title: String(row.title), required: bool(row.required), evidence });
+      const archivedAt = textOrNull(row.archived_at);
+      return {
+        id: String(row.id),
+        requirementId: String(row.requirement_id),
+        title: String(row.title),
+        description: textOrNull(row.description),
+        position: Number(row.position),
+        required: bool(row.required),
+        version: Number(row.version),
+        archivedAt,
+        proofStatus: proof.status,
+        proofEvidenceId: proof.evidenceId,
+        proofReason: archivedAt ? "Criterion is archived and does not participate in requirement proof" : proof.reason,
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at)
+      };
+    });
   }
   requirementFromRow(row) {
     const id2 = String(row.id);
     const relatedPhaseIds = this.db.prepare("SELECT phase_id FROM requirement_phase_links WHERE requirement_id=? AND role='related'").all(id2).map((entry) => String(entry.phase_id));
     const linkedWorkItemIds = this.db.prepare("SELECT work_item_id FROM requirement_work_links WHERE requirement_id=?").all(id2).map((entry) => String(entry.work_item_id));
     const linkedEvidenceIds = this.db.prepare("SELECT evidence_id FROM evidence_requirement_links WHERE requirement_id=?").all(id2).map((entry) => String(entry.evidence_id));
-    const required2 = this.criteria(id2).filter((criterion) => criterion.required);
-    const linkedEvidence = this.db.prepare("SELECT e.* FROM evidence e JOIN evidence_requirement_links l ON l.evidence_id=e.id WHERE l.requirement_id=?").all(id2).map((entry) => this.evidenceFromRow(entry));
-    const satisfied = required2.length > 0 && linkedEvidence.some((entry) => entry.result === "verified" && !entry.stale);
-    const state = String(row.semantic);
-    const gate = required2.length === 0 ? "not_configured" : satisfied ? "satisfied" : "unsatisfied";
+    const criteria = this.criteria(id2);
+    const proofExplanation = explainRequirementProof(criteria.map((criterion) => ({
+      id: criterion.id,
+      title: criterion.title,
+      required: criterion.required,
+      archivedAt: criterion.archivedAt,
+      evidence: [],
+      status: criterion.proofStatus,
+      evidenceId: criterion.proofEvidenceId,
+      reason: criterion.proofReason
+    })));
+    const gate = proofExplanation.requiredCriteria === 0 ? "not_configured" : proofExplanation.status === "proven" ? "satisfied" : "unsatisfied";
     return {
       id: id2,
       projectId: String(row.project_id),
@@ -11440,11 +11937,13 @@ class SqliteOperationalRepository {
       version: Number(row.version),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
-      criteria: this.criteria(id2),
+      criteria,
       relatedPhaseIds,
       linkedWorkItemIds,
       linkedEvidenceIds,
-      gate: state === "proven" && gate !== "satisfied" ? "unsatisfied" : gate
+      gate,
+      proofStatus: proofExplanation.status,
+      proofExplanation
     };
   }
   listRequirements(projectId) {
@@ -11480,6 +11979,7 @@ class SqliteOperationalRepository {
     if (!state) throw new ValidationError("Requirement state does not belong to the project");
     if (input.parentId) this.assertRequirementParent(input.parentId, projectId);
     if (input.responsiblePhaseId) this.assertProjectEntity("phases", input.responsiblePhaseId, projectId);
+    if (input.criteria?.some((criterion) => criterion.id)) throw new ValidationError("New requirements cannot reuse existing criterion ids");
     return this.transaction(() => {
       const id2 = randomUUID();
       const timestamp = now();
@@ -11493,6 +11993,7 @@ class SqliteOperationalRepository {
         this.assertProjectEntity("phases", phaseId, projectId);
         this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, phaseId, phaseId === input.responsiblePhaseId ? "responsible" : "related", timestamp);
       }
+      this.event(projectId, "requirement", id2, "requirement.created", { stableKey: input.stableKey, criterionCount: input.criteria?.length ?? 0 });
       return this.getRequirement(id2);
     });
   }
@@ -11517,9 +12018,31 @@ class SqliteOperationalRepository {
         for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== responsiblePhaseId) this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, phaseId, "related", now());
       }
       if (input.criteria !== void 0) {
-        this.db.prepare("DELETE FROM acceptance_criteria WHERE requirement_id=?").run(id2);
-        for (const [position, criterion] of input.criteria.entries()) this.db.prepare("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(randomUUID(), id2, criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, now(), now());
+        const existing = this.db.prepare("SELECT * FROM acceptance_criteria WHERE requirement_id=?").all(id2);
+        const byId = new Map(existing.map((criterion) => [String(criterion.id), criterion]));
+        const retained = /* @__PURE__ */ new Set();
+        for (const [position, criterion] of input.criteria.entries()) {
+          if (!criterion.id) {
+            const criterionId = randomUUID();
+            const timestamp = now();
+            this.db.prepare("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(criterionId, id2, criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, timestamp, timestamp);
+            this.event(current.projectId, "acceptance_criterion", criterionId, "acceptance_criterion.created", { requirementId: id2 });
+            continue;
+          }
+          const stored = byId.get(criterion.id);
+          if (!stored) throw new ValidationError("Criterion must belong to the requirement being updated");
+          const changed = String(stored.title) !== criterion.title || textOrNull(stored.description) !== (criterion.description ?? null) || bool(stored.required) !== criterion.required || Number(stored.position) !== position || stored.archived_at !== null;
+          const result22 = this.db.prepare(`UPDATE acceptance_criteria SET title=?,description=?,position=?,required=?,archived_at=NULL,version=version+?,updated_at=? WHERE id=? AND requirement_id=? AND version=?`).run(criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, changed ? 1 : 0, now(), criterion.id, id2, criterion.expectedVersion);
+          if (!Number(result22.changes)) throw new ConflictError("Acceptance criterion", criterion.id);
+          retained.add(criterion.id);
+          if (changed) this.event(current.projectId, "acceptance_criterion", criterion.id, "acceptance_criterion.updated", { requirementId: id2 });
+        }
+        for (const stored of existing.filter((criterion) => criterion.archived_at === null && !retained.has(String(criterion.id)))) {
+          this.db.prepare("UPDATE acceptance_criteria SET archived_at=?,version=version+1,updated_at=? WHERE id=?").run(now(), now(), String(stored.id));
+          this.event(current.projectId, "acceptance_criterion", String(stored.id), "acceptance_criterion.archived", { requirementId: id2 });
+        }
       }
+      this.event(current.projectId, "requirement", id2, "requirement.updated", { stableKey: next.stableKey });
       return this.getRequirement(id2);
     });
   }
@@ -11527,15 +12050,20 @@ class SqliteOperationalRepository {
     this.assertProjectEntity("requirements", requirementId, projectId);
     this.assertProjectEntity("work_items", workItemId, projectId);
     this.db.prepare("INSERT OR IGNORE INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)").run(requirementId, workItemId, now());
+    this.event(projectId, "requirement", requirementId, "requirement.work_linked", { workItemId });
   }
   unlinkRequirementWork(requirementId, workItemId) {
+    const requirement = this.db.prepare("SELECT project_id FROM requirements WHERE id=?").get(requirementId);
     this.db.prepare("DELETE FROM requirement_work_links WHERE requirement_id=? AND work_item_id=?").run(requirementId, workItemId);
+    if (requirement) this.event(String(requirement.project_id), "requirement", requirementId, "requirement.work_unlinked", { workItemId });
   }
   getRequirementRollup(projectId) {
     const bySemantic = { open: 0, partial: 0, proven: 0, defect: 0 };
     const rows = this.db.prepare("SELECT s.semantic,COUNT(*) AS count FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.project_id=? GROUP BY s.semantic").all(projectId);
     for (const row of rows) bySemantic[String(row.semantic)] = Number(row.count);
     const requirements = this.listRequirements(projectId);
+    const byProofStatus = { open: 0, partial: 0, proven: 0, defect: 0 };
+    for (const requirement of requirements) byProofStatus[requirement.proofStatus] += 1;
     const states = new Map(this.listRequirementStates(projectId).map((state) => [state.id, state.semantic]));
     const emptyCounts = () => ({ open: 0, partial: 0, proven: 0, defect: 0 });
     const byCapability = /* @__PURE__ */ new Map();
@@ -11571,8 +12099,9 @@ class SqliteOperationalRepository {
     return {
       total: requirements.length,
       bySemantic,
+      byProofStatus,
       gateFailures: requirements.filter((requirement) => requirement.gate === "unsatisfied").length,
-      defects: bySemantic.defect,
+      defects: byProofStatus.defect,
       byCapability: [...byCapability.values()].sort((left, right) => left.name.localeCompare(right.name)),
       byMilestone: [...byMilestone.values()].sort((left, right) => left.name.localeCompare(right.name)),
       byGoal: [...byGoal.values()].sort((left, right) => left.name.localeCompare(right.name))
@@ -11591,6 +12120,7 @@ class SqliteOperationalRepository {
     } catch (error) {
       throw new ValidationError(error instanceof Error ? error.message : "Could not create work queue");
     }
+    this.event(projectId, "work_queue", id2, "work_queue.created", { name: input.name });
     return this.listWorkQueues(projectId).find((queue) => queue.id === id2);
   }
   workItemFromRow(row) {
@@ -11658,10 +12188,13 @@ class SqliteOperationalRepository {
     } catch (error) {
       throw new ValidationError(error instanceof Error ? error.message : "Could not create work relation");
     }
+    this.event(projectId, "work_relation", id2, "work_relation.created", { ...input });
     return { id: id2, projectId, fromWorkItemId: input.fromWorkItemId, toWorkItemId: input.toWorkItemId, kind: input.kind, createdAt: timestamp };
   }
   unlinkWorkItems(id2) {
+    const relation = this.db.prepare("SELECT * FROM work_relations WHERE id=?").get(id2);
     this.db.prepare("DELETE FROM work_relations WHERE id=?").run(id2);
+    if (relation) this.event(String(relation.project_id), "work_relation", id2, "work_relation.deleted", { kind: relation.kind });
   }
   listWorkRelations(projectId) {
     return this.db.prepare("SELECT * FROM work_relations WHERE project_id=? ORDER BY created_at,id").all(projectId).map((row) => ({ id: String(row.id), projectId: String(row.project_id), fromWorkItemId: String(row.from_work_item_id), toWorkItemId: String(row.to_work_item_id), kind: String(row.kind), createdAt: String(row.created_at) }));
@@ -11672,6 +12205,7 @@ class SqliteOperationalRepository {
     const id2 = randomUUID();
     const timestamp = now();
     this.db.prepare("INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, input.workItemId ?? null, input.content, timestamp, timestamp);
+    this.event(projectId, "external_blocker", id2, "external_blocker.created", { workItemId: input.workItemId ?? null });
     return { id: id2, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp };
   }
   listExternalBlockers(projectId, includeResolved = false) {
@@ -11683,6 +12217,7 @@ class SqliteOperationalRepository {
     if (!current) throw new NotFoundError("External blocker", id2);
     const timestamp = now();
     this.db.prepare("UPDATE external_blockers SET resolved_at=?,updated_at=? WHERE id=?").run(timestamp, timestamp, id2);
+    this.event(String(current.project_id), "external_blocker", id2, "external_blocker.resolved");
     return { id: id2, projectId: String(current.project_id), workItemId: textOrNull(current.work_item_id), content: String(current.content), resolvedAt: timestamp, createdAt: String(current.created_at), updatedAt: timestamp };
   }
   createWorkspace(input) {
@@ -11697,6 +12232,7 @@ class SqliteOperationalRepository {
         throw new ValidationError(error instanceof Error ? error.message : "Could not create workspace");
       }
       for (const alias of aliases) this.db.prepare("INSERT INTO workspace_aliases(workspace_id,alias,created_at) VALUES (?,?,?)").run(id2, alias, timestamp);
+      this.event(null, "workspace", id2, "workspace.created", { name: input.name, canonicalRoot: root });
       return { id: id2, name: input.name, canonicalRoot: root, aliases, remote: input.remote ?? null, createdAt: timestamp, updatedAt: timestamp };
     });
   }
@@ -11704,12 +12240,16 @@ class SqliteOperationalRepository {
     this.project(projectId);
     if (!this.db.prepare("SELECT id FROM workspaces WHERE id=?").get(workspaceId)) throw new NotFoundError("Workspace", workspaceId);
     this.db.prepare("INSERT OR IGNORE INTO project_workspaces(project_id,workspace_id,created_at) VALUES (?,?,?)").run(projectId, workspaceId, now());
+    this.event(projectId, "workspace", workspaceId, "workspace.linked", { projectId });
   }
   createWorkspaceRevision(input) {
     if (!this.db.prepare("SELECT id FROM workspaces WHERE id=?").get(input.workspaceId)) throw new NotFoundError("Workspace", input.workspaceId);
     const id2 = randomUUID();
     const capturedAt = now();
     this.db.prepare('INSERT INTO workspace_revisions(id,workspace_id,branch,"commit",dirty,diff_hash,captured_at) VALUES (?,?,?,?,?,?,?)').run(id2, input.workspaceId, input.branch ?? null, input.commit ?? null, input.dirty ? 1 : 0, input.diffHash ?? null, capturedAt);
+    const projects = this.db.prepare("SELECT project_id FROM project_workspaces WHERE workspace_id=?").all(input.workspaceId);
+    if (projects.length) for (const project of projects) this.event(String(project.project_id), "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
+    else this.event(null, "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
     return { id: id2, workspaceId: input.workspaceId, branch: input.branch ?? null, commit: input.commit ?? null, dirty: input.dirty, diffHash: input.diffHash ?? null, capturedAt };
   }
   resolveProject(workspacePath) {
@@ -11719,9 +12259,9 @@ class SqliteOperationalRepository {
     const selected = enclosing.length ? enclosing.filter((row, index, all) => index === 0 || String(row.canonical_root).length === String(all[0]?.canonical_root).length) : rows;
     return selected.map((row) => ({ id: String(row.id), title: String(row.title), description: textOrNull(row.description), intent: textOrNull(row.intent), deadline: textOrNull(row.deadline), completionCriteria: textOrNull(row.completion_criteria), state: String(row.state), currentFocus: textOrNull(row.current_focus), nextAction: textOrNull(row.next_action), blockers: json(row.blockers_json, []), currentCheckpointId: textOrNull(row.current_checkpoint_id), archivedAt: textOrNull(row.archived_at), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at), lastActivityAt: String(row.last_activity_at) }));
   }
-  redactExcerpt(value) {
-    if (!value) return null;
-    return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/(authorization\s*[:=]\s*)(?:bearer|basic)\s+[^\s"']+/gi, "$1[REDACTED]").replace(/(authorization|token|password|secret|api[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"']+)/gi, "$1=[REDACTED]").slice(0, 32768);
+  secretRedactor(projectId) {
+    const secretNames = this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name));
+    return new SecretRedactor({ secretNames });
   }
   createRun(projectId, input) {
     this.project(projectId);
@@ -11729,23 +12269,42 @@ class SqliteOperationalRepository {
     const id2 = randomUUID();
     const createdAt = now();
     const startedAt = input.startedAt ?? createdAt;
-    const endedAt = input.endedAt ?? (input.outcome === "recorded" ? null : createdAt);
-    const durationMs = endedAt ? Math.max(0, new Date(endedAt).getTime() - new Date(startedAt).getTime()) : null;
-    const command = this.redactExcerpt(input.command) ?? input.command;
+    const endedAt = input.endedAt ?? null;
+    const violations = validateRunInvariants({ ...input, startedAt, endedAt });
+    if (violations.length) throw new ValidationError("Run violates authoritative ledger invariants", { violations });
+    const durationMs = endedAt ? new Date(endedAt).getTime() - new Date(startedAt).getTime() : null;
+    const redactor = this.secretRedactor(projectId);
+    const commandResult = redactor.redact(stripAnsi(input.command));
+    const workingDirectoryResult = input.workingDirectory ? redactor.redact(input.workingDirectory) : null;
+    const stdoutResult = input.stdoutExcerpt ? redactor.redact(stripAnsi(input.stdoutExcerpt).slice(0, 32768)) : null;
+    const stderrResult = input.stderrExcerpt ? redactor.redact(stripAnsi(input.stderrExcerpt).slice(0, 32768)) : null;
+    const toolchainResults = Object.entries(input.toolchain ?? {}).map(([name, value]) => ({ name, result: redactor.redact(value) }));
+    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
+    const redactionEntries = [
+      { field: "command", result: commandResult },
+      ...workingDirectoryResult ? [{ field: "workingDirectory", result: workingDirectoryResult }] : [],
+      ...stdoutResult ? [{ field: "stdoutExcerpt", result: stdoutResult }] : [],
+      ...stderrResult ? [{ field: "stderrExcerpt", result: stderrResult }] : [],
+      ...toolchainResults.map(({ name, result: result2 }) => ({ field: `toolchain.${name}`, result: result2 })),
+      ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))
+    ];
+    const redaction = redactionMetadata(redactionEntries);
+    const toolchain = Object.fromEntries(toolchainResults.map(({ name, result: result2 }) => [name, result2.value]));
     return this.transaction(() => {
-      this.db.prepare("INSERT INTO runs(id,project_id,workspace_revision_id,command,working_directory,started_at,ended_at,duration_ms,outcome,exit_code,toolchain_json,stdout_excerpt,stderr_excerpt,stdout_truncated,stderr_truncated,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, projectId, input.workspaceRevisionId ?? null, command, input.workingDirectory ?? null, startedAt, endedAt, durationMs, input.outcome, input.exitCode ?? null, JSON.stringify(input.toolchain ?? {}), this.redactExcerpt(input.stdoutExcerpt), this.redactExcerpt(input.stderrExcerpt), input.stdoutTruncated ? 1 : 0, input.stderrTruncated ? 1 : 0, createdAt);
+      this.db.prepare("INSERT INTO runs(id,project_id,workspace_revision_id,command,working_directory,started_at,ended_at,duration_ms,outcome,exit_code,toolchain_json,stdout_excerpt,stderr_excerpt,stdout_truncated,stderr_truncated,validation_status,redaction_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, projectId, input.workspaceRevisionId ?? null, commandResult.value, workingDirectoryResult?.value ?? null, startedAt, endedAt, durationMs, input.outcome, input.exitCode ?? null, JSON.stringify(toolchain), stdoutResult?.value ?? null, stderrResult?.value ?? null, input.stdoutTruncated ? 1 : 0, input.stderrTruncated ? 1 : 0, "validated", JSON.stringify(redaction), createdAt);
       let testSummary = null;
       if (input.testSummary) {
         const summaryId = randomUUID();
         this.db.prepare("INSERT INTO test_summaries(id,run_id,scope,passed,failed,skipped,target_count,created_at) VALUES (?,?,?,?,?,?,?,?)").run(summaryId, id2, input.testSummary.scope, input.testSummary.passed, input.testSummary.failed, input.testSummary.skipped, input.testSummary.targetCount, createdAt);
         testSummary = { id: summaryId, runId: id2, ...input.testSummary, createdAt };
       }
-      const artifacts = (input.artifacts ?? []).map((artifact) => {
+      const artifacts = artifactResults.map(({ artifact, result: result2 }) => {
         const artifactId = randomUUID();
-        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, id2, artifact.uri, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, createdAt);
-        return { id: artifactId, runId: id2, uri: artifact.uri, mediaType: artifact.mediaType ?? null, byteCount: artifact.byteCount ?? null, digest: artifact.digest ?? null, createdAt };
+        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, id2, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, createdAt);
+        return { id: artifactId, runId: id2, uri: result2.value, mediaType: artifact.mediaType ?? null, byteCount: artifact.byteCount ?? null, digest: artifact.digest ?? null, createdAt };
       });
-      const run = { id: id2, projectId, workspaceRevisionId: input.workspaceRevisionId ?? null, command, workingDirectory: input.workingDirectory ?? null, startedAt, endedAt, durationMs, outcome: input.outcome, exitCode: input.exitCode ?? null, toolchain: input.toolchain ?? {}, stdoutExcerpt: this.redactExcerpt(input.stdoutExcerpt), stderrExcerpt: this.redactExcerpt(input.stderrExcerpt), stdoutTruncated: Boolean(input.stdoutTruncated), stderrTruncated: Boolean(input.stderrTruncated), artifacts, createdAt };
+      const run = { id: id2, projectId, workspaceRevisionId: input.workspaceRevisionId ?? null, command: commandResult.value, workingDirectory: workingDirectoryResult?.value ?? null, startedAt, endedAt, durationMs, outcome: input.outcome, exitCode: input.exitCode ?? null, toolchain, stdoutExcerpt: stdoutResult?.value ?? null, stderrExcerpt: stderrResult?.value ?? null, stdoutTruncated: Boolean(input.stdoutTruncated), stderrTruncated: Boolean(input.stderrTruncated), artifacts, validationStatus: "validated", redaction, createdAt };
+      this.event(projectId, "run", id2, "run.created", { outcome: input.outcome, redactionCount: redaction.count });
       return { run, testSummary, artifacts };
     });
   }
@@ -11754,7 +12313,7 @@ class SqliteOperationalRepository {
   }
   listRuns(projectId) {
     const rows = this.db.prepare("SELECT * FROM runs WHERE project_id=? ORDER BY started_at DESC,id DESC").all(projectId);
-    return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workspaceRevisionId: textOrNull(row.workspace_revision_id), command: String(row.command), workingDirectory: textOrNull(row.working_directory), startedAt: String(row.started_at), endedAt: textOrNull(row.ended_at), durationMs: row.duration_ms === null ? null : Number(row.duration_ms), outcome: String(row.outcome), exitCode: row.exit_code === null ? null : Number(row.exit_code), toolchain: json(row.toolchain_json, {}), stdoutExcerpt: textOrNull(row.stdout_excerpt), stderrExcerpt: textOrNull(row.stderr_excerpt), stdoutTruncated: bool(row.stdout_truncated), stderrTruncated: bool(row.stderr_truncated), artifacts: this.artifactsForRun(String(row.id)), createdAt: String(row.created_at) }));
+    return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workspaceRevisionId: textOrNull(row.workspace_revision_id), command: String(row.command), workingDirectory: textOrNull(row.working_directory), startedAt: String(row.started_at), endedAt: textOrNull(row.ended_at), durationMs: row.duration_ms === null ? null : Number(row.duration_ms), outcome: String(row.outcome), exitCode: row.exit_code === null ? null : Number(row.exit_code), toolchain: json(row.toolchain_json, {}), stdoutExcerpt: textOrNull(row.stdout_excerpt), stderrExcerpt: textOrNull(row.stderr_excerpt), stdoutTruncated: bool(row.stdout_truncated), stderrTruncated: bool(row.stderr_truncated), artifacts: this.artifactsForRun(String(row.id)), validationStatus: String(row.validation_status), redaction: json(row.redaction_json, { count: 0, fields: [] }), createdAt: String(row.created_at) }));
   }
   listRunsPage(projectId, limit2, cursor) {
     return pageOf(this.listRuns(projectId), limit2, cursor);
@@ -11763,21 +12322,52 @@ class SqliteOperationalRepository {
     this.project(projectId);
     const id2 = randomUUID();
     const timestamp = now();
-    for (const requirementId of input.requirementIds ?? []) this.assertProjectEntity("requirements", requirementId, projectId);
+    const requirementIds = new Set(input.requirementIds ?? []);
+    for (const requirementId of requirementIds) this.assertProjectEntity("requirements", requirementId, projectId);
+    const criteria = (input.criterionIds ?? []).map((criterionId) => {
+      const row = this.db.prepare(`SELECT c.*,r.project_id FROM acceptance_criteria c JOIN requirements r ON r.id=c.requirement_id WHERE c.id=? AND r.project_id=? AND c.archived_at IS NULL`).get(criterionId, projectId);
+      if (!row) throw new ValidationError("Criterion must be active and belong to the project");
+      requirementIds.add(String(row.requirement_id));
+      return row;
+    });
     for (const workItemId of input.workItemIds ?? []) this.assertProjectEntity("work_items", workItemId, projectId);
     for (const updateId of [...input.updateIds ?? [], ...input.checkpointIds ?? []]) this.assertProjectEntity("updates", updateId, projectId);
-    if (input.runId && !this.db.prepare("SELECT id FROM runs WHERE id=? AND project_id=?").get(input.runId, projectId)) throw new ValidationError("Run does not belong to the project");
+    const linkedRun = input.runId ? this.db.prepare("SELECT * FROM runs WHERE id=? AND project_id=?").get(input.runId, projectId) : void 0;
+    if (input.runId && !linkedRun) throw new ValidationError("Run does not belong to the project");
+    const context = this.mutationContext();
+    if (input.override && context.source === "mcp") throw new ValidationError("Verification overrides are unavailable through MCP");
+    const evidenceViolations = (() => {
+      try {
+        assertEvidenceInvariants({ result: input.result, runId: input.runId }, {
+          linkedRun: linkedRun ? { id: String(linkedRun.id), outcome: String(linkedRun.outcome), invariantsValid: String(linkedRun.validation_status) === "validated" } : null,
+          verifiedOverride: input.override
+        });
+        return [];
+      } catch (error) {
+        return error instanceof Error && "violations" in error ? error.violations : [String(error)];
+      }
+    })();
+    if (evidenceViolations.length) throw new ValidationError("Evidence violates authoritative ledger invariants", { violations: evidenceViolations });
+    const redactor = this.secretRedactor(projectId);
+    const summaryResult = redactor.redact(input.summary);
+    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
+    const redaction = redactionMetadata([{ field: "summary", result: summaryResult }, ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))]);
+    const validationStatus = input.override ? "overridden" : "validated";
     return this.transaction(() => {
-      this.db.prepare("INSERT INTO evidence(id,project_id,run_id,result,summary,target_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id2, projectId, input.runId ?? null, input.result, input.summary, input.targetVersion ?? null, timestamp, timestamp);
-      for (const requirementId of new Set(input.requirementIds ?? [])) this.db.prepare("INSERT INTO evidence_requirement_links(evidence_id,requirement_id) VALUES (?,?)").run(id2, requirementId);
+      const ordinal = Number(this.db.prepare("SELECT COALESCE(MAX(ordinal),0)+1 AS ordinal FROM evidence").get().ordinal);
+      this.db.prepare("INSERT INTO evidence(id,ordinal,project_id,run_id,result,summary,target_version,validation_status,redaction_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id2, ordinal, projectId, input.runId ?? null, input.result, summaryResult.value, input.targetVersion ?? null, validationStatus, JSON.stringify(redaction), timestamp, timestamp);
+      for (const requirementId of requirementIds) this.db.prepare("INSERT INTO evidence_requirement_links(evidence_id,requirement_id) VALUES (?,?)").run(id2, requirementId);
+      for (const criterion of criteria) this.db.prepare("INSERT INTO evidence_criterion_links(evidence_id,criterion_id,criterion_version,created_at) VALUES (?,?,?,?)").run(id2, String(criterion.id), Number(criterion.version), timestamp);
       for (const workItemId of new Set(input.workItemIds ?? [])) this.db.prepare("INSERT INTO evidence_work_links(evidence_id,work_item_id) VALUES (?,?)").run(id2, workItemId);
       for (const updateId of new Set(input.updateIds ?? [])) this.db.prepare("INSERT INTO evidence_update_links(evidence_id,update_id) VALUES (?,?)").run(id2, updateId);
       for (const checkpointId of new Set(input.checkpointIds ?? [])) this.db.prepare("INSERT INTO evidence_checkpoint_links(evidence_id,checkpoint_id) VALUES (?,?)").run(id2, checkpointId);
-      for (const artifact of input.artifacts ?? []) {
+      for (const { artifact, result: result2 } of artifactResults) {
         const artifactId = randomUUID();
-        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, input.runId ?? null, artifact.uri, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, timestamp);
+        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, input.runId ?? null, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, timestamp);
         this.db.prepare("INSERT INTO evidence_artifact_links(evidence_id,artifact_id) VALUES (?,?)").run(id2, artifactId);
       }
+      if (input.override) this.db.prepare("INSERT INTO evidence_overrides(evidence_id,reason,actor,source,client,created_at) VALUES (?,?,?,?,?,?)").run(id2, input.override.reason, context.actor, context.source, context.client ?? null, timestamp);
+      this.event(projectId, "evidence", id2, "evidence.created", { result: input.result, criterionIds: criteria.map((criterion) => criterion.id), overridden: Boolean(input.override), redactionCount: redaction.count });
       return this.evidenceFromRow(this.db.prepare("SELECT * FROM evidence WHERE id=?").get(id2));
     });
   }
@@ -11795,24 +12385,39 @@ class SqliteOperationalRepository {
   evidenceFromRow(row) {
     const id2 = String(row.id);
     const targetVersion = row.target_version === null ? null : Number(row.target_version);
-    let stale = bool(row.stale);
-    let staleReason = textOrNull(row.stale_reason);
-    if (targetVersion !== null) {
-      const versions = [
-        ...this.db.prepare("SELECT version FROM requirements r JOIN evidence_requirement_links l ON l.requirement_id=r.id WHERE l.evidence_id=?").all(id2),
-        ...this.db.prepare("SELECT version FROM work_items w JOIN evidence_work_links l ON l.work_item_id=w.id WHERE l.evidence_id=?").all(id2),
-        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_update_links l ON l.update_id=u.id WHERE l.evidence_id=?").all(id2),
-        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_checkpoint_links l ON l.checkpoint_id=u.id WHERE l.evidence_id=?").all(id2)
-      ].map((entry) => Number(entry.version));
-      const currentVersion = versions.length ? Math.max(...versions) : targetVersion;
-      stale = currentVersion > targetVersion;
-      staleReason = stale ? `Linked entity advanced from version ${targetVersion} to ${currentVersion}` : null;
-    }
-    return { id: id2, projectId: String(row.project_id), runId: textOrNull(row.run_id), result: String(row.result), summary: String(row.summary), targetVersion, stale, staleReason, createdAt: String(row.created_at), updatedAt: String(row.updated_at), requirementIds: this.db.prepare("SELECT requirement_id FROM evidence_requirement_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.requirement_id)), workItemIds: this.db.prepare("SELECT work_item_id FROM evidence_work_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.work_item_id)), updateIds: this.db.prepare("SELECT update_id FROM evidence_update_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.update_id)), checkpointIds: this.db.prepare("SELECT checkpoint_id FROM evidence_checkpoint_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.checkpoint_id)), artifacts: this.artifactsForEvidence(id2) };
+    const { stale, staleReason } = this.evidenceStaleness(row);
+    const criterionLinks = this.db.prepare(`SELECT l.criterion_id,l.criterion_version,c.version FROM evidence_criterion_links l JOIN acceptance_criteria c ON c.id=l.criterion_id WHERE l.evidence_id=? ORDER BY l.criterion_id`).all(id2).map((entry) => ({
+      criterionId: String(entry.criterion_id),
+      criterionVersion: Number(entry.criterion_version),
+      stale: Number(entry.criterion_version) !== Number(entry.version)
+    }));
+    const override = this.db.prepare("SELECT * FROM evidence_overrides WHERE evidence_id=?").get(id2);
+    return {
+      id: id2,
+      ordinal: Number(row.ordinal),
+      projectId: String(row.project_id),
+      runId: textOrNull(row.run_id),
+      result: String(row.result),
+      summary: String(row.summary),
+      targetVersion,
+      stale,
+      staleReason,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      requirementIds: this.db.prepare("SELECT requirement_id FROM evidence_requirement_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.requirement_id)),
+      workItemIds: this.db.prepare("SELECT work_item_id FROM evidence_work_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.work_item_id)),
+      updateIds: this.db.prepare("SELECT update_id FROM evidence_update_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.update_id)),
+      checkpointIds: this.db.prepare("SELECT checkpoint_id FROM evidence_checkpoint_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.checkpoint_id)),
+      artifacts: this.artifactsForEvidence(id2),
+      criterionLinks,
+      validationStatus: String(row.validation_status),
+      redaction: json(row.redaction_json, { count: 0, fields: [] }),
+      override: override ? { reason: String(override.reason), actor: String(override.actor), source: String(override.source), client: textOrNull(override.client), createdAt: String(override.created_at) } : null
+    };
   }
   listEvidence(projectId, includeStale = false) {
     this.project(projectId);
-    const evidence = this.db.prepare("SELECT * FROM evidence WHERE project_id=? ORDER BY created_at DESC,id DESC").all(projectId).map((row) => this.evidenceFromRow(row));
+    const evidence = this.db.prepare("SELECT * FROM evidence WHERE project_id=? ORDER BY ordinal DESC").all(projectId).map((row) => this.evidenceFromRow(row));
     return includeStale ? evidence : evidence.filter((entry) => !entry.stale);
   }
   listEvidencePage(projectId, limit2, cursor, includeStale = false) {
@@ -11825,41 +12430,103 @@ class SqliteOperationalRepository {
     if (existing) return existing;
     const project = this.project(projectId);
     const phases = this.db.prepare("SELECT * FROM phases WHERE project_id=? ORDER BY position,id").all(projectId);
+    const requirementStates = this.listRequirementStates(projectId);
     const requirements = this.listRequirements(projectId);
     const workItems = this.listWorkItems(projectId);
     const queues = this.listWorkQueues(projectId);
     const relations = this.listWorkRelations(projectId);
     const blockers = this.listExternalBlockers(projectId, true);
-    const workspaces = this.db.prepare("SELECT w.*,pw.project_id FROM workspaces w JOIN project_workspaces pw ON pw.workspace_id=w.id WHERE pw.project_id=?").all(projectId);
+    const workspaces = this.db.prepare("SELECT w.*,pw.project_id FROM workspaces w JOIN project_workspaces pw ON pw.workspace_id=w.id WHERE pw.project_id=? ORDER BY w.canonical_root,w.id").all(projectId).map((workspace) => ({
+      ...workspace,
+      aliases: this.db.prepare("SELECT alias FROM workspace_aliases WHERE workspace_id=? ORDER BY alias").all(String(workspace.id)).map((alias) => String(alias.alias))
+    }));
+    const workspaceRevisions = this.db.prepare(`SELECT wr.* FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id
+      WHERE pw.project_id=? ORDER BY wr.captured_at,wr.id`).all(projectId);
+    const runs = this.listRuns(projectId);
+    const testSummaries = this.db.prepare(`SELECT ts.* FROM test_summaries ts JOIN runs r ON r.id=ts.run_id
+      WHERE r.project_id=? ORDER BY r.started_at,r.id`).all(projectId);
     const evidence = this.listEvidence(projectId, true);
-    const document = { project, phases, requirements, workItems, queues, relations, blockers, workspaces, evidenceHeads: evidence.map((entry) => ({ id: entry.id, result: entry.result, stale: entry.stale, updatedAt: entry.updatedAt })) };
-    const encoded = JSON.stringify(document);
+    const updates = this.db.prepare("SELECT * FROM updates WHERE project_id=? ORDER BY created_at,id").all(projectId);
+    const updateRevisions = this.db.prepare(`SELECT ur.* FROM update_revisions ur JOIN updates u ON u.id=ur.update_id
+      WHERE u.project_id=? ORDER BY u.created_at,u.id,ur.revision`).all(projectId);
+    const labels = this.db.prepare(`SELECT DISTINCT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id JOIN work_items wi ON wi.id=wil.work_item_id
+      WHERE wi.project_id=? ORDER BY l.name COLLATE NOCASE,l.id`).all(projectId);
+    const links = {
+      requirementAliases: this.db.prepare(`SELECT a.* FROM requirement_key_aliases a JOIN requirements r ON r.id=a.requirement_id WHERE r.project_id=? ORDER BY a.requirement_id,a.alias`).all(projectId),
+      requirementPhases: this.db.prepare(`SELECT l.* FROM requirement_phase_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=? ORDER BY l.requirement_id,l.phase_id`).all(projectId),
+      requirementWork: this.db.prepare(`SELECT l.* FROM requirement_work_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=? ORDER BY l.requirement_id,l.work_item_id`).all(projectId),
+      workPhases: this.db.prepare(`SELECT l.* FROM work_phase_links l JOIN work_items w ON w.id=l.work_item_id WHERE w.project_id=? ORDER BY l.work_item_id,l.phase_id`).all(projectId)
+    };
+    const projectSecretNames = this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name));
+    const document = canonicaliseJson({
+      project,
+      phases,
+      requirementStates,
+      requirements,
+      workItems,
+      queues,
+      relations,
+      blockers,
+      workspaces,
+      workspaceRevisions,
+      runs,
+      testSummaries,
+      evidence,
+      updates,
+      updateRevisions,
+      labels,
+      links,
+      projectSecretNames,
+      evidenceHeads: evidence.map((entry) => ({ id: entry.id, ordinal: entry.ordinal, result: entry.result, stale: entry.stale, updatedAt: entry.updatedAt }))
+    });
+    const encoded = canonicalJson(document);
     const digest = createHash("sha256").update(encoded).digest("hex");
     const id2 = randomUUID();
     const capturedAt = now();
     try {
-      this.db.prepare("INSERT INTO checkpoint_snapshots(id,checkpoint_id,schema_version,captured_at,document_json,digest) VALUES (?,?,?,?,?,?)").run(id2, checkpointId, 2, capturedAt, encoded, digest);
+      this.db.prepare("INSERT INTO checkpoint_snapshots(id,checkpoint_id,schema_version,captured_at,document_json,digest) VALUES (?,?,?,?,?,?)").run(id2, checkpointId, 3, capturedAt, encoded, digest);
     } catch (error) {
       if (error instanceof Error && error.message.includes("UNIQUE")) return this.getCheckpointSnapshot(checkpointId);
       throw error;
     }
-    return { id: id2, checkpointId, schemaVersion: 2, capturedAt, document, digest };
+    this.event(projectId, "checkpoint_snapshot", id2, "checkpoint_snapshot.captured", { checkpointId, digest });
+    return { id: id2, checkpointId, schemaVersion: 3, capturedAt, document, digest };
   }
   getCheckpointSnapshot(checkpointId) {
     const row = this.db.prepare("SELECT * FROM checkpoint_snapshots WHERE checkpoint_id=?").get(checkpointId);
     if (!row) return null;
-    return { id: String(row.id), checkpointId: String(row.checkpoint_id), schemaVersion: 2, capturedAt: String(row.captured_at), document: json(row.document_json, {}), digest: String(row.digest) };
+    return { id: String(row.id), checkpointId: String(row.checkpoint_id), schemaVersion: 3, capturedAt: String(row.captured_at), document: json(row.document_json, {}), digest: String(row.digest) };
   }
   compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) {
-    const left = this.getCheckpointSnapshot(leftCheckpointId);
-    const right = this.getCheckpointSnapshot(rightCheckpointId);
+    const comparable = (checkpointId) => {
+      const structured = this.getCheckpointSnapshot(checkpointId);
+      if (structured) return { document: structured.document, digest: structured.digest, legacy: false };
+      const row = this.db.prepare(`SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id
+        WHERE u.id=? AND u.kind='checkpoint' AND u.deleted_at IS NULL`).get(checkpointId);
+      if (!row) return null;
+      const document = json(row.snapshot_json, null);
+      if (!document) return null;
+      return { document, digest: createHash("sha256").update(canonicalJson(document)).digest("hex"), legacy: true };
+    };
+    const left = comparable(leftCheckpointId);
+    const right = comparable(rightCheckpointId);
     if (!left || !right) throw new NotFoundError("Checkpoint snapshot", !left ? leftCheckpointId : rightCheckpointId);
     const sections = /* @__PURE__ */ new Set([...Object.keys(left.document), ...Object.keys(right.document)]);
     const changedSections = [...sections].filter((section) => JSON.stringify(left.document[section]) !== JSON.stringify(right.document[section])).sort();
-    return { leftCheckpointId, rightCheckpointId, same: changedSections.length === 0, changedSections, leftDigest: left.digest, rightDigest: right.digest };
+    return { leftCheckpointId, rightCheckpointId, same: changedSections.length === 0, changedSections, leftDigest: left.digest, rightDigest: right.digest, leftLegacy: left.legacy, rightLegacy: right.legacy };
   }
   reconstructCheckpointState(checkpointId) {
-    return this.getCheckpointSnapshot(checkpointId)?.document ?? null;
+    const structured = this.getCheckpointSnapshot(checkpointId);
+    if (structured) return { ...structured.document, _snapshot: { legacy: false, schemaVersion: structured.schemaVersion, digest: structured.digest } };
+    const row = this.db.prepare(`SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id
+      WHERE u.id=? AND u.kind='checkpoint' AND u.deleted_at IS NULL`).get(checkpointId);
+    if (!row) return null;
+    const compactSnapshot = json(row.snapshot_json, null);
+    if (!compactSnapshot) return null;
+    return {
+      compactSnapshot,
+      _snapshot: { legacy: true, schemaVersion: 1, digest: createHash("sha256").update(canonicalJson(compactSnapshot)).digest("hex") }
+    };
   }
   getProjectPulseSummary(projectId) {
     const projectRow = this.db.prepare("SELECT * FROM projects WHERE id=?").get(projectId);
@@ -22639,7 +23306,7 @@ function createMcpServer(service) {
     annotations: write
   }, async ({ projectId, client: clientName, ...input }) => result(await service.archiveProject(projectId, input, source(clientName))));
   server2.registerTool("save_checkpoint", {
-    description: "Atomically record a dated journal checkpoint and select its structured pulse as the project’s current checkpoint.",
+    description: "Atomically record a checkpoint, capture its canonical structured state and return the snapshot digest.",
     inputSchema: CheckpointSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200).optional(), client }),
     annotations: write
   }, async ({ projectId, client: clientName, idempotencyKey, ...input }) => result(await service.saveCheckpoint(projectId, input, source(clientName), idempotencyKey)));
@@ -22702,7 +23369,7 @@ function createMcpServer(service) {
     description: "Create a semantic requirement state for a project.",
     inputSchema: CreateRequirementStateSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirementState(projectId, input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirementState(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("list_requirements", {
     description: "List the hierarchical requirement ledger for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
@@ -22722,12 +23389,12 @@ function createMcpServer(service) {
     description: "Create a stable-keyed goal, capability or requirement.",
     inputSchema: CreateRequirementSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirement(projectId, input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirement(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("update_requirement", {
     description: "Update a requirement using optimistic concurrency.",
     inputSchema: UpdateRequirementSchema.extend({ requirementId: stringType().uuid(), client }),
     annotations: write
-  }, async ({ requirementId, client: _client, ...input }) => result(await service.updateRequirement(requirementId, input)));
+  }, async ({ requirementId, client: clientName, ...input }) => result(await service.updateRequirement(requirementId, input, source(clientName))));
   server2.registerTool("get_requirement_rollup", {
     description: "Compute requirement counts and gate failures for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
@@ -22737,12 +23404,12 @@ function createMcpServer(service) {
     description: "Link a requirement to a work item.",
     inputSchema: objectType({ projectId: stringType().uuid(), requirementId: stringType().uuid(), workItemId: stringType().uuid(), client }),
     annotations: write
-  }, async ({ projectId, requirementId, workItemId }) => result(await service.linkRequirementWork(projectId, requirementId, workItemId) ?? { linked: true }));
+  }, async ({ projectId, requirementId, workItemId, client: clientName }) => result(await service.linkRequirementWork(projectId, requirementId, workItemId, source(clientName)) ?? { linked: true }));
   server2.registerTool("unlink_requirement_work", {
     description: "Remove a requirement/work link.",
     inputSchema: objectType({ requirementId: stringType().uuid(), workItemId: stringType().uuid(), client }),
     annotations: write
-  }, async ({ requirementId, workItemId }) => result(await service.unlinkRequirementWork(requirementId, workItemId) ?? { linked: false }));
+  }, async ({ requirementId, workItemId, client: clientName }) => result(await service.unlinkRequirementWork(requirementId, workItemId, source(clientName)) ?? { linked: false }));
   server2.registerTool("list_work_queues", {
     description: "List ordered work queues for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
@@ -22752,7 +23419,7 @@ function createMcpServer(service) {
     description: "Create an ordered work queue.",
     inputSchema: CreateWorkQueueSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createWorkQueue(projectId, input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createWorkQueue(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("list_operational_work_items", {
     description: "List work items with queue rank and derived blocker reasons.",
     inputSchema: objectType({ projectId: stringType().uuid(), queueId: stringType().uuid().optional() }),
@@ -22772,12 +23439,12 @@ function createMcpServer(service) {
     description: "Create a dependency or related-work edge.",
     inputSchema: CreateWorkRelationSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.linkWorkItems(projectId, input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.linkWorkItems(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("unlink_work_items", {
     description: "Remove a work relation.",
     inputSchema: objectType({ relationId: stringType().uuid(), client }),
     annotations: write
-  }, async ({ relationId }) => result(await service.unlinkWorkItems(relationId) ?? { linked: false }));
+  }, async ({ relationId, client: clientName }) => result(await service.unlinkWorkItems(relationId, source(clientName)) ?? { linked: false }));
   server2.registerTool("list_external_blockers", {
     description: "List unresolved or historical external blockers.",
     inputSchema: objectType({ projectId: stringType().uuid(), includeResolved: booleanType().default(false) }),
@@ -22787,32 +23454,35 @@ function createMcpServer(service) {
     description: "Record an external blocker for a project or work item.",
     inputSchema: CreateExternalBlockerSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createExternalBlocker(projectId, input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createExternalBlocker(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("resolve_external_blocker", {
     description: "Resolve an external blocker.",
     inputSchema: objectType({ blockerId: stringType().uuid(), client }),
     annotations: write
-  }, async ({ blockerId }) => result(await service.resolveExternalBlocker(blockerId)));
+  }, async ({ blockerId, client: clientName }) => result(await service.resolveExternalBlocker(blockerId, source(clientName))));
   server2.registerTool("create_workspace", {
     description: "Register a filesystem/Git workspace identity.",
     inputSchema: CreateWorkspaceSchema.extend({ idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspace(input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspace(input, idempotencyKey, source(clientName))));
   server2.registerTool("link_project_workspace", {
     description: "Link a workspace to a project.",
     inputSchema: objectType({ projectId: stringType().uuid(), workspaceId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ projectId, workspaceId, idempotencyKey, client: clientName }) => result(await service.linkProjectWorkspace(projectId, workspaceId, idempotencyKey, clientName ?? "istra-mcp") ?? { linked: true }));
+  }, async ({ projectId, workspaceId, idempotencyKey, client: clientName }) => result(await service.linkProjectWorkspace(projectId, workspaceId, idempotencyKey, source(clientName)) ?? { linked: true }));
   server2.registerTool("create_workspace_revision", {
     description: "Record read-only branch, commit and dirty-state metadata.",
     inputSchema: CreateWorkspaceRevisionSchema.extend({ idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspaceRevision(input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspaceRevision(input, idempotencyKey, source(clientName))));
   server2.registerTool("create_run", {
     description: "Record a bounded command/test execution with redacted excerpts.",
-    inputSchema: CreateRunSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
+    inputSchema: CreateRunObjectSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }).superRefine((run, context) => {
+      const parsed = CreateRunSchema.safeParse(run);
+      if (!parsed.success) for (const issue2 of parsed.error.issues) context.addIssue(issue2);
+    }),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("list_runs", {
     description: "List structured runs for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
@@ -22825,9 +23495,9 @@ function createMcpServer(service) {
   }, async ({ projectId, ...page }) => result(service.listRunsPage(projectId, page)));
   server2.registerTool("create_evidence", {
     description: "Record evidence linked to requirements, work, decisions or checkpoints.",
-    inputSchema: CreateEvidenceSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
+    inputSchema: CreateEvidenceSchema.omit({ override: true }).extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }).strict(),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createEvidence(projectId, input, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createEvidence(projectId, input, idempotencyKey, source(clientName))));
   server2.registerTool("list_evidence", {
     description: "List evidence and verification freshness for a project.",
     inputSchema: objectType({ projectId: stringType().uuid(), includeStale: booleanType().default(false) }),
@@ -22843,11 +23513,11 @@ function createMcpServer(service) {
     inputSchema: PageRequestSchema.extend({ projectId: stringType().uuid(), entity: enumType(["updates", "activity"]) }),
     annotations: readOnly
   }, async ({ projectId, entity, ...page }) => result(entity === "updates" ? service.listUpdatesPage(projectId, page) : service.listActivityPage(projectId, page)));
-  server2.registerTool("capture_checkpoint_snapshot", {
-    description: "Capture an immutable structured checkpoint snapshot.",
+  server2.registerTool("backfill_legacy_checkpoint_snapshot", {
+    description: "Backfill an immutable structured snapshot for a legacy checkpoint that predates atomic checkpoint capture.",
     inputSchema: objectType({ projectId: stringType().uuid(), checkpointId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
-  }, async ({ projectId, checkpointId, idempotencyKey, client: clientName }) => result(await service.captureCheckpointSnapshot(projectId, checkpointId, idempotencyKey, clientName ?? "istra-mcp")));
+  }, async ({ projectId, checkpointId, idempotencyKey, client: clientName }) => result(await service.backfillLegacyCheckpointSnapshot(projectId, checkpointId, idempotencyKey, source(clientName))));
   server2.registerTool("get_checkpoint_snapshot", {
     description: "Read an immutable checkpoint reconstruction document.",
     inputSchema: objectType({ checkpointId: stringType().uuid() }),

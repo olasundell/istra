@@ -18,6 +18,7 @@ import {
   CreateExternalBlockerSchema,
   CreateRequirementSchema,
   CreateRequirementStateSchema,
+  CreateRunObjectSchema,
   CreateRunSchema,
   CreateWorkQueueSchema,
   CreateWorkRelationSchema,
@@ -106,7 +107,7 @@ export function createMcpServer(service: IstraService): McpServer {
   }, async ({ projectId, client: clientName, ...input }) => result(await service.archiveProject(projectId, input, source(clientName))))
 
   server.registerTool('save_checkpoint', {
-    description: 'Atomically record a dated journal checkpoint and select its structured pulse as the project’s current checkpoint.',
+    description: 'Atomically record a checkpoint, capture its canonical structured state and return the snapshot digest.',
     inputSchema: CheckpointSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200).optional(), client }),
     annotations: write,
   }, async ({ projectId, client: clientName, idempotencyKey, ...input }) => result(await service.saveCheckpoint(projectId, input, source(clientName), idempotencyKey)))
@@ -178,7 +179,7 @@ export function createMcpServer(service: IstraService): McpServer {
     description: 'Create a semantic requirement state for a project.',
     inputSchema: CreateRequirementStateSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirementState(projectId, input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirementState(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('list_requirements', {
     description: 'List the hierarchical requirement ledger for a project.',
     inputSchema: z.object({ projectId: z.string().uuid() }),
@@ -198,12 +199,12 @@ export function createMcpServer(service: IstraService): McpServer {
     description: 'Create a stable-keyed goal, capability or requirement.',
     inputSchema: CreateRequirementSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirement(projectId, input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRequirement(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('update_requirement', {
     description: 'Update a requirement using optimistic concurrency.',
     inputSchema: UpdateRequirementSchema.extend({ requirementId: z.string().uuid(), client }),
     annotations: write,
-  }, async ({ requirementId, client: _client, ...input }) => result(await service.updateRequirement(requirementId, input)))
+  }, async ({ requirementId, client: clientName, ...input }) => result(await service.updateRequirement(requirementId, input, source(clientName))))
   server.registerTool('get_requirement_rollup', {
     description: 'Compute requirement counts and gate failures for a project.',
     inputSchema: z.object({ projectId: z.string().uuid() }),
@@ -213,12 +214,12 @@ export function createMcpServer(service: IstraService): McpServer {
     description: 'Link a requirement to a work item.',
     inputSchema: z.object({ projectId: z.string().uuid(), requirementId: z.string().uuid(), workItemId: z.string().uuid(), client }),
     annotations: write,
-  }, async ({ projectId, requirementId, workItemId }) => result((await service.linkRequirementWork(projectId, requirementId, workItemId)) ?? { linked: true }))
+  }, async ({ projectId, requirementId, workItemId, client: clientName }) => result((await service.linkRequirementWork(projectId, requirementId, workItemId, source(clientName))) ?? { linked: true }))
   server.registerTool('unlink_requirement_work', {
     description: 'Remove a requirement/work link.',
     inputSchema: z.object({ requirementId: z.string().uuid(), workItemId: z.string().uuid(), client }),
     annotations: write,
-  }, async ({ requirementId, workItemId }) => result((await service.unlinkRequirementWork(requirementId, workItemId)) ?? { linked: false }))
+  }, async ({ requirementId, workItemId, client: clientName }) => result((await service.unlinkRequirementWork(requirementId, workItemId, source(clientName))) ?? { linked: false }))
 
   server.registerTool('list_work_queues', {
     description: 'List ordered work queues for a project.',
@@ -229,7 +230,7 @@ export function createMcpServer(service: IstraService): McpServer {
     description: 'Create an ordered work queue.',
     inputSchema: CreateWorkQueueSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createWorkQueue(projectId, input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createWorkQueue(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('list_operational_work_items', {
     description: 'List work items with queue rank and derived blocker reasons.',
     inputSchema: z.object({ projectId: z.string().uuid(), queueId: z.string().uuid().optional() }),
@@ -249,12 +250,12 @@ export function createMcpServer(service: IstraService): McpServer {
     description: 'Create a dependency or related-work edge.',
     inputSchema: CreateWorkRelationSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.linkWorkItems(projectId, input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.linkWorkItems(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('unlink_work_items', {
     description: 'Remove a work relation.',
     inputSchema: z.object({ relationId: z.string().uuid(), client }),
     annotations: write,
-  }, async ({ relationId }) => result((await service.unlinkWorkItems(relationId)) ?? { linked: false }))
+  }, async ({ relationId, client: clientName }) => result((await service.unlinkWorkItems(relationId, source(clientName))) ?? { linked: false }))
   server.registerTool('list_external_blockers', {
     description: 'List unresolved or historical external blockers.',
     inputSchema: z.object({ projectId: z.string().uuid(), includeResolved: z.boolean().default(false) }),
@@ -264,34 +265,37 @@ export function createMcpServer(service: IstraService): McpServer {
     description: 'Record an external blocker for a project or work item.',
     inputSchema: CreateExternalBlockerSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createExternalBlocker(projectId, input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createExternalBlocker(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('resolve_external_blocker', {
     description: 'Resolve an external blocker.',
     inputSchema: z.object({ blockerId: z.string().uuid(), client }),
     annotations: write,
-  }, async ({ blockerId }) => result(await service.resolveExternalBlocker(blockerId)))
+  }, async ({ blockerId, client: clientName }) => result(await service.resolveExternalBlocker(blockerId, source(clientName))))
 
   server.registerTool('create_workspace', {
     description: 'Register a filesystem/Git workspace identity.',
     inputSchema: CreateWorkspaceSchema.extend({ idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspace(input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspace(input, idempotencyKey, source(clientName))))
   server.registerTool('link_project_workspace', {
     description: 'Link a workspace to a project.',
     inputSchema: z.object({ projectId: z.string().uuid(), workspaceId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ projectId, workspaceId, idempotencyKey, client: clientName }) => result((await service.linkProjectWorkspace(projectId, workspaceId, idempotencyKey, clientName ?? 'istra-mcp')) ?? { linked: true }))
+  }, async ({ projectId, workspaceId, idempotencyKey, client: clientName }) => result((await service.linkProjectWorkspace(projectId, workspaceId, idempotencyKey, source(clientName))) ?? { linked: true }))
   server.registerTool('create_workspace_revision', {
     description: 'Record read-only branch, commit and dirty-state metadata.',
     inputSchema: CreateWorkspaceRevisionSchema.extend({ idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspaceRevision(input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspaceRevision(input, idempotencyKey, source(clientName))))
 
   server.registerTool('create_run', {
     description: 'Record a bounded command/test execution with redacted excerpts.',
-    inputSchema: CreateRunSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
+    inputSchema: CreateRunObjectSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }).superRefine((run, context) => {
+      const parsed = CreateRunSchema.safeParse(run)
+      if (!parsed.success) for (const issue of parsed.error.issues) context.addIssue(issue)
+    }),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('list_runs', {
     description: 'List structured runs for a project.',
     inputSchema: z.object({ projectId: z.string().uuid() }),
@@ -304,9 +308,9 @@ export function createMcpServer(service: IstraService): McpServer {
   }, async ({ projectId, ...page }) => result(service.listRunsPage(projectId, page)))
   server.registerTool('create_evidence', {
     description: 'Record evidence linked to requirements, work, decisions or checkpoints.',
-    inputSchema: CreateEvidenceSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
+    inputSchema: CreateEvidenceSchema.omit({ override: true }).extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }).strict(),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createEvidence(projectId, input, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createEvidence(projectId, input, idempotencyKey, source(clientName))))
   server.registerTool('list_evidence', {
     description: 'List evidence and verification freshness for a project.',
     inputSchema: z.object({ projectId: z.string().uuid(), includeStale: z.boolean().default(false) }),
@@ -324,11 +328,11 @@ export function createMcpServer(service: IstraService): McpServer {
     annotations: readOnly,
   }, async ({ projectId, entity, ...page }) => result(entity === 'updates' ? service.listUpdatesPage(projectId, page) : service.listActivityPage(projectId, page)))
 
-  server.registerTool('capture_checkpoint_snapshot', {
-    description: 'Capture an immutable structured checkpoint snapshot.',
+  server.registerTool('backfill_legacy_checkpoint_snapshot', {
+    description: 'Backfill an immutable structured snapshot for a legacy checkpoint that predates atomic checkpoint capture.',
     inputSchema: z.object({ projectId: z.string().uuid(), checkpointId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
-  }, async ({ projectId, checkpointId, idempotencyKey, client: clientName }) => result(await service.captureCheckpointSnapshot(projectId, checkpointId, idempotencyKey, clientName ?? 'istra-mcp')))
+  }, async ({ projectId, checkpointId, idempotencyKey, client: clientName }) => result(await service.backfillLegacyCheckpointSnapshot(projectId, checkpointId, idempotencyKey, source(clientName))))
   server.registerTool('get_checkpoint_snapshot', {
     description: 'Read an immutable checkpoint reconstruction document.',
     inputSchema: z.object({ checkpointId: z.string().uuid() }),

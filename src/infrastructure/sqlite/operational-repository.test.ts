@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Provenance } from '../../domain/contracts.js'
 import { openIstraDatabase } from './database.js'
 import { SqliteIstraRepository } from './repository.js'
@@ -22,6 +22,7 @@ describe('operational project memory', () => {
   })
 
   afterEach(async () => {
+    vi.useRealTimers()
     database.db.close()
     await rm(dataDir, { recursive: true, force: true })
   })
@@ -34,9 +35,92 @@ describe('operational project memory', () => {
       stableKey: 'MAP-03', kind: 'requirement', title: 'Map data is complete', criteria: [{ title: 'All provinces have owners', required: true }],
     })
     expect(requirement.gate).toBe('unsatisfied')
-    expect(operational.getRequirementRollup(project.id)).toMatchObject({ total: 1, gateFailures: 1, defects: 0 })
+    expect(requirement.proofStatus).toBe('open')
+    expect(operational.getRequirementRollup(project.id)).toMatchObject({ total: 1, gateFailures: 1, defects: 0, byProofStatus: { open: 1, partial: 0, proven: 0, defect: 0 } })
     const custom = operational.createRequirementState(project.id, { name: 'Investigating', semantic: 'partial' })
     expect(custom.name).toBe('Investigating')
+  })
+
+  it('keeps criterion identity authoritative and scopes proof to exact criterion versions', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-10T12:00:00.000Z'))
+    const project = repository.createProject({ title: 'Criterion proof' }, provenance)
+    const requirement = operational.createRequirement(project.id, {
+      stableKey: 'PROOF-1', kind: 'requirement', title: 'Criterion-scoped proof', criteria: [
+        { title: 'Required criterion A', required: true },
+        { title: 'Optional criterion B', required: false },
+      ],
+    })
+    const [criterionA, criterionB] = requirement.criteria
+    const verifiedRun = operational.createRun(project.id, {
+      command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0, stdoutTruncated: false, stderrTruncated: false,
+    })
+    const evidenceA = operational.createEvidence(project.id, {
+      runId: verifiedRun.run.id, result: 'verified', summary: 'Criterion A passed', criterionIds: [criterionA!.id],
+    })
+
+    expect(operational.getRequirement(requirement.id)).toMatchObject({
+      proofStatus: 'proven',
+      criteria: [
+        expect.objectContaining({ id: criterionA!.id, proofStatus: 'proven', proofEvidenceId: evidenceA.id }),
+        expect.objectContaining({ id: criterionB!.id, required: false, proofStatus: 'open' }),
+      ],
+    })
+
+    const requiredBoth = operational.updateRequirement(requirement.id, {
+      expectedVersion: requirement.version,
+      criteria: [
+        { id: criterionA!.id, expectedVersion: criterionA!.version, title: criterionA!.title, description: criterionA!.description, required: true },
+        { id: criterionB!.id, expectedVersion: criterionB!.version, title: criterionB!.title, description: criterionB!.description, required: true },
+      ],
+    })
+    expect(requiredBoth.proofStatus).toBe('partial')
+    expect(requiredBoth.criteria[0]).toMatchObject({ id: criterionA!.id, version: criterionA!.version, proofStatus: 'proven' })
+    expect(requiredBoth.criteria[1]).toMatchObject({ id: criterionB!.id, version: criterionB!.version + 1, proofStatus: 'open' })
+
+    const failedRun = operational.createRun(project.id, {
+      command: 'pnpm test -- criterion-b', startedAt: '2026-07-10T10:01:00.000Z', endedAt: '2026-07-10T10:01:01.000Z', outcome: 'failed', exitCode: 1, stdoutTruncated: false, stderrTruncated: false,
+    })
+    operational.createEvidence(project.id, {
+      runId: failedRun.run.id, result: 'failed', summary: 'Criterion B failed', criterionIds: [criterionB!.id],
+    })
+    expect(operational.getRequirement(requirement.id)?.proofStatus).toBe('defect')
+
+    const verifiedB = operational.createEvidence(project.id, {
+      runId: verifiedRun.run.id, result: 'verified', summary: 'Criterion B passed after the fix', criterionIds: [criterionB!.id],
+    })
+    expect(operational.getRequirement(requirement.id)).toMatchObject({ proofStatus: 'proven' })
+    expect(operational.getRequirement(requirement.id)?.criteria[1]).toMatchObject({ proofEvidenceId: verifiedB.id })
+
+    const beforeCriterionChange = operational.getRequirement(requirement.id)!
+    const changedCriterion = operational.updateRequirement(requirement.id, {
+      expectedVersion: beforeCriterionChange.version,
+      criteria: [
+        { id: criterionA!.id, expectedVersion: beforeCriterionChange.criteria[0]!.version, title: 'Required criterion A, clarified', description: null, required: true },
+        { id: criterionB!.id, expectedVersion: beforeCriterionChange.criteria[1]!.version, title: criterionB!.title, description: criterionB!.description, required: true },
+      ],
+    })
+    expect(changedCriterion.proofStatus).toBe('partial')
+    expect(changedCriterion.criteria[0]).toMatchObject({ id: criterionA!.id, version: criterionA!.version + 1, proofStatus: 'open' })
+    expect(changedCriterion.criteria[1]).toMatchObject({ id: criterionB!.id, proofStatus: 'proven' })
+
+    const criteriaOmitted = operational.updateRequirement(requirement.id, {
+      expectedVersion: changedCriterion.version, title: 'Criterion-scoped proof, renamed',
+    })
+    expect(criteriaOmitted.criteria.map(({ id, version }) => ({ id, version }))).toEqual(changedCriterion.criteria.map(({ id, version }) => ({ id, version })))
+
+    const archived = operational.updateRequirement(requirement.id, {
+      expectedVersion: criteriaOmitted.version,
+      criteria: [{ id: criterionA!.id, expectedVersion: criteriaOmitted.criteria[0]!.version, title: 'Required criterion A, clarified', description: null, required: true }],
+    })
+    expect(archived.criteria.find(({ id }) => id === criterionB!.id)).toMatchObject({ archivedAt: expect.any(String) })
+    expect(operational.listEvidence(project.id, true).find(({ id }) => id === verifiedB.id)?.criterionLinks).toContainEqual(expect.objectContaining({ criterionId: criterionB!.id }))
+
+    const otherRequirement = operational.createRequirement(project.id, { stableKey: 'PROOF-2', kind: 'requirement', title: 'Other requirement' })
+    expect(() => operational.updateRequirement(otherRequirement.id, {
+      expectedVersion: otherRequirement.version,
+      criteria: [{ id: criterionA!.id, expectedVersion: archived.criteria[0]!.version, title: 'Cannot move', required: true }],
+    })).toThrow(/belong to the requirement/)
   })
 
   it('derives dependency blockers and rejects dependency cycles', () => {
@@ -79,7 +163,7 @@ describe('operational project memory', () => {
     operational.linkProjectWorkspace(project.id, workspace.id)
     expect(operational.resolveProject(join(dataDir, 'src'))[0]?.id).toBe(project.id)
     const revision = operational.createWorkspaceRevision({ workspaceId: workspace.id, branch: 'main', commit: 'abc', dirty: true, diffHash: 'def' })
-    const payload = { workspaceRevisionId: revision.id, command: 'TOKEN=secret pnpm test', outcome: 'failed' as const, exitCode: 1, stdoutExcerpt: 'token=secret\nfailed', stdoutTruncated: false, stderrTruncated: false, toolchain: { node: '24' } }
+    const payload = { workspaceRevisionId: revision.id, command: 'TOKEN=secret pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'failed' as const, exitCode: 1, stdoutExcerpt: 'token=secret\nfailed', stdoutTruncated: false, stderrTruncated: false, toolchain: { node: '24' } }
     const first = operational.runIdempotent('test-client', 'run-1', 'create_run', payload, () => operational.createRun(project.id, payload))
     const second = operational.runIdempotent('test-client', 'run-1', 'create_run', payload, () => operational.createRun(project.id, payload))
     expect(second.run.id).toBe(first.run.id)
@@ -89,13 +173,22 @@ describe('operational project memory', () => {
 
   it('captures a reconstructable checkpoint snapshot and evidence links', () => {
     const project = repository.createProject({ title: 'Snapshot probe' }, provenance)
-    const requirement = operational.createRequirement(project.id, { stableKey: 'FG-WAR-02', kind: 'goal', title: 'War simulation is reproducible' })
+    const requirement = operational.createRequirement(project.id, {
+      stableKey: 'FG-WAR-02', kind: 'goal', title: 'War simulation is reproducible', criteria: [{ title: 'Replay checksum matches', required: true }],
+    })
     const checkpoint = repository.saveCheckpoint(project.id, { expectedVersion: project.version, content: 'Initial structured state', currentFocus: 'Verify replay', nextAction: 'Run the suite', blockers: [] }, provenance)
-    const evidence = operational.createEvidence(project.id, { result: 'verified', summary: 'Replay checksum matched', requirementIds: [requirement.id] })
+    const run = operational.createRun(project.id, { command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0, stdoutTruncated: false, stderrTruncated: false })
+    const evidence = operational.createEvidence(project.id, { runId: run.run.id, result: 'verified', summary: 'Replay checksum matched', criterionIds: [requirement.criteria[0]!.id] })
     const snapshot = operational.captureCheckpointSnapshot(project.id, checkpoint.id)
-    expect(snapshot.schemaVersion).toBe(2)
+    expect(snapshot.schemaVersion).toBe(3)
     expect(snapshot.digest).toHaveLength(64)
-    expect(snapshot.document).toMatchObject({ project: { id: project.id }, requirements: [expect.objectContaining({ stableKey: 'FG-WAR-02' })], evidenceHeads: [expect.objectContaining({ id: evidence.id, result: 'verified' })] })
+    expect(snapshot.document).toMatchObject({
+      project: { id: project.id },
+      requirements: [expect.objectContaining({ stableKey: 'FG-WAR-02' })],
+      runs: [expect.objectContaining({ id: run.run.id, validationStatus: 'validated' })],
+      evidence: [expect.objectContaining({ id: evidence.id, criterionLinks: [expect.objectContaining({ criterionId: requirement.criteria[0]!.id })] })],
+      evidenceHeads: [expect.objectContaining({ id: evidence.id, result: 'verified' })],
+    })
     expect(operational.getCheckpointSnapshot(checkpoint.id)?.digest).toBe(snapshot.digest)
   })
 
@@ -104,7 +197,7 @@ describe('operational project memory', () => {
     const requirement = operational.createRequirement(project.id, { stableKey: 'MAP-03', kind: 'requirement', title: 'Map is proven' })
     const item = repository.createWorkItem(project.id, { stableKey: 'WORK-01', kind: 'task', title: 'Run map checks' }, provenance)
     operational.linkRequirementWork(project.id, requirement.id, item.id)
-    const run = operational.createRun(project.id, { command: 'pnpm test', outcome: 'verified', stdoutTruncated: false, stderrTruncated: false, artifacts: [{ uri: 'artifact://test-report', mediaType: 'text/plain' }] })
+    const run = operational.createRun(project.id, { command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0, stdoutTruncated: false, stderrTruncated: false, artifacts: [{ uri: 'artifact://test-report', mediaType: 'text/plain' }] })
     operational.createEvidence(project.id, {
       runId: run.run.id,
       result: 'verified',
@@ -138,7 +231,7 @@ describe('operational project memory', () => {
   it('supports project-scoped filtered search across operational records', () => {
     const project = repository.createProject({ title: 'Searchable operational state' }, provenance)
     const requirement = operational.createRequirement(project.id, { stableKey: 'SEARCH-01', kind: 'requirement', title: 'Find the hidden signal' })
-    operational.createEvidence(project.id, { result: 'verified', summary: 'The hidden signal was verified', requirementIds: [requirement.id] })
+    operational.createEvidence(project.id, { result: 'recorded', summary: 'The hidden signal was verified', requirementIds: [requirement.id] })
     expect(operational.search('hidden', 20, { projectId: project.id, entityTypes: ['requirement', 'evidence'] }).map(({ type }) => type)).toEqual(expect.arrayContaining(['requirement', 'evidence']))
   })
 
@@ -151,8 +244,8 @@ describe('operational project memory', () => {
     const workItem = repository.createWorkItem(project.id, {
       kind: 'task', title: 'Shared filter marker', status: 'open', phaseId: phase.id, requirementIds: [requirement.id],
     }, provenance)
-    operational.createRun(project.id, { command: 'shared filter marker', outcome: 'verified', stdoutTruncated: false, stderrTruncated: false })
-    operational.createEvidence(project.id, { result: 'verified', summary: 'Shared filter marker' })
+    const run = operational.createRun(project.id, { command: 'shared filter marker', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0, stdoutTruncated: false, stderrTruncated: false })
+    operational.createEvidence(project.id, { runId: run.run.id, result: 'verified', summary: 'Shared filter marker' })
 
     expect(operational.search('filter marker', 20, { evidenceResult: 'verified' }).map(({ type }) => type)).toEqual(['evidence'])
     expect(operational.search('filter marker', 20, { requirementId: requirement.id }).map(({ type, id }) => ({ type, id }))).toEqual([
@@ -213,7 +306,7 @@ describe('operational project memory', () => {
     const project = repository.createProject({ title: 'Stale evidence' }, provenance)
     const requirement = operational.createRequirement(project.id, { stableKey: 'STALE-1', kind: 'requirement', title: 'Version one' })
     const evidence = operational.createEvidence(project.id, {
-      result: 'verified', summary: 'Verified version one', targetVersion: requirement.version, requirementIds: [requirement.id],
+      result: 'recorded', summary: 'Recorded version one', targetVersion: requirement.version, requirementIds: [requirement.id],
     })
     operational.updateRequirement(requirement.id, { expectedVersion: requirement.version, title: 'Version two' })
 
@@ -221,15 +314,56 @@ describe('operational project memory', () => {
     expect(operational.listEvidence(project.id, true).find(({ id }) => id === evidence.id)).toMatchObject({ stale: true })
   })
 
-  it('redacts bearer credentials without retaining the token value', () => {
+  it('removes target-version evidence from criterion proof as soon as its linked requirement advances', () => {
+    const project = repository.createProject({ title: 'Criterion target staleness' }, provenance)
+    const requirement = operational.createRequirement(project.id, {
+      stableKey: 'STALE-CRITERION', kind: 'requirement', title: 'Version one', criteria: [{ title: 'Exact version is verified', required: true }],
+    })
+    const run = operational.createRun(project.id, {
+      command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0,
+      stdoutTruncated: false, stderrTruncated: false,
+    })
+    const evidence = operational.createEvidence(project.id, {
+      runId: run.run.id, result: 'verified', summary: 'Version one passed', targetVersion: requirement.version, criterionIds: [requirement.criteria[0]!.id],
+    })
+    expect(operational.getRequirement(requirement.id)?.proofStatus).toBe('proven')
+
+    database.db.prepare('UPDATE evidence SET stale=1,stale_reason=? WHERE id=?').run('Superseded by an external review', evidence.id)
+    expect(operational.getRequirement(requirement.id)?.proofStatus).toBe('open')
+    database.db.prepare('UPDATE evidence SET stale=0,stale_reason=NULL WHERE id=?').run(evidence.id)
+    expect(operational.getRequirement(requirement.id)?.proofStatus).toBe('proven')
+
+    operational.updateRequirement(requirement.id, { expectedVersion: requirement.version, title: 'Version two' })
+    expect(operational.getRequirement(requirement.id)).toMatchObject({ proofStatus: 'open', criteria: [expect.objectContaining({ proofStatus: 'open' })] })
+  })
+
+  it('redacts every persisted run and evidence field without retaining secret values', () => {
     const project = repository.createProject({ title: 'Credential redaction' }, provenance)
+    database.db.prepare('INSERT INTO project_secret_names(project_id,name,created_at) VALUES (?,?,?)').run(project.id, 'PROJECT_CREDENTIAL', new Date().toISOString())
     const result = operational.createRun(project.id, {
       command: 'curl -H "Authorization: Bearer topsecret" https://example.invalid',
-      outcome: 'failed', stdoutTruncated: false, stderrTruncated: false,
+      workingDirectory: '/tmp?project_credential=working-secret',
+      startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z',
+      outcome: 'failed', exitCode: 1,
+      stdoutExcerpt: '{"password":"stdout-secret"}',
+      stderrExcerpt: 'Cookie: session=stderr-secret',
+      toolchain: { registry: 'https://user:tool-secret@example.invalid' },
+      artifacts: [{ uri: 'https://example.invalid/report?access_token=run-artifact-secret' }],
+      stdoutTruncated: false, stderrTruncated: false,
+    })
+    const evidence = operational.createEvidence(project.id, {
+      runId: result.run.id,
+      result: 'failed',
+      summary: 'PROJECT_CREDENTIAL=evidence-secret',
+      artifacts: [{ uri: 'https://example.invalid/report?password=evidence-artifact-secret' }],
     })
 
-    expect(result.run.command).toContain('[REDACTED]')
-    expect(result.run.command).not.toContain('topsecret')
+    expect(result.run.redaction.count).toBeGreaterThanOrEqual(6)
+    expect(evidence.redaction.count).toBe(2)
+    const persisted = JSON.stringify(repository.exportAll())
+    for (const secret of ['topsecret', 'working-secret', 'stdout-secret', 'stderr-secret', 'tool-secret', 'run-artifact-secret', 'evidence-secret', 'evidence-artifact-secret']) {
+      expect(persisted).not.toContain(secret)
+    }
   })
 
   it('associates evidence artifacts even when no run is present', () => {
@@ -241,5 +375,63 @@ describe('operational project memory', () => {
 
     expect(evidence.artifacts).toEqual([expect.objectContaining({ uri: 'artifact://evidence-log', runId: null })])
     expect(operational.listEvidence(project.id, true)[0]?.artifacts).toEqual([expect.objectContaining({ uri: 'artifact://evidence-log' })])
+  })
+
+  it('deletes artefacts only after their final run or evidence owner disappears', () => {
+    const project = repository.createProject({ title: 'Artefact ownership' }, provenance)
+    const runOwned = operational.createRun(project.id, {
+      command: 'record run artefact', outcome: 'recorded', stdoutTruncated: false, stderrTruncated: false,
+      artifacts: [{ uri: 'artifact://run-only' }],
+    })
+    const evidenceOwned = operational.createEvidence(project.id, {
+      result: 'recorded', summary: 'Evidence-owned artefact', artifacts: [{ uri: 'artifact://evidence-only' }],
+    })
+    const dualRun = operational.createRun(project.id, {
+      command: 'record dual artefact', outcome: 'recorded', stdoutTruncated: false, stderrTruncated: false,
+    })
+    const dualOwned = operational.createEvidence(project.id, {
+      runId: dualRun.run.id, result: 'recorded', summary: 'Dual-owned artefact', artifacts: [{ uri: 'artifact://dual' }],
+    })
+    const exists = (id: string) => Boolean(database.db.prepare('SELECT 1 FROM artifact_references WHERE id=?').get(id))
+
+    database.db.prepare('DELETE FROM runs WHERE id=?').run(runOwned.run.id)
+    expect(exists(runOwned.artifacts[0]!.id)).toBe(false)
+
+    database.db.prepare('DELETE FROM evidence WHERE id=?').run(evidenceOwned.id)
+    expect(exists(evidenceOwned.artifacts[0]!.id)).toBe(false)
+
+    database.db.prepare('DELETE FROM runs WHERE id=?').run(dualRun.run.id)
+    expect(exists(dualOwned.artifacts[0]!.id)).toBe(true)
+    expect(operational.listEvidence(project.id, true).find(({ id }) => id === dualOwned.id)).toMatchObject({ runId: null })
+    database.db.prepare('DELETE FROM evidence WHERE id=?').run(dualOwned.id)
+    expect(exists(dualOwned.artifacts[0]!.id)).toBe(false)
+  })
+
+  it('audits one provenance event and project pulse for idempotent operational writes', () => {
+    const project = repository.createProject({ title: 'Mutation provenance' }, provenance)
+    const before = Number((database.db.prepare('SELECT COUNT(*) AS count FROM activity_events WHERE project_id=?').get(project.id) as { count: number }).count)
+    const context = { source: 'ui' as const, actor: 'local-human', client: 'web', idempotencyKey: 'requirement-1', occurredAt: '2026-07-10T12:00:00.000Z' }
+    const payload = { projectId: project.id, stableKey: 'AUDIT-1' }
+    const first = operational.runMutation(context, 'create_requirement', payload, () => operational.createRequirement(project.id, {
+      stableKey: 'AUDIT-1', kind: 'requirement', title: 'Audit this mutation',
+    }))
+    const replay = operational.runMutation<typeof first>(context, 'create_requirement', payload, () => { throw new Error('replay must not execute') })
+
+    expect(replay.id).toBe(first.id)
+    expect(Number((database.db.prepare('SELECT COUNT(*) AS count FROM activity_events WHERE project_id=?').get(project.id) as { count: number }).count)).toBe(before + 1)
+    expect(database.db.prepare("SELECT source,client,actor,idempotency_key,created_at FROM activity_events WHERE entity_id=? AND event_type='requirement.created'").get(first.id)).toEqual({
+      source: 'ui', client: 'web', actor: 'local-human', idempotency_key: 'requirement-1', created_at: context.occurredAt,
+    })
+    expect(database.db.prepare('SELECT last_activity_at FROM projects WHERE id=?').get(project.id)).toEqual({ last_activity_at: context.occurredAt })
+    expect(() => operational.runMutation(context, 'create_requirement', { ...payload, stableKey: 'AUDIT-2' }, () => first)).toThrow(/Idempotency key/)
+
+    const changedActor = { ...context, actor: 'rotated-local-actor' }
+    expect(operational.runMutation<typeof first>(changedActor, 'create_requirement', payload, () => { throw new Error('same client must replay') }).id).toBe(first.id)
+
+    const otherClient = { ...context, client: 'cli', occurredAt: '2026-07-10T12:01:00.000Z' }
+    const independent = operational.runMutation(otherClient, 'create_requirement', { ...payload, stableKey: 'AUDIT-2' }, () => operational.createRequirement(project.id, {
+      stableKey: 'AUDIT-2', kind: 'requirement', title: 'Independent client namespace',
+    }))
+    expect(independent.id).not.toBe(first.id)
   })
 })

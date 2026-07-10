@@ -173,6 +173,17 @@ function currentMigrationVersion(db: DatabaseSync): number {
   return Number(row.version)
 }
 
+function assertCompatibleMigrationHistory(db: DatabaseSync, databasePath: string): void {
+  const table = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'").get()
+  if (!table) return
+  const expected = new Map(migrations.map((migration) => [migration.version, migration.name]))
+  const applied = db.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all() as Array<{ version: number; name: string }>
+  const incompatible = applied.find((migration) => expected.get(Number(migration.version)) !== String(migration.name))
+  if (incompatible) {
+    throw new Error(`Database ${databasePath} uses an incompatible legacy schema. Recreate it before starting Istra.`)
+  }
+}
+
 export async function openIstraDatabase(options: { dataDir?: string; databasePath?: string } = {}): Promise<OpenDatabaseResult> {
   const resolved = resolveDatabasePaths(options.dataDir)
   const databasePath = options.databasePath ? resolve(options.databasePath) : resolved.databasePath
@@ -182,6 +193,12 @@ export async function openIstraDatabase(options: { dataDir?: string; databasePat
   const db = new DatabaseSync(databasePath)
   db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;')
   const backupManager = new BackupManager(db, paths)
+  try {
+    assertCompatibleMigrationHistory(db, databasePath)
+  } catch (error) {
+    db.close()
+    throw error
+  }
   const version = currentMigrationVersion(db)
   const pending = migrations.filter((migration) => migration.version > version)
   if (pending.length > 0 && existed) await backupManager.create('pre-migration', `v${version}-to-v${pending.at(-1)?.version}-${isoFileTimestamp()}`)

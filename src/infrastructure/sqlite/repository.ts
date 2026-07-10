@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { ConflictError, NotFoundError, ValidationError } from '../../application/errors.js'
 import type { ExportBundle, IstraRepository } from '../../application/ports.js'
@@ -32,6 +32,9 @@ import type {
 } from '../../domain/contracts.js'
 import { migrations } from './migrations.js'
 import { decodeCursor, encodeCursor, pageOf } from '../../application/pagination.js'
+import { validateEvidenceInvariants, validateRunInvariants } from '../../domain/run-invariants.js'
+import { canonicalJson } from '../../domain/canonical-json.js'
+import { SecretRedactor } from '../../application/secret-redactor.js'
 
 type SqlRow = Record<string, unknown>
 const now = () => new Date().toISOString()
@@ -83,11 +86,11 @@ const exportTables: Record<string, string[]> = {
   work_item_labels: ['work_item_id','label_id','created_at'],
   updates: ['id','project_id','kind','current_revision_id','deleted_at','version','created_at','updated_at'],
   update_revisions: ['id','update_id','revision','content','snapshot_json','source','client','created_at'],
-  activity_events: ['id','project_id','entity_type','entity_id','event_type','payload_json','source','client','created_at'],
+  activity_events: ['id','project_id','entity_type','entity_id','event_type','payload_json','source','client','actor','idempotency_key','created_at'],
   requirement_states: ['id','project_id','name','semantic','position','colour','created_at','updated_at'],
   requirements: ['id','project_id','stable_key','kind','parent_id','title','description','state_id','responsible_phase_id','version','created_at','updated_at'],
   requirement_key_aliases: ['requirement_id','alias','created_at'],
-  acceptance_criteria: ['id','requirement_id','title','description','position','required','created_at','updated_at'],
+  acceptance_criteria: ['id','requirement_id','title','description','position','required','version','archived_at','created_at','updated_at'],
   requirement_phase_links: ['requirement_id','phase_id','role','created_at'],
   work_queues: ['id','project_id','name','description','version','created_at','updated_at'],
   work_queue_items: ['queue_id','work_item_id','rank','created_at'],
@@ -99,19 +102,21 @@ const exportTables: Record<string, string[]> = {
   workspace_aliases: ['workspace_id','alias','created_at'],
   project_workspaces: ['project_id','workspace_id','created_at'],
   workspace_revisions: ['id','workspace_id','branch','"commit"','dirty','diff_hash','captured_at'],
-  runs: ['id','project_id','workspace_revision_id','command','working_directory','started_at','ended_at','duration_ms','outcome','exit_code','toolchain_json','stdout_excerpt','stderr_excerpt','stdout_truncated','stderr_truncated','created_at'],
+  project_secret_names: ['project_id','name','created_at'],
+  runs: ['id','project_id','workspace_revision_id','command','working_directory','started_at','ended_at','duration_ms','outcome','exit_code','toolchain_json','stdout_excerpt','stderr_excerpt','stdout_truncated','stderr_truncated','validation_status','redaction_json','created_at'],
   test_summaries: ['id','run_id','scope','passed','failed','skipped','target_count','created_at'],
   artifact_references: ['id','run_id','uri','media_type','byte_count','digest','created_at'],
-  evidence: ['id','project_id','run_id','result','summary','target_version','stale','stale_reason','created_at','updated_at'],
+  evidence: ['id','ordinal','project_id','run_id','result','summary','target_version','stale','stale_reason','validation_status','redaction_json','created_at','updated_at'],
   evidence_artifact_links: ['evidence_id','artifact_id'],
   evidence_requirement_links: ['evidence_id','requirement_id'],
+  evidence_criterion_links: ['evidence_id','criterion_id','criterion_version','created_at'],
   evidence_work_links: ['evidence_id','work_item_id'],
   evidence_update_links: ['evidence_id','update_id'],
   evidence_checkpoint_links: ['evidence_id','checkpoint_id'],
+  evidence_overrides: ['evidence_id','reason','actor','source','client','created_at'],
   checkpoint_snapshots: ['id','checkpoint_id','schema_version','captured_at','document_json','digest'],
   idempotency_records: ['client','idempotency_key','operation','request_hash','result_json','created_at'],
 }
-const legacyRequiredExportTables = new Set(['projects', 'phases', 'work_items', 'labels', 'work_item_labels', 'updates', 'update_revisions', 'activity_events'])
 
 export class SqliteIstraRepository implements IstraRepository {
   private savepointSequence = 0
@@ -150,23 +155,11 @@ export class SqliteIstraRepository implements IstraRepository {
     }
   }
 
-  private backfillLegacyOperationalProjections(projectId: string): void {
-    const queueId = this.ensureDefaultQueue(projectId)
-    this.db.prepare(`INSERT OR IGNORE INTO work_queue_items(queue_id,work_item_id,rank,created_at)
-      SELECT ?,wi.id,'legacy:' || wi.created_at || ':' || wi.id,wi.created_at
-      FROM work_items wi
-      WHERE wi.project_id=? AND NOT EXISTS (SELECT 1 FROM work_queue_items existing WHERE existing.work_item_id=wi.id)`)
-      .run(queueId, projectId)
-    this.db.prepare(`INSERT OR IGNORE INTO work_phase_links(work_item_id,phase_id,role,created_at)
-      SELECT wi.id,wi.phase_id,'responsible',wi.created_at
-      FROM work_items wi WHERE wi.project_id=? AND wi.phase_id IS NOT NULL`)
-      .run(projectId)
-  }
-
-  private event(projectId: string, entityType: string, entityId: string, eventType: string, payload: Record<string, unknown>, provenance: Provenance): void {
-    this.db.prepare(`INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), provenance.source, provenance.client ?? null, now())
-    this.db.prepare('UPDATE projects SET last_activity_at=? WHERE id=?').run(now(), projectId)
+  private event(projectId: string | null, entityType: string, entityId: string, eventType: string, payload: Record<string, unknown>, provenance: Provenance): void {
+    const occurredAt = provenance.occurredAt ?? now()
+    this.db.prepare(`INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), provenance.source, provenance.client ?? null, provenance.actor ?? provenance.client ?? provenance.source, provenance.idempotencyKey ?? null, occurredAt)
+    if (projectId) this.db.prepare('UPDATE projects SET last_activity_at=? WHERE id=?').run(occurredAt, projectId)
   }
 
   private replaceSearch(type: SearchResult['type'], id: string, projectId: string, title: string, body: string): void {
@@ -518,13 +511,16 @@ export class SqliteIstraRepository implements IstraRepository {
 
   createLabel(input: CreateLabelInput, provenance: Provenance): Label {
     const id = randomUUID(); const timestamp = now()
-    try {
-      this.db.prepare('INSERT INTO labels(id,name,colour,created_at,updated_at) VALUES (?,?,?,?,?)').run(id, input.name, input.colour ?? null, timestamp, timestamp)
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('UNIQUE')) throw new ValidationError(`A label named “${input.name}” already exists`)
-      throw error
-    }
-    return labelFromRow(this.db.prepare('SELECT * FROM labels WHERE id=?').get(id) as SqlRow)
+    return this.transaction(() => {
+      try {
+        this.db.prepare('INSERT INTO labels(id,name,colour,created_at,updated_at) VALUES (?,?,?,?,?)').run(id, input.name, input.colour ?? null, timestamp, timestamp)
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('UNIQUE')) throw new ValidationError(`A label named “${input.name}” already exists`)
+        throw error
+      }
+      this.event(null, 'label', id, 'label.created', { name: input.name }, provenance)
+      return labelFromRow(this.db.prepare('SELECT * FROM labels WHERE id=?').get(id) as SqlRow)
+    })
   }
 
   attachLabel(workItemId: string, labelId: string, expectedVersion: number, provenance: Provenance): WorkItem {
@@ -558,8 +554,8 @@ export class SqliteIstraRepository implements IstraRepository {
 
   listActivity(projectId: string, limit = 200): ActivityEvent[] {
     return (this.db.prepare('SELECT * FROM activity_events WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT ?').all(projectId, Math.min(Math.max(limit, 1), 1000)) as SqlRow[]).map((row) => ({
-      id: String(row.id), projectId: String(row.project_id), entityType: String(row.entity_type), entityId: String(row.entity_id), eventType: String(row.event_type),
-      payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), createdAt: String(row.created_at),
+      id: String(row.id), projectId: textOrNull(row.project_id), entityType: String(row.entity_type), entityId: String(row.entity_id), eventType: String(row.event_type),
+      payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), actor: String(row.actor), idempotencyKey: textOrNull(row.idempotency_key), createdAt: String(row.created_at),
     }))
   }
 
@@ -569,8 +565,8 @@ export class SqliteIstraRepository implements IstraRepository {
     const rows = this.db.prepare('SELECT * FROM activity_events WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?').all(projectId, boundedLimit + 1, start) as SqlRow[]
     const hasMore = rows.length > boundedLimit
     const items = rows.slice(0, boundedLimit).map((row) => ({
-      id: String(row.id), projectId: String(row.project_id), entityType: String(row.entity_type), entityId: String(row.entity_id), eventType: String(row.event_type),
-      payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), createdAt: String(row.created_at),
+      id: String(row.id), projectId: textOrNull(row.project_id), entityType: String(row.entity_type), entityId: String(row.entity_id), eventType: String(row.event_type),
+      payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), actor: String(row.actor), idempotencyKey: textOrNull(row.idempotency_key), createdAt: String(row.created_at),
     }))
     return { items, nextCursor: hasMore ? encodeCursor(start + items.length) : null, hasMore }
   }
@@ -579,7 +575,7 @@ export class SqliteIstraRepository implements IstraRepository {
     const rows = this.db.prepare(`SELECT ae.*,p.title AS project_title FROM activity_events ae JOIN projects p ON p.id=ae.project_id WHERE p.archived_at IS NULL ORDER BY ae.created_at DESC LIMIT ?`).all(Math.min(Math.max(limit, 1), 200)) as SqlRow[]
     return rows.map((row) => ({
       id: String(row.id), projectId: String(row.project_id), projectTitle: String(row.project_title), entityType: String(row.entity_type), entityId: String(row.entity_id), eventType: String(row.event_type),
-      payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), createdAt: String(row.created_at),
+      payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), actor: String(row.actor), idempotencyKey: textOrNull(row.idempotency_key), createdAt: String(row.created_at),
     }))
   }
 
@@ -619,13 +615,13 @@ export class SqliteIstraRepository implements IstraRepository {
   exportAll(): ExportBundle {
     const tables: ExportBundle['tables'] = {}
     for (const [table, columns] of Object.entries(exportTables)) tables[table] = this.db.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all() as Array<Record<string, unknown>>
-    return { format: 'istra-export', formatVersion: 2, exportedAt: now(), tables }
+    return { format: 'istra-export', formatVersion: 3, exportedAt: now(), tables }
   }
 
   validateImport(bundle: ExportBundle): void {
     const temp = new DatabaseSync(':memory:')
     try {
-      if (bundle.formatVersion !== 1 && bundle.formatVersion !== 2) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`)
+      if (bundle.formatVersion !== 3) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`)
       temp.exec('PRAGMA foreign_keys=ON;')
       for (const migration of migrations) temp.exec(migration.sql)
       temp.exec('BEGIN; PRAGMA defer_foreign_keys=ON;')
@@ -650,13 +646,154 @@ export class SqliteIstraRepository implements IstraRepository {
           UNION ALL SELECT 'run_workspace',r.id FROM runs r JOIN workspace_revisions revision ON revision.id=r.workspace_revision_id WHERE NOT EXISTS (SELECT 1 FROM project_workspaces pw WHERE pw.project_id=r.project_id AND pw.workspace_id=revision.workspace_id)
           UNION ALL SELECT 'evidence_run',e.id FROM evidence e JOIN runs r ON r.id=e.run_id WHERE e.project_id<>r.project_id
           UNION ALL SELECT 'evidence_requirement',l.evidence_id FROM evidence_requirement_links l JOIN evidence e ON e.id=l.evidence_id JOIN requirements r ON r.id=l.requirement_id WHERE e.project_id<>r.project_id
+          UNION ALL SELECT 'evidence_criterion',l.evidence_id FROM evidence_criterion_links l JOIN evidence e ON e.id=l.evidence_id JOIN acceptance_criteria c ON c.id=l.criterion_id JOIN requirements r ON r.id=c.requirement_id WHERE e.project_id<>r.project_id OR l.criterion_version>c.version
+          UNION ALL SELECT 'evidence_criterion_requirement',l.evidence_id FROM evidence_criterion_links l JOIN acceptance_criteria c ON c.id=l.criterion_id WHERE NOT EXISTS (SELECT 1 FROM evidence_requirement_links erl WHERE erl.evidence_id=l.evidence_id AND erl.requirement_id=c.requirement_id)
           UNION ALL SELECT 'evidence_work',l.evidence_id FROM evidence_work_links l JOIN evidence e ON e.id=l.evidence_id JOIN work_items w ON w.id=l.work_item_id WHERE e.project_id<>w.project_id
           UNION ALL SELECT 'evidence_update',l.evidence_id FROM evidence_update_links l JOIN evidence e ON e.id=l.evidence_id JOIN updates u ON u.id=l.update_id WHERE e.project_id<>u.project_id
           UNION ALL SELECT 'evidence_checkpoint',l.evidence_id FROM evidence_checkpoint_links l JOIN evidence e ON e.id=l.evidence_id JOIN updates u ON u.id=l.checkpoint_id WHERE e.project_id<>u.project_id OR u.kind<>'checkpoint'
           UNION ALL SELECT 'evidence_artifact',l.evidence_id FROM evidence_artifact_links l JOIN evidence e ON e.id=l.evidence_id JOIN artifact_references a ON a.id=l.artifact_id WHERE a.run_id IS NOT e.run_id
-          UNION ALL SELECT 'checkpoint_snapshot',s.id FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id WHERE u.kind<>'checkpoint'
+          UNION ALL SELECT 'evidence_override',e.id FROM evidence e LEFT JOIN evidence_overrides o ON o.evidence_id=e.id WHERE (e.validation_status='overridden')<>(o.evidence_id IS NOT NULL)
+          UNION ALL SELECT 'checkpoint_snapshot',s.id FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id WHERE u.kind<>'checkpoint' OR s.schema_version<>3
         )
       `).all()
+      const orphanArtifacts = temp.prepare(`SELECT a.id FROM artifact_references a LEFT JOIN evidence_artifact_links l ON l.artifact_id=a.id WHERE a.run_id IS NULL GROUP BY a.id HAVING COUNT(l.evidence_id)=0`).all()
+      const invalidRuns = (temp.prepare('SELECT * FROM runs').all() as SqlRow[]).flatMap((run) => {
+        const summary = temp.prepare('SELECT passed,failed,skipped,target_count FROM test_summaries WHERE run_id=?').get(String(run.id)) as SqlRow | undefined
+        const violations = validateRunInvariants({
+          startedAt: String(run.started_at), endedAt: textOrNull(run.ended_at), outcome: String(run.outcome) as 'recorded' | 'verified' | 'failed' | 'interrupted',
+          exitCode: run.exit_code === null ? null : Number(run.exit_code),
+          testSummary: summary ? { passed: Number(summary.passed), failed: Number(summary.failed), skipped: Number(summary.skipped), targetCount: Number(summary.target_count) } : null,
+        })
+        return violations.length ? [{ runId: String(run.id), violations }] : []
+      })
+      const invalidEvidence = (temp.prepare('SELECT * FROM evidence').all() as SqlRow[]).flatMap((evidence) => {
+        const run = evidence.run_id ? temp.prepare('SELECT * FROM runs WHERE id=?').get(String(evidence.run_id)) as SqlRow | undefined : undefined
+        const override = temp.prepare('SELECT reason FROM evidence_overrides WHERE evidence_id=?').get(String(evidence.id)) as SqlRow | undefined
+        const violations = validateEvidenceInvariants({ result: String(evidence.result) as 'recorded' | 'verified' | 'failed' | 'interrupted', runId: textOrNull(evidence.run_id) }, {
+          linkedRun: run ? { id: String(run.id), outcome: String(run.outcome) as 'recorded' | 'verified' | 'failed' | 'interrupted', invariantsValid: String(run.validation_status) === 'validated' } : null,
+          verifiedOverride: override ? { reason: String(override.reason) } : null,
+        })
+        return violations.length ? [{ evidenceId: String(evidence.id), violations }] : []
+      })
+      const redactors = new Map<string, SecretRedactor>()
+      const redactorFor = (projectId: string): SecretRedactor => {
+        const existing = redactors.get(projectId)
+        if (existing) return existing
+        const secretNames = (temp.prepare('SELECT name FROM project_secret_names WHERE project_id=?').all(projectId) as SqlRow[]).map((row) => String(row.name))
+        const redactor = new SecretRedactor({ secretNames })
+        redactors.set(projectId, redactor)
+        return redactor
+      }
+      const invalidRedactions: Array<{ entityType: string; entityId: string; field: string }> = []
+      for (const run of temp.prepare('SELECT * FROM runs').all() as SqlRow[]) {
+        const redactor = redactorFor(String(run.project_id))
+        const fields: Record<string, unknown> = {
+          command: run.command,
+          working_directory: run.working_directory,
+          stdout_excerpt: run.stdout_excerpt,
+          stderr_excerpt: run.stderr_excerpt,
+          ...Object.fromEntries(Object.entries(parseJson<Record<string, unknown>>(run.toolchain_json, {})).map(([name, value]) => [`toolchain.${name}`, value])),
+        }
+        for (const [field, value] of Object.entries(fields)) if (typeof value === 'string' && redactor.redact(value).redacted) invalidRedactions.push({ entityType: 'run', entityId: String(run.id), field })
+      }
+      for (const evidence of temp.prepare('SELECT id,project_id,summary FROM evidence').all() as SqlRow[]) {
+        if (redactorFor(String(evidence.project_id)).redact(String(evidence.summary)).redacted) invalidRedactions.push({ entityType: 'evidence', entityId: String(evidence.id), field: 'summary' })
+      }
+      for (const artifact of temp.prepare(`SELECT a.id,a.uri,COALESCE(r.project_id,e.project_id) AS project_id
+        FROM artifact_references a
+        LEFT JOIN runs r ON r.id=a.run_id
+        LEFT JOIN evidence_artifact_links l ON l.artifact_id=a.id
+        LEFT JOIN evidence e ON e.id=l.evidence_id`).all() as SqlRow[]) {
+        if (artifact.project_id && redactorFor(String(artifact.project_id)).redact(String(artifact.uri)).redacted) invalidRedactions.push({ entityType: 'artifact', entityId: String(artifact.id), field: 'uri' })
+      }
+      const invalidStructuredSnapshots = (temp.prepare(`SELECT s.id,s.document_json,s.digest,u.project_id
+        FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id`).all() as SqlRow[]).flatMap((snapshot) => {
+        const document = parseJson<unknown>(snapshot.document_json, null)
+        if (!document || typeof document !== 'object' || Array.isArray(document)) return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot document must be an object' }]
+        const structured = document as Record<string, unknown>
+        const snapshotProject = structured.project
+        if (!snapshotProject || typeof snapshotProject !== 'object' || Array.isArray(snapshotProject) || String((snapshotProject as Record<string, unknown>).id) !== String(snapshot.project_id)) {
+          return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot project does not match its checkpoint' }]
+        }
+        const requiredArrays = [
+          'phases', 'requirementStates', 'requirements', 'workItems', 'queues', 'relations', 'blockers', 'workspaces',
+          'workspaceRevisions', 'runs', 'testSummaries', 'evidence', 'updates', 'updateRevisions', 'labels', 'projectSecretNames', 'evidenceHeads',
+        ]
+        if (requiredArrays.some((section) => !Array.isArray(structured[section]))) return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot is missing a required v3 section' }]
+        const links = structured.links
+        const requiredLinkSections = ['requirementAliases', 'requirementPhases', 'requirementWork', 'workPhases']
+        if (!links || typeof links !== 'object' || Array.isArray(links) || requiredLinkSections.some((section) => !Array.isArray((links as Record<string, unknown>)[section]))) {
+          return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot is missing required v3 ownership links' }]
+        }
+        const projectId = String(snapshot.project_id)
+        const projectScopedSections: Array<[string, string]> = [
+          ['phases', 'project_id'], ['requirementStates', 'projectId'], ['requirements', 'projectId'], ['workItems', 'projectId'],
+          ['queues', 'projectId'], ['relations', 'projectId'], ['blockers', 'projectId'], ['workspaces', 'project_id'],
+          ['runs', 'projectId'], ['evidence', 'projectId'], ['updates', 'project_id'],
+        ]
+        const containsForeignProject = projectScopedSections.some(([section, projectField]) => (structured[section] as unknown[]).some((entry) => (
+          !entry || typeof entry !== 'object' || Array.isArray(entry) || String((entry as Record<string, unknown>)[projectField]) !== projectId
+        )))
+        if (containsForeignProject) return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot contains data owned by another project' }]
+        const ids = (section: string, field: string) => new Set((structured[section] as Array<Record<string, unknown>>).map((entry) => String(entry[field])))
+        const workspaceIds = ids('workspaces', 'id')
+        const workspaceRevisionIds = ids('workspaceRevisions', 'id')
+        const phaseIds = ids('phases', 'id')
+        const requirementStateIds = ids('requirementStates', 'id')
+        const requirementIds = ids('requirements', 'id')
+        const workItemIds = ids('workItems', 'id')
+        const queueIds = ids('queues', 'id')
+        const runIds = ids('runs', 'id')
+        const evidenceIds = ids('evidence', 'id')
+        const updateIds = ids('updates', 'id')
+        const updateRevisionIds = ids('updateRevisions', 'id')
+        const labelIds = ids('labels', 'id')
+        if ((structured.workspaceRevisions as Array<Record<string, unknown>>).some((entry) => !workspaceIds.has(String(entry.workspace_id)))
+          || (structured.testSummaries as Array<Record<string, unknown>>).some((entry) => !runIds.has(String(entry.run_id)))
+          || (structured.updateRevisions as Array<Record<string, unknown>>).some((entry) => !updateIds.has(String(entry.update_id)))
+          || (structured.evidenceHeads as Array<Record<string, unknown>>).some((entry) => !evidenceIds.has(String(entry.id)))) {
+          return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot contains an invalid nested ownership link' }]
+        }
+        const criteriaOwned = (structured.requirements as Array<Record<string, unknown>>).every((requirement) => Array.isArray(requirement.criteria)
+          && (requirement.criteria as Array<Record<string, unknown>>).every((criterion) => String(criterion.requirementId) === String(requirement.id)))
+        if (!criteriaOwned || !(structured.projectSecretNames as unknown[]).every((name) => typeof name === 'string')) {
+          return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot contains invalid criterion or redaction ownership data' }]
+        }
+        const criterionIds = new Set((structured.requirements as Array<Record<string, unknown>>).flatMap((requirement) => (requirement.criteria as Array<Record<string, unknown>>).map((criterion) => String(criterion.id))))
+        const belongsOrNull = (set: Set<string>, value: unknown) => value === null || value === undefined || set.has(String(value))
+        const nestedOwnershipInvalid = (structured.requirements as Array<Record<string, unknown>>).some((requirement) => !belongsOrNull(requirementIds, requirement.parentId)
+            || !requirementStateIds.has(String(requirement.stateId))
+            || !belongsOrNull(phaseIds, requirement.responsiblePhaseId)
+            || !Array.isArray(requirement.relatedPhaseIds) || (requirement.relatedPhaseIds as unknown[]).some((id) => !phaseIds.has(String(id)))
+            || !Array.isArray(requirement.linkedWorkItemIds) || (requirement.linkedWorkItemIds as unknown[]).some((id) => !workItemIds.has(String(id)))
+            || !Array.isArray(requirement.linkedEvidenceIds) || (requirement.linkedEvidenceIds as unknown[]).some((id) => !evidenceIds.has(String(id)))
+            || (requirement.criteria as Array<Record<string, unknown>>).some((criterion) => !belongsOrNull(evidenceIds, criterion.proofEvidenceId)))
+          || (structured.workItems as Array<Record<string, unknown>>).some((item) => !belongsOrNull(phaseIds, item.phaseId)
+            || !belongsOrNull(workItemIds, item.parentId) || !belongsOrNull(queueIds, item.queueId)
+            || !Array.isArray(item.labels) || (item.labels as Array<Record<string, unknown>>).some((label) => !labelIds.has(String(label.id))))
+          || (structured.relations as Array<Record<string, unknown>>).some((relation) => !workItemIds.has(String(relation.fromWorkItemId)) || !workItemIds.has(String(relation.toWorkItemId)))
+          || (structured.blockers as Array<Record<string, unknown>>).some((blocker) => !belongsOrNull(workItemIds, blocker.workItemId))
+          || (structured.runs as Array<Record<string, unknown>>).some((run) => !belongsOrNull(workspaceRevisionIds, run.workspaceRevisionId)
+            || !Array.isArray(run.artifacts) || (run.artifacts as Array<Record<string, unknown>>).some((artifact) => String(artifact.runId) !== String(run.id)))
+          || (structured.evidence as Array<Record<string, unknown>>).some((evidence) => !belongsOrNull(runIds, evidence.runId)
+            || !Array.isArray(evidence.requirementIds) || (evidence.requirementIds as unknown[]).some((id) => !requirementIds.has(String(id)))
+            || !Array.isArray(evidence.workItemIds) || (evidence.workItemIds as unknown[]).some((id) => !workItemIds.has(String(id)))
+            || !Array.isArray(evidence.updateIds) || (evidence.updateIds as unknown[]).some((id) => !updateIds.has(String(id)))
+            || !Array.isArray(evidence.checkpointIds) || (evidence.checkpointIds as unknown[]).some((id) => !updateIds.has(String(id)))
+            || !Array.isArray(evidence.criterionLinks) || (evidence.criterionLinks as Array<Record<string, unknown>>).some((link) => !criterionIds.has(String(link.criterionId)))
+            || !Array.isArray(evidence.artifacts) || (evidence.artifacts as Array<Record<string, unknown>>).some((artifact) => String(artifact.runId ?? '') !== String(evidence.runId ?? '')))
+          || (structured.updates as Array<Record<string, unknown>>).some((update) => !updateRevisionIds.has(String(update.current_revision_id)))
+          || (structured.workspaces as Array<Record<string, unknown>>).some((workspace) => !Array.isArray(workspace.aliases) || (workspace.aliases as unknown[]).some((alias) => typeof alias !== 'string'))
+          || !belongsOrNull(updateIds, (snapshotProject as Record<string, unknown>).current_checkpoint_id)
+        const ownershipLinks = links as Record<string, Array<Record<string, unknown>>>
+        const rawOwnershipInvalid = ownershipLinks.requirementAliases!.some((link) => !requirementIds.has(String(link.requirement_id)))
+          || ownershipLinks.requirementPhases!.some((link) => !requirementIds.has(String(link.requirement_id)) || !phaseIds.has(String(link.phase_id)))
+          || ownershipLinks.requirementWork!.some((link) => !requirementIds.has(String(link.requirement_id)) || !workItemIds.has(String(link.work_item_id)))
+          || ownershipLinks.workPhases!.some((link) => !workItemIds.has(String(link.work_item_id)) || !phaseIds.has(String(link.phase_id)))
+        if (nestedOwnershipInvalid || rawOwnershipInvalid) return [{ snapshotId: String(snapshot.id), reason: 'structured snapshot contains a cross-project nested reference' }]
+        const digest = createHash('sha256').update(canonicalJson(document)).digest('hex')
+        return digest === String(snapshot.digest) ? [] : [{ snapshotId: String(snapshot.id), reason: 'structured snapshot digest does not match its document' }]
+      })
       const invalidSnapshots: Array<{ updateId: string; reason: string }> = []
       const snapshots = temp.prepare(`SELECT u.id,u.project_id,r.snapshot_json FROM updates u JOIN update_revisions r ON r.update_id=u.id WHERE u.kind='checkpoint'`).all() as SqlRow[]
       for (const row of snapshots) {
@@ -668,8 +805,8 @@ export class SqliteIstraRepository implements IstraRepository {
         const workItemCount = workItemIds.length ? Number((temp.prepare(`SELECT COUNT(*) AS count FROM work_items WHERE project_id=? AND id IN (${workItemIds.map(() => '?').join(',')})`).get(String(row.project_id), ...workItemIds) as SqlRow).count) : 0
         if (phaseCount !== new Set(phaseIds).size || workItemCount !== new Set(workItemIds).size) invalidSnapshots.push({ updateId: String(row.id), reason: 'snapshot references an entity outside the project' })
       }
-      if (integrity.integrity_check !== 'ok' || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length) {
-        throw new ValidationError('Import failed database integrity checks', { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots })
+      if (integrity.integrity_check !== 'ok' || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length || invalidStructuredSnapshots.length || orphanArtifacts.length || invalidRuns.length || invalidEvidence.length || invalidRedactions.length) {
+        throw new ValidationError('Import failed database integrity checks', { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots, invalidStructuredSnapshots, orphanArtifacts, invalidRuns, invalidEvidence, invalidRedactions })
       }
     } catch (error) {
       if (error instanceof ValidationError) throw error
@@ -690,7 +827,6 @@ export class SqliteIstraRepository implements IstraRepository {
       for (const row of this.db.prepare('SELECT id FROM projects').all() as SqlRow[]) {
         const projectId = String(row.id)
         this.seedOperationalDefaults(projectId)
-        if (bundle.formatVersion === 1) this.backfillLegacyOperationalProjections(projectId)
       }
       this.rebuildSearch()
     })
@@ -699,10 +835,7 @@ export class SqliteIstraRepository implements IstraRepository {
   private loadTables(db: DatabaseSync, bundle: ExportBundle): void {
     for (const [table, columns] of Object.entries(exportTables)) {
       const rows = bundle.tables[table]
-      if (!Array.isArray(rows)) {
-        if (bundle.formatVersion === 1 && !legacyRequiredExportTables.has(table)) continue
-        throw new ValidationError(`Import is missing table ${table}`)
-      }
+      if (!Array.isArray(rows)) throw new ValidationError(`Import is missing table ${table}`)
       const statement = db.prepare(`INSERT INTO ${table}(${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
       for (const row of rows) statement.run(...columns.map((column) => {
         const key = column.replaceAll('"', '')

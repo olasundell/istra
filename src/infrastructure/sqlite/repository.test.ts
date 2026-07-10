@@ -25,13 +25,15 @@ describe('SQLite project memory repository', () => {
 
     const firstRun = await createRuntime({ dataDir })
     const project = await firstRun.service.createProject({ title: 'Persistent memory' })
-    const checkpoint = await firstRun.service.saveCheckpoint(project.id, {
+    const savedCheckpoint = await firstRun.service.saveCheckpoint(project.id, {
       expectedVersion: project.version,
       content: 'The first durable checkpoint.',
       currentFocus: 'Prove restart persistence',
       nextAction: 'Reopen the same database',
       blockers: [],
     })
+    const { checkpoint } = savedCheckpoint
+    expect(savedCheckpoint.snapshot).toMatchObject({ schemaVersion: 3, digest: expect.any(String) })
     await firstRun.service.reviseUpdate(checkpoint.id, {
       expectedVersion: checkpoint.version,
       content: 'The checkpoint and its original revision are durable.',
@@ -44,6 +46,7 @@ describe('SQLite project memory repository', () => {
     expect(restored.pulse.currentFocus).toBe('Prove restart persistence')
     expect(restored.updates[0]?.currentRevision.content).toBe('The checkpoint and its original revision are durable.')
     expect(secondRun.service.getUpdateRevisions(checkpoint.id)).toHaveLength(2)
+    expect(secondRun.service.getCheckpointSnapshot(checkpoint.id)?.digest).toBe(savedCheckpoint.snapshot.digest)
     expect(secondRun.service.search('durable')[0]).toMatchObject({ projectId: project.id, type: 'update' })
     secondRun.close()
   })
@@ -67,22 +70,57 @@ describe('SQLite project memory repository', () => {
     await app.service.createPhase(project.id, { name: 'Prototype', status: 'active' })
     await app.service.createWorkItem(project.id, { title: 'Handle invalid input', kind: 'issue', status: 'blocked' })
 
-    const checkpoint = await app.service.saveCheckpoint(project.id, {
+    const savedCheckpoint = await app.service.saveCheckpoint(project.id, {
       expectedVersion: project.version,
       content: 'Parser works; recovery remains.',
       currentFocus: 'Error recovery',
       nextAction: 'Add recovery cases',
       blockers: ['Need a useful diagnostic shape'],
     })
+    const { checkpoint } = savedCheckpoint
     const detail = app.service.getProject(project.id)!
     expect(detail.project.currentCheckpointId).toBe(checkpoint.id)
     expect(detail.pulse.currentFocus).toBe('Error recovery')
     expect(checkpoint.currentRevision.snapshot?.activePhaseIds).toHaveLength(1)
     expect(checkpoint.currentRevision.snapshot?.unresolvedWorkItemIds).toHaveLength(1)
+    expect(savedCheckpoint.snapshot).toMatchObject({
+      schemaVersion: 3,
+      digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      capturedAt: expect.any(String),
+    })
+    expect(app.service.getCheckpointSnapshot(checkpoint.id)?.id).toBe(savedCheckpoint.snapshot.id)
 
     const revised = await app.service.reviseUpdate(checkpoint.id, { expectedVersion: checkpoint.version, content: 'Parser and recovery now work.' })
     expect(revised.currentRevision.snapshot).toEqual(checkpoint.currentRevision.snapshot)
     expect(app.service.getUpdateRevisions(checkpoint.id)).toHaveLength(2)
+    app.close()
+  })
+
+  it('rolls back the checkpoint and project pulse when structured snapshot persistence fails', async () => {
+    const app = await runtime()
+    const project = await app.service.createProject({ title: 'Atomic snapshot failure' })
+    app.db.exec(`
+      CREATE TRIGGER fail_structured_snapshot
+      BEFORE INSERT ON checkpoint_snapshots
+      BEGIN
+        SELECT RAISE(ABORT, 'forced structured snapshot failure');
+      END;
+    `)
+
+    await expect(app.service.saveCheckpoint(project.id, {
+      expectedVersion: project.version,
+      content: 'This checkpoint must not survive.',
+      currentFocus: 'Must also roll back',
+    })).rejects.toThrow(/forced structured snapshot failure/)
+
+    expect(app.service.getProject(project.id)?.project).toMatchObject({
+      version: project.version,
+      currentCheckpointId: null,
+      currentFocus: null,
+    })
+    expect(app.db.prepare("SELECT COUNT(*) AS count FROM updates WHERE project_id=? AND kind='checkpoint'").get(project.id)).toEqual({ count: 0 })
+    expect(app.db.prepare('SELECT COUNT(*) AS count FROM checkpoint_snapshots').get()).toEqual({ count: 0 })
+    expect(app.service.listActivity(project.id).filter(({ eventType }) => eventType.startsWith('checkpoint'))).toHaveLength(0)
     app.close()
   })
 

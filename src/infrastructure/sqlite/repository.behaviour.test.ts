@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ValidationError } from '../../application/errors.js'
 import type { ExportBundle } from '../../application/ports.js'
 import type { Provenance } from '../../domain/contracts.js'
+import { canonicalJson } from '../../domain/canonical-json.js'
 import { openIstraDatabase } from './database.js'
 import { SqliteOperationalRepository } from './operational-repository.js'
 import { SqliteIstraRepository } from './repository.js'
@@ -77,6 +79,12 @@ describe('SQLite repository behaviour', () => {
       blockers: ['Open question'],
     })
     expect(checkpoint.currentRevision.snapshot?.activePhaseIds).toHaveLength(2)
+    const operational = new SqliteOperationalRepository(db)
+    expect(operational.reconstructCheckpointState(checkpoint.id)).toMatchObject({
+      compactSnapshot: checkpoint.currentRevision.snapshot,
+      _snapshot: { legacy: true, schemaVersion: 1, digest: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    })
+    expect(operational.compareCheckpointSnapshots(checkpoint.id, checkpoint.id)).toMatchObject({ same: true, leftLegacy: true, rightLegacy: true })
 
     const ordinaryUpdate = repository.createUpdate(project.id, {
       kind: 'decision', content: 'An ordinary entry does not replace the checkpoint.',
@@ -191,10 +199,10 @@ describe('SQLite repository behaviour', () => {
 
   it('paginates through the complete activity history beyond one thousand events', () => {
     const project = repository.createProject({ title: 'Long activity history' }, provenance)
-    const insert = db.prepare('INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,created_at) VALUES (?,?,?,?,?,?,?,?)')
+    const insert = db.prepare('INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
     db.exec('BEGIN')
     for (let index = 0; index < 1_005; index += 1) {
-      insert.run(`bulk-${index}`, project.id, 'probe', project.id, 'probe.recorded', '{}', 'system', `2026-01-01T00:${String(index).padStart(4, '0')}Z`)
+      insert.run(`bulk-${index}`, project.id, 'probe', project.id, 'probe.recorded', '{}', 'system', null, 'repository-test', null, `2026-01-01T00:${String(index).padStart(4, '0')}Z`)
     }
     db.exec('COMMIT')
 
@@ -223,53 +231,57 @@ describe('SQLite repository behaviour', () => {
     expect(repository.listWorkItems(project.id).find(({ id }) => id === child.id)?.parentId).toBe(parent.id)
   })
 
-  it('accepts legacy v1 exports and initialises their operational defaults', () => {
-    const project = repository.createProject({ title: 'Legacy export' }, provenance)
-    const phase = repository.createPhase(project.id, { name: 'Legacy phase', status: 'active' }, provenance)
-    const workItem = repository.createWorkItem(project.id, { kind: 'task', title: 'Legacy work', phaseId: phase.id }, provenance)
+  it('accepts current v3 exports and rejects obsolete format versions', () => {
+    const project = repository.createProject({ title: 'Current export' }, provenance)
     const current = repository.exportAll()
-    const legacyTables = ['projects', 'phases', 'work_items', 'labels', 'work_item_labels', 'updates', 'update_revisions', 'activity_events']
-    const legacy: ExportBundle = {
-      format: 'istra-export',
-      formatVersion: 1,
-      exportedAt: current.exportedAt,
-      tables: Object.fromEntries(legacyTables.map((table) => [table, current.tables[table]!.map((row) => {
-        if (table !== 'work_items') return row
-        const { stable_key: _stableKey, parent_id: _parentId, ...v1Row } = row
-        return v1Row
-      })])),
-    }
 
-    expect(() => repository.validateImport(legacy)).not.toThrow()
-    repository.importAll(legacy)
-    expect(repository.getProject(project.id)?.title).toBe('Legacy export')
-    expect((db.prepare('SELECT COUNT(*) AS count FROM requirement_states WHERE project_id=?').get(project.id) as { count: number }).count).toBe(4)
-    expect((db.prepare('SELECT COUNT(*) AS count FROM work_queues WHERE project_id=?').get(project.id) as { count: number }).count).toBe(1)
-    const operational = new SqliteOperationalRepository(db)
-    const queue = operational.listWorkQueues(project.id)[0]!
-    expect(operational.listWorkItems(project.id, queue.id)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: workItem.id, phaseId: phase.id }),
-    ]))
-    expect(db.prepare("SELECT role FROM work_phase_links WHERE work_item_id=? AND phase_id=?").get(workItem.id, phase.id)).toEqual({ role: 'responsible' })
-    expect(repository.search('Legacy', 20, { phaseId: phase.id })).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'work_item', id: workItem.id }),
-    ]))
+    expect(current.formatVersion).toBe(3)
+    expect(() => repository.validateImport(current)).not.toThrow()
+    repository.importAll(current)
+    expect(repository.getProject(project.id)?.title).toBe('Current export')
+
+    for (const formatVersion of [1, 2]) {
+      const obsolete = { ...current, formatVersion } as unknown as ExportBundle
+      expect(() => repository.validateImport(obsolete)).toThrow(`Unsupported import format version ${formatVersion}`)
+    }
   })
 
   it('rejects evidence artifacts assigned to another run and snapshots of ordinary updates', () => {
     const operational = new SqliteOperationalRepository(db)
     const first = repository.createProject({ title: 'Artifact source' }, provenance)
     const second = repository.createProject({ title: 'Evidence target' }, provenance)
-    const run = operational.createRun(first.id, {
-      command: 'pnpm test', outcome: 'verified', stdoutTruncated: false, stderrTruncated: false,
+    const foreignRun = operational.createRun(first.id, {
+      command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0, stdoutTruncated: false, stderrTruncated: false,
       artifacts: [{ uri: 'artifact://foreign-run' }],
     })
-    const evidence = operational.createEvidence(second.id, {
-      result: 'verified', summary: 'Standalone evidence', artifacts: [{ uri: 'artifact://standalone' }],
+    const evidenceRun = operational.createRun(second.id, {
+      command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0, stdoutTruncated: false, stderrTruncated: false,
     })
+    const evidence = operational.createEvidence(second.id, {
+      runId: evidenceRun.run.id, result: 'verified', summary: 'Linked evidence', artifacts: [{ uri: 'artifact://evidence' }],
+    })
+    const unredactedBundle = repository.exportAll()
+    unredactedBundle.tables.runs!.find((row) => row.id === evidenceRun.run.id)!.command = 'TOKEN=must-not-enter-the-ledger pnpm test'
+    expect(() => repository.validateImport(unredactedBundle)).toThrow(ValidationError)
+
+    const incompleteRunBundle = repository.exportAll()
+    incompleteRunBundle.tables.runs!.find((row) => row.id === evidenceRun.run.id)!.ended_at = null
+    expect(() => repository.validateImport(incompleteRunBundle)).toThrow(ValidationError)
+
+    const nonVerifiedRunBundle = repository.exportAll()
+    nonVerifiedRunBundle.tables.runs!.find((row) => row.id === evidenceRun.run.id)!.outcome = 'recorded'
+    expect(() => repository.validateImport(nonVerifiedRunBundle)).toThrow(ValidationError)
+
     const invalidArtifactBundle = repository.exportAll()
-    invalidArtifactBundle.tables.evidence_artifact_links!.find((row) => row.evidence_id === evidence.id)!.artifact_id = run.artifacts[0]!.id
+    const evidenceArtifactId = invalidArtifactBundle.tables.evidence_artifact_links!.find((row) => row.evidence_id === evidence.id)!.artifact_id
+    invalidArtifactBundle.tables.artifact_references!.find((row) => row.id === evidenceArtifactId)!.run_id = foreignRun.run.id
     expect(() => repository.validateImport(invalidArtifactBundle)).toThrow(ValidationError)
+
+    const orphanArtifactBundle = repository.exportAll()
+    const orphanArtifactId = orphanArtifactBundle.tables.evidence_artifact_links!.find((row) => row.evidence_id === evidence.id)!.artifact_id
+    orphanArtifactBundle.tables.artifact_references!.find((row) => row.id === orphanArtifactId)!.run_id = null
+    orphanArtifactBundle.tables.evidence_artifact_links = orphanArtifactBundle.tables.evidence_artifact_links!.filter((row) => row.artifact_id !== orphanArtifactId)
+    expect(() => repository.validateImport(orphanArtifactBundle)).toThrow(ValidationError)
 
     const checkpoint = repository.saveCheckpoint(second.id, {
       expectedVersion: second.version, content: 'Valid checkpoint', blockers: [],
@@ -281,11 +293,86 @@ describe('SQLite repository behaviour', () => {
     expect(() => repository.validateImport(invalidSnapshotBundle)).toThrow(ValidationError)
   })
 
+  it('validates structured snapshot digests using canonical object and array ordering', () => {
+    const operational = new SqliteOperationalRepository(db)
+    const project = repository.createProject({ title: 'Canonical snapshots' }, provenance)
+    operational.createRequirement(project.id, { stableKey: 'CANON-1', kind: 'requirement', title: 'First requirement' })
+    operational.createRequirement(project.id, { stableKey: 'CANON-2', kind: 'requirement', title: 'Second requirement' })
+    const evidenceRun = operational.createRun(project.id, { command: 'capture evidence artefact', outcome: 'recorded', stdoutTruncated: false, stderrTruncated: false })
+    const otherRun = operational.createRun(project.id, { command: 'other run', outcome: 'recorded', stdoutTruncated: false, stderrTruncated: false })
+    operational.createEvidence(project.id, {
+      runId: evidenceRun.run.id, result: 'recorded', summary: 'Snapshot evidence', artifacts: [{ uri: 'artifact://snapshot-evidence' }],
+    })
+    const checkpoint = repository.saveCheckpoint(project.id, { expectedVersion: project.version, content: 'Canonical state' }, provenance)
+    operational.captureCheckpointSnapshot(project.id, checkpoint.id)
+    const reordered = repository.exportAll()
+    const snapshot = reordered.tables.checkpoint_snapshots![0]!
+    const document = JSON.parse(String(snapshot.document_json)) as Record<string, unknown>
+    const requirements = [...document.requirements as unknown[]].reverse()
+    snapshot.document_json = JSON.stringify(Object.fromEntries(Object.entries({ ...document, requirements }).reverse()))
+
+    expect(() => repository.validateImport(reordered)).not.toThrow()
+
+    const tampered = structuredClone(reordered)
+    const tamperedSnapshot = tampered.tables.checkpoint_snapshots![0]!
+    const tamperedDocument = JSON.parse(String(tamperedSnapshot.document_json)) as { project: { title: string } }
+    tamperedDocument.project.title = 'Tampered without a new digest'
+    tamperedSnapshot.document_json = JSON.stringify(tamperedDocument)
+    expect(() => repository.validateImport(tampered)).toThrow(ValidationError)
+
+    const otherProject = repository.createProject({ title: 'Other snapshot owner' }, provenance)
+    const wrongOwner = repository.exportAll()
+    const wrongOwnerSnapshot = wrongOwner.tables.checkpoint_snapshots![0]!
+    const wrongOwnerDocument = JSON.parse(String(wrongOwnerSnapshot.document_json)) as { project: { id: string } }
+    wrongOwnerDocument.project.id = otherProject.id
+    wrongOwnerSnapshot.document_json = JSON.stringify(wrongOwnerDocument)
+    wrongOwnerSnapshot.digest = createHash('sha256').update(canonicalJson(wrongOwnerDocument)).digest('hex')
+    expect(() => repository.validateImport(wrongOwner)).toThrow(ValidationError)
+
+    const wrongNestedOwner = repository.exportAll()
+    const wrongNestedSnapshot = wrongNestedOwner.tables.checkpoint_snapshots![0]!
+    const wrongNestedDocument = JSON.parse(String(wrongNestedSnapshot.document_json)) as { requirements: Array<{ projectId: string }> }
+    wrongNestedDocument.requirements[0]!.projectId = otherProject.id
+    wrongNestedSnapshot.document_json = JSON.stringify(wrongNestedDocument)
+    wrongNestedSnapshot.digest = createHash('sha256').update(canonicalJson(wrongNestedDocument)).digest('hex')
+    expect(() => repository.validateImport(wrongNestedOwner)).toThrow(ValidationError)
+
+    const otherPhase = repository.createPhase(otherProject.id, { name: 'Foreign phase', status: 'active' }, provenance)
+    const wrongNestedReference = repository.exportAll()
+    const wrongReferenceSnapshot = wrongNestedReference.tables.checkpoint_snapshots![0]!
+    const wrongReferenceDocument = JSON.parse(String(wrongReferenceSnapshot.document_json)) as { requirements: Array<{ responsiblePhaseId: string | null }> }
+    wrongReferenceDocument.requirements[0]!.responsiblePhaseId = otherPhase.id
+    wrongReferenceSnapshot.document_json = JSON.stringify(wrongReferenceDocument)
+    wrongReferenceSnapshot.digest = createHash('sha256').update(canonicalJson(wrongReferenceDocument)).digest('hex')
+    expect(() => repository.validateImport(wrongNestedReference)).toThrow(ValidationError)
+
+    const wrongEvidenceArtifact = repository.exportAll()
+    const wrongEvidenceSnapshot = wrongEvidenceArtifact.tables.checkpoint_snapshots![0]!
+    const wrongEvidenceDocument = JSON.parse(String(wrongEvidenceSnapshot.document_json)) as { evidence: Array<{ artifacts: Array<{ runId: string | null }> }> }
+    wrongEvidenceDocument.evidence[0]!.artifacts[0]!.runId = otherRun.run.id
+    wrongEvidenceSnapshot.document_json = JSON.stringify(wrongEvidenceDocument)
+    wrongEvidenceSnapshot.digest = createHash('sha256').update(canonicalJson(wrongEvidenceDocument)).digest('hex')
+    expect(() => repository.validateImport(wrongEvidenceArtifact)).toThrow(ValidationError)
+  })
+
   it('rejects operational import links that cross project boundaries', () => {
     const operational = new SqliteOperationalRepository(db)
     const first = repository.createProject({ title: 'First import project' }, provenance)
     const second = repository.createProject({ title: 'Second import project' }, provenance)
-    const requirement = operational.createRequirement(first.id, { stableKey: 'FIRST-1', kind: 'requirement', title: 'First requirement' })
+    const requirement = operational.createRequirement(first.id, {
+      stableKey: 'FIRST-1', kind: 'requirement', title: 'First requirement', criteria: [{ title: 'Criterion trace remains complete', required: true }],
+    })
+    const run = operational.createRun(first.id, {
+      command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0,
+      stdoutTruncated: false, stderrTruncated: false,
+    })
+    const evidence = operational.createEvidence(first.id, {
+      runId: run.run.id, result: 'verified', summary: 'Criterion passed', criterionIds: [requirement.criteria[0]!.id],
+    })
+    const missingRequirementLink = repository.exportAll()
+    missingRequirementLink.tables.evidence_requirement_links = missingRequirementLink.tables.evidence_requirement_links!.filter((row) => row.evidence_id !== evidence.id)
+    expect(() => repository.validateImport(missingRequirementLink)).toThrow(ValidationError)
+
     const secondState = operational.listRequirementStates(second.id)[0]!
     const bundle = repository.exportAll()
     bundle.tables.requirements!.find((row) => row.id === requirement.id)!.state_id = secondState.id

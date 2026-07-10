@@ -40,23 +40,37 @@ describe('SQLite database integrity', () => {
     }).toThrow()
   })
 
-  it('backfills legacy work into the default queue and responsible phase projection', () => {
-    const db = new DatabaseSync(':memory:')
-    databases.push(db)
-    db.exec('PRAGMA foreign_keys=ON')
-    for (const migration of migrations.filter(({ version }) => version <= 3)) db.exec(migration.sql)
-    const timestamp = '2026-07-10T08:00:00.000Z'
-    const projectId = randomUUID()
-    const phaseId = randomUUID()
-    const workItemId = randomUUID()
-    db.prepare("INSERT INTO projects(id,title,state,created_at,updated_at) VALUES (?,?,'active',?,?)").run(projectId, 'Legacy project', timestamp, timestamp)
-    db.prepare("INSERT INTO phases(id,project_id,name,status,created_at,updated_at) VALUES (?,?,?,'active',?,?)").run(phaseId, projectId, 'Legacy phase', timestamp, timestamp)
-    db.prepare("INSERT INTO work_items(id,project_id,phase_id,kind,title,status,created_at,updated_at) VALUES (?,?,?,'task',?,'open',?,?)").run(workItemId, projectId, phaseId, 'Legacy work', timestamp, timestamp)
+  it('creates the complete authoritative schema from one fresh migration', async () => {
+    const { db } = await openDatabase()
 
-    db.exec(migrations.find(({ version }) => version === 4)!.sql)
+    expect(migrations.map(({ version, name }) => ({ version, name }))).toEqual([
+      { version: 1, name: 'authoritative_ledger' },
+    ])
+    expect(db.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all()).toEqual([
+      { version: 1, name: 'authoritative_ledger' },
+    ])
 
-    expect(db.prepare('SELECT q.project_id,i.work_item_id FROM work_queue_items i JOIN work_queues q ON q.id=i.queue_id WHERE i.work_item_id=?').get(workItemId)).toEqual({ project_id: projectId, work_item_id: workItemId })
-    expect(db.prepare('SELECT phase_id,role FROM work_phase_links WHERE work_item_id=?').get(workItemId)).toEqual({ phase_id: phaseId, role: 'responsible' })
+    const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(({ name }) => name))
+    expect([...tables]).toEqual(expect.arrayContaining([
+      'projects',
+      'requirements',
+      'runs',
+      'evidence',
+      'checkpoint_snapshots',
+      'idempotency_records',
+    ]))
+  })
+
+  it('fails closed when a legacy migration history is opened without recreating the database', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'istra-legacy-schema-test-'))
+    directories.push(dataDir)
+    const databasePath = join(dataDir, 'istra.sqlite3')
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL) STRICT;')
+    legacy.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (1,?,?)').run('initial', new Date().toISOString())
+    legacy.close()
+
+    await expect(openIstraDatabase({ dataDir })).rejects.toThrow(/incompatible legacy schema.*Recreate/i)
   })
 
   it('rejects a current checkpoint that is missing, deleted, the wrong kind, or owned by another project', async () => {

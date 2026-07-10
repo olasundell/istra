@@ -152,6 +152,12 @@ describe('HTTP API contract', () => {
       },
     })
     expect(checkpointResponse.statusCode).toBe(200)
+    expect(checkpointResponse.json()).toMatchObject({
+      data: {
+        checkpoint: { kind: 'checkpoint', currentRevision: { content: 'Checkpoint before export' } },
+        snapshot: { id: expect.any(String), digest: expect.stringMatching(/^[a-f0-9]{64}$/), schemaVersion: 3, capturedAt: expect.any(String) },
+      },
+    })
 
     const exportResponse = await app.inject({
       method: 'GET',
@@ -161,7 +167,7 @@ describe('HTTP API contract', () => {
     expect(exportResponse.statusCode).toBe(200)
     expect(exportResponse.headers['content-disposition']).toContain('attachment;')
     const exported = exportResponse.json() as ExportBundle
-    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 2 })
+    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 3 })
     expect(exported).not.toHaveProperty('data')
 
     const importResponse = await app.inject({
@@ -312,11 +318,55 @@ describe('HTTP API contract', () => {
     const workspace = await runtime.service.createWorkspace({ name: 'Coverage workspace', canonicalRoot: join(dataDir, 'workspace') })
     await runtime.service.linkProjectWorkspace(project.id, workspace.id, 'workspace-link-key', 'test')
     const revision = await runtime.service.createWorkspaceRevision({ workspaceId: workspace.id, dirty: false })
-    const run = await runtime.service.createRun(project.id, { workspaceRevisionId: revision.id, command: 'pnpm test' }, 'run-key', 'test')
+    const run = await runtime.service.createRun(project.id, { workspaceRevisionId: revision.id, command: 'pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'verified', exitCode: 0 }, 'run-key', 'test')
     await runtime.service.createEvidence(project.id, { runId: run.run.id, result: 'verified', summary: 'Tests passed' })
-    await runtime.service.captureCheckpointSnapshot(project.id, checkpoint.id, 'snapshot-key', 'test')
+    const legacySnapshotResponse = await app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${project.id}/checkpoints/${checkpoint.checkpoint.id}/legacy-snapshot`,
+      headers: { ...jsonHeaders, 'idempotency-key': 'snapshot-key', 'x-istra-client': 'test' },
+      payload: {},
+    })
 
+    expect(legacySnapshotResponse.statusCode).toBe(200)
+    expect(legacySnapshotResponse.json()).toMatchObject({ data: { checkpointId: checkpoint.checkpoint.id, schemaVersion: 3 } })
     expect(beforeWrite).toHaveBeenCalledTimes(16)
+  })
+
+  it('allows HTTP verification overrides and records their audit context', async () => {
+    const project = await createProject('Override audit project')
+    const reason = 'Verified manually against an external signed test report.'
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${project.id}/evidence`,
+      headers: { ...jsonHeaders, 'idempotency-key': 'override-evidence-key', 'x-istra-client': 'mcp:override-reviewer' },
+      payload: { result: 'verified', summary: 'External verification accepted', override: { reason } },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toMatchObject({
+      data: {
+        result: 'verified',
+        validationStatus: 'overridden',
+        override: { reason, actor: 'mcp:override-reviewer', source: 'ui', client: 'mcp:override-reviewer', createdAt: expect.any(String) },
+      },
+    })
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/projects/${project.id}`,
+      headers: { host: 'localhost:4317' },
+    })
+    expect(detail.statusCode).toBe(200)
+    expect(detail.json().data.activity).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventType: 'evidence.created',
+        source: 'ui',
+        client: 'mcp:override-reviewer',
+        actor: 'mcp:override-reviewer',
+        idempotencyKey: 'override-evidence-key',
+        payload: expect.objectContaining({ overridden: true }),
+      }),
+    ]))
   })
 
   it('applies search filters before the requested result limit', async () => {

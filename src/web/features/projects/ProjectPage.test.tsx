@@ -39,6 +39,7 @@ const operationalPulse = {
   requirementRollup: {
     total: 12,
     bySemantic: { open: 5, partial: 2, proven: 3, defect: 2 },
+    byProofStatus: { open: 2, partial: 1, proven: 7, defect: 2 },
     gateFailures: 4,
     defects: 2,
     byCapability: [],
@@ -54,7 +55,7 @@ const operationalPulse = {
   failedEvidenceCount: 1,
 };
 const requirementsPage = {
-  items: [{ id: "requirement-1", stableKey: "REQ-1", title: "Broken authentication", gate: "satisfied" }],
+  items: [{ id: "requirement-1", stableKey: "REQ-1", title: "Broken authentication", gate: "satisfied", proofStatus: "defect" }],
   nextCursor: null,
   hasMore: false,
 };
@@ -74,7 +75,15 @@ function projectPageResponse(input: RequestInfo | URL, init?: RequestInit) {
   if (url.includes(`/projects/${id}/requirements/page`)) return response(requirementsPage);
   if (url.includes("/phases")) return response([]);
   if (url.endsWith("/labels")) return response([]);
-  if (url.includes("/checkpoints") && init?.method === "POST") return response({ id: "checkpoint-1" });
+  if (url.includes("/checkpoints") && init?.method === "POST") return response({
+    checkpoint: { id: "checkpoint-1" },
+    snapshot: {
+      id: "snapshot-1",
+      digest: "a".repeat(64),
+      schemaVersion: 3,
+      capturedAt: "2026-07-10T11:00:00.000Z",
+    },
+  });
   return response([]);
 }
 
@@ -123,8 +132,9 @@ describe("ProjectPage", () => {
     const requirementsCard = screen.getByText("Requirements").closest(".operational-memory-card") as HTMLElement | null;
     expect(requirementsCard).not.toBeNull();
     expect(within(requirementsCard!).getByText("12")).toBeInTheDocument();
-    expect(within(requirementsCard!).getByText("3 proven · 4 gate failures · 2 defects")).toBeInTheDocument();
+    expect(within(requirementsCard!).getByText("7 proven · 4 gate failures · 2 defects")).toBeInTheDocument();
     expect(await screen.findByText("REQ-1")).toBeInTheDocument();
+    expect(screen.getByText("Defect")).toHaveClass("requirement-gate--defect");
 
     const urls = fetchMock.mock.calls.map(([input]) => String(input));
     expect(urls.some((url) => url.includes(`/requirements/page?limit=8`))).toBe(true);

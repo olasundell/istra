@@ -37,6 +37,8 @@ Set `ISTRA_DATA_DIR` to keep the database and backups elsewhere. Istra enables f
 
 Use the Data management view for a portable, versioned JSON export or a full replacement import. Import validates the bundle before changing active data and takes a pre-import backup. Import is intentionally not a merge operation.
 
+The authoritative-ledger development schema is created from one fresh migration and accepts export format v3 only. Earlier databases and v1/v2 exports are intentionally unsupported: stop every Istra web/MCP process, remove the old database together with its `-wal` and `-shm` files, then restart Istra to create the new schema. Startup fails closed when it detects an older migration history; it never deletes a database automatically.
+
 ## MCP
 
 The stdio MCP server uses the same application service and database as the UI:

@@ -434,6 +434,10 @@ h1, h2, h3, p { margin-top: 0; }
 .requirement-gate--satisfied { color: var(--green); }
 .requirement-gate--unsatisfied { color: var(--rust); }
 .requirement-gate--not_configured { color: var(--muted); }
+.requirement-gate--proven { color: var(--green); }
+.requirement-gate--defect { color: var(--rust); }
+.requirement-gate--partial { color: #9a6800; }
+.requirement-gate--open { color: var(--muted); }
 .operational-memory__empty { color: var(--muted); font-size: 13px; }
 
 @media (max-width: 1050px) {

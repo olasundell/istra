@@ -19,6 +19,7 @@ export type {
   DashboardActivityEvent,
   CheckpointInput,
   CheckpointComparison,
+  CheckpointSaveResult,
   CreateLabelInput,
   CreatePhaseInput,
   CreateProjectInput,
@@ -65,7 +66,7 @@ export interface BackupStatus {
 
 export interface ActivityViewItem {
   id: string;
-  projectId: string;
+  projectId: string | null;
   projectTitle?: string;
   kind: string;
   summary: string;

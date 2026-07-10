@@ -42,6 +42,8 @@ describe('MCP server contract', () => {
 
     expect([...byName.keys()]).toEqual(expect.arrayContaining([
       'archive_project',
+      'backfill_legacy_checkpoint_snapshot',
+      'create_evidence',
       'create_phase',
       'create_project',
       'create_update',
@@ -60,6 +62,8 @@ describe('MCP server contract', () => {
     expect(byName.has('restore_backup')).toBe(false)
     expect(byName.has('delete_project')).toBe(false)
     expect(byName.has('hard_delete_update')).toBe(false)
+    expect(byName.has('capture_checkpoint_snapshot')).toBe(false)
+    expect((byName.get('create_evidence')?.inputSchema as { properties?: Record<string, unknown> }).properties).not.toHaveProperty('override')
 
     for (const tool of tools) expect(tool.annotations?.destructiveHint).toBe(false)
     for (const readTool of ['list_projects', 'get_project_pulse', 'list_work_items', 'search']) {
@@ -147,12 +151,67 @@ describe('MCP server contract', () => {
       name: 'revise_update',
       arguments: { updateId: update.id, expectedVersion: update.version, content: 'Revised update' },
     })
-    const checkpoint = await client.callTool({
+    const checkpointResponse = await client.callTool({
       name: 'save_checkpoint',
       arguments: { projectId: project.id, expectedVersion: project.version, content: 'Compatibility checkpoint' },
     })
 
-    for (const response of [phase, workItem, revision, checkpoint]) expect(response.isError).not.toBe(true)
+    for (const response of [phase, workItem, revision, checkpointResponse]) expect(response.isError).not.toBe(true)
+    expect(structured<{ checkpoint: { kind: string }; snapshot: { digest: string; schemaVersion: number } }>(checkpointResponse)).toMatchObject({
+      checkpoint: { kind: 'checkpoint' },
+      snapshot: { digest: expect.stringMatching(/^[a-f0-9]{64}$/), schemaVersion: 3 },
+    })
+  })
+
+  it('accepts validated verified evidence but does not honour MCP override input', async () => {
+    const project = structured<Project>(await client.callTool({
+      name: 'create_project',
+      arguments: { title: 'MCP evidence project' },
+    }))
+    const run = structured<{ run: { id: string; outcome: string; validationStatus: string } }>(await client.callTool({
+      name: 'create_run',
+      arguments: {
+        projectId: project.id,
+        idempotencyKey: 'verified-run-key',
+        client: 'codex-evidence',
+        command: 'pnpm test',
+        startedAt: '2026-07-10T10:00:00.000Z',
+        endedAt: '2026-07-10T10:00:01.000Z',
+        outcome: 'verified',
+        exitCode: 0,
+      },
+    }))
+    expect(run.run).toMatchObject({ outcome: 'verified', validationStatus: 'validated' })
+
+    const evidence = await client.callTool({
+      name: 'create_evidence',
+      arguments: {
+        projectId: project.id,
+        idempotencyKey: 'verified-evidence-key',
+        client: 'codex-evidence',
+        runId: run.run.id,
+        result: 'verified',
+        summary: 'The verified run passed.',
+      },
+    })
+    expect(evidence.isError).not.toBe(true)
+    expect(structured<{ validationStatus: string; override: unknown }>(evidence)).toMatchObject({ validationStatus: 'validated', override: null })
+
+    const overrideAttempt = await client.callTool({
+      name: 'create_evidence',
+      arguments: {
+        projectId: project.id,
+        idempotencyKey: 'override-attempt-key',
+        client: 'codex-evidence',
+        result: 'verified',
+        summary: 'Attempt an MCP override.',
+        override: { reason: 'MCP must not be able to create an override.' },
+      },
+    })
+    expect(overrideAttempt.isError).toBe(true)
+    expect(overrideAttempt.content).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'text', text: expect.stringMatching(/override|unrecognized|unknown/i) }),
+    ]))
   })
 
   it('returns tool errors for missing nullable resources', async () => {

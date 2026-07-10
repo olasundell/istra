@@ -16,6 +16,7 @@ const instructionPath = resolve(pluginRoot, "instructions/opencode-project-memor
 describe("OpenCode plugin package", () => {
   it("declares an OpenCode server export and packages its runtime assets", async () => {
     const manifest = JSON.parse(await readFile(resolve(pluginRoot, "package.json"), "utf8")) as Record<string, unknown>;
+    const instructions = await readFile(instructionPath, "utf8");
 
     expect(manifest).toMatchObject({
       name: "opencode-istra",
@@ -44,6 +45,18 @@ describe("OpenCode plugin package", () => {
       "instructions/opencode-project-memory.md",
       "skills/istra-project-memory/SKILL.md",
     ]));
+    expect(instructions).toContain("Call `istra_resolve_project` first with the current checkout path.");
+    expect(instructions).toContain("Call `istra_get_project_pulse_summary`");
+    for (const tool of ["istra_list_requirements_page", "istra_list_operational_work_items_page", "istra_list_external_blockers", "istra_list_evidence_page"]) {
+      expect(instructions).toContain(`\`${tool}\``);
+    }
+    for (const tool of ["istra_create_requirement", "istra_update_requirement", "istra_create_work_item", "istra_update_work_item", "istra_create_evidence"]) {
+      expect(instructions).toContain(`\`${tool}\``);
+    }
+    expect(instructions).toContain("Record meaningful verification commands with `istra_create_run`");
+    expect(instructions.toLocaleLowerCase()).toContain("link evidence to the exact acceptance criteria and work items");
+    expect(instructions).toContain("Never create evidence overrides.");
+    expect(instructions).toContain("Confirm that `istra_save_checkpoint` returned its snapshot identifier and digest.");
   });
 
   it("adds Istra only when the user has not already configured it", async () => {

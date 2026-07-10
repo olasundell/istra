@@ -25,6 +25,7 @@ import {
   UpdateRequirementSchema,
   PageRequestSchema,
   type Provenance,
+  type MutationContext,
   type SearchFilters,
 } from '../domain/contracts.js'
 import { ValidationError } from './errors.js'
@@ -33,13 +34,13 @@ import type { OperationalRepository } from '../infrastructure/sqlite/operational
 
 const ExportBundleSchema = z.object({
   format: z.literal('istra-export'),
-  formatVersion: z.union([z.literal(1), z.literal(2)]),
+  formatVersion: z.literal(3),
   exportedAt: z.string().datetime({ offset: true }),
   tables: z.record(z.array(z.record(z.unknown()))),
 }).strict()
 
-const provenance = (value?: Partial<Provenance>): Provenance => ({ source: value?.source ?? 'ui', client: value?.client })
 const queryBoolean = (value: unknown): boolean => value === true || value === 'true'
+type OperationalCaller = Partial<Provenance> | string
 
 export class IstraService {
   constructor(private readonly repository: IstraRepository, private readonly backups: BackupManager, private readonly operational?: OperationalRepository) {}
@@ -55,18 +56,24 @@ export class IstraService {
     return result.data
   }
 
-  private async write<T>(operation: () => T): Promise<T> {
-    await this.backups.beforeWrite()
-    return operation()
+  private mutationContext(caller: OperationalCaller = {}, key?: string): MutationContext {
+    const provenance = typeof caller === 'string' ? { source: 'ui' as const, client: caller } : caller
+    const client = provenance.client ?? provenance.actor ?? provenance.source ?? 'ui'
+    return {
+      source: provenance.source ?? 'ui', actor: (provenance.actor ?? client) || 'local-user', client,
+      idempotencyKey: key ?? provenance.idempotencyKey ?? null, occurredAt: provenance.occurredAt ?? new Date().toISOString(),
+    }
   }
 
-  private async writeIdempotent<T>(clientName: string, key: string, operationName: string, payload: unknown, operation: () => T): Promise<T> {
+  private async writeOperational<T>(caller: OperationalCaller, key: string | undefined, operationName: string, payload: unknown, operation: () => T): Promise<T> {
     await this.backups.beforeWrite()
-    return this.operations().runIdempotent(clientName, key, operationName, payload, operation)
+    return this.operations().runMutation(this.mutationContext(caller, key), operationName, payload, operation)
   }
 
-  private writeOperational<T>(clientName: string, key: string | undefined, operationName: string, payload: unknown, operation: () => T): Promise<T> {
-    return key ? this.writeIdempotent(clientName, key, operationName, payload, operation) : this.write(operation)
+  private async writeCore<T>(source: Partial<Provenance> | undefined, key: string | undefined, operationName: string, payload: unknown, operation: (context: MutationContext) => T): Promise<T> {
+    await this.backups.beforeWrite()
+    const context = this.mutationContext(source, key)
+    return this.operations().runMutation(context, operationName, payload, () => operation(context))
   }
 
   listProjects(filters: unknown = {}) {
@@ -119,107 +126,105 @@ export class IstraService {
 
   createProject(input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CreateProjectSchema, input)
-    const operation = () => this.repository.createProject(parsed, provenance(source))
-    return idempotencyKey ? this.writeIdempotent(source?.client ?? 'ui', idempotencyKey, 'create_project', parsed, operation) : this.write(operation)
+    return this.writeCore(source, idempotencyKey, 'create_project', parsed, (context) => this.repository.createProject(parsed, context))
   }
   updateProject(id: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(UpdateProjectSchema, input)
-    return this.write(() => this.repository.updateProject(id, parsed, provenance(source)))
+    return this.writeCore(source, undefined, 'update_project', { id, parsed }, (context) => this.repository.updateProject(id, parsed, context))
   }
   archiveProject(id: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(z.object({ expectedVersion: z.number().int().positive(), archived: z.boolean() }), input)
-    return this.write(() => this.repository.archiveProject(id, parsed.expectedVersion, parsed.archived, provenance(source)))
+    return this.writeCore(source, undefined, 'archive_project', { id, parsed }, (context) => this.repository.archiveProject(id, parsed.expectedVersion, parsed.archived, context))
   }
   createPhase(projectId: string, input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CreatePhaseSchema, input)
-    const operation = () => this.repository.createPhase(projectId, parsed, provenance(source))
-    return idempotencyKey ? this.writeIdempotent(source?.client ?? 'ui', idempotencyKey, 'create_phase', { projectId, parsed }, operation) : this.write(operation)
+    return this.writeCore(source, idempotencyKey, 'create_phase', { projectId, parsed }, (context) => this.repository.createPhase(projectId, parsed, context))
   }
   updatePhase(id: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(UpdatePhaseSchema, input)
-    return this.write(() => this.repository.updatePhase(id, parsed, provenance(source)))
+    return this.writeCore(source, undefined, 'update_phase', { id, parsed }, (context) => this.repository.updatePhase(id, parsed, context))
   }
   createWorkItem(projectId: string, input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CreateWorkItemSchema, input)
-    const operation = () => this.repository.createWorkItem(projectId, parsed, provenance(source))
-    return idempotencyKey ? this.writeIdempotent(source?.client ?? 'ui', idempotencyKey, 'create_work_item', { projectId, parsed }, operation) : this.write(operation)
+    return this.writeCore(source, idempotencyKey, 'create_work_item', { projectId, parsed }, (context) => this.repository.createWorkItem(projectId, parsed, context))
   }
   updateWorkItem(id: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(UpdateWorkItemSchema, input)
-    return this.write(() => this.repository.updateWorkItem(id, parsed, provenance(source)))
+    return this.writeCore(source, undefined, 'update_work_item', { id, parsed }, (context) => this.repository.updateWorkItem(id, parsed, context))
   }
   createUpdate(projectId: string, input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CreateUpdateSchema, input)
-    const operation = () => this.repository.createUpdate(projectId, parsed, provenance(source))
-    return idempotencyKey ? this.writeIdempotent(source?.client ?? 'ui', idempotencyKey, 'create_update', { projectId, parsed }, operation) : this.write(operation)
+    return this.writeCore(source, idempotencyKey, 'create_update', { projectId, parsed }, (context) => this.repository.createUpdate(projectId, parsed, context))
   }
   reviseUpdate(id: string, input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(ReviseUpdateSchema, input)
-    const operation = () => this.repository.reviseUpdate(id, parsed, provenance(source))
-    return idempotencyKey ? this.writeIdempotent(source?.client ?? 'ui', idempotencyKey, 'revise_update', { id, parsed }, operation) : this.write(operation)
+    return this.writeCore(source, idempotencyKey, 'revise_update', { id, parsed }, (context) => this.repository.reviseUpdate(id, parsed, context))
   }
   deleteUpdate(id: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(z.object({ expectedVersion: z.number().int().positive() }), input)
-    return this.write(() => this.repository.softDeleteUpdate(id, parsed.expectedVersion, provenance(source)))
+    return this.writeCore(source, undefined, 'delete_update', { id, parsed }, (context) => this.repository.softDeleteUpdate(id, parsed.expectedVersion, context))
   }
-  saveCheckpoint(projectId: string, input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
+  async saveCheckpoint(projectId: string, input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CheckpointSchema, input)
-    const operation = () => this.repository.saveCheckpoint(projectId, parsed, provenance(source))
-    return idempotencyKey ? this.writeIdempotent(source?.client ?? 'ui', idempotencyKey, 'save_checkpoint', { projectId, parsed }, operation) : this.write(operation)
+    const context = this.mutationContext(source, idempotencyKey)
+    await this.backups.beforeWrite()
+    return this.operations().runMutation(context, 'save_checkpoint', { projectId, parsed }, () => {
+      const checkpoint = this.repository.saveCheckpoint(projectId, parsed, context)
+      const snapshot = this.operations().captureCheckpointSnapshot(projectId, checkpoint.id)
+      return { checkpoint, snapshot: { id: snapshot.id, digest: snapshot.digest, schemaVersion: snapshot.schemaVersion, capturedAt: snapshot.capturedAt } }
+    })
   }
   createLabel(input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CreateLabelSchema, input)
-    const operation = () => this.repository.createLabel(parsed, provenance(source))
-    return idempotencyKey ? this.writeIdempotent(source?.client ?? 'ui', idempotencyKey, 'create_label', parsed, operation) : this.write(operation)
+    return this.writeCore(source, idempotencyKey, 'create_label', parsed, (context) => this.repository.createLabel(parsed, context))
   }
   attachLabel(workItemId: string, labelId: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(z.object({ expectedVersion: z.number().int().positive() }), input)
-    return this.write(() => this.repository.attachLabel(workItemId, labelId, parsed.expectedVersion, provenance(source)))
+    return this.writeCore(source, undefined, 'attach_label', { workItemId, labelId, parsed }, (context) => this.repository.attachLabel(workItemId, labelId, parsed.expectedVersion, context))
   }
   detachLabel(workItemId: string, labelId: string, input: unknown, source?: Partial<Provenance>) {
     const parsed = this.parse(z.object({ expectedVersion: z.number().int().positive() }), input)
-    return this.write(() => this.repository.detachLabel(workItemId, labelId, parsed.expectedVersion, provenance(source)))
+    return this.writeCore(source, undefined, 'detach_label', { workItemId, labelId, parsed }, (context) => this.repository.detachLabel(workItemId, labelId, parsed.expectedVersion, context))
   }
 
   async importAll(value: unknown): Promise<void> {
     const bundle = this.parse(ExportBundleSchema, value) as ExportBundle
     this.repository.validateImport(bundle)
-    await this.backups.beforeWrite()
     await this.backups.create('pre-import')
     this.repository.importAll(bundle)
   }
 
   listRequirementStates(projectId: string) { return this.operations().listRequirementStates(projectId) }
-  createRequirementState(projectId: string, input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateRequirementStateSchema, input); const operation = () => this.operations().createRequirementState(projectId, parsed); return this.writeOperational(clientName, idempotencyKey, 'create_requirement_state', { projectId, parsed }, operation) }
+  createRequirementState(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateRequirementStateSchema, input); const operation = () => this.operations().createRequirementState(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_requirement_state', { projectId, parsed }, operation) }
   listRequirements(projectId: string) { return this.operations().listRequirements(projectId) }
   listRequirementsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listRequirementsPage(projectId, parsed.limit, parsed.cursor) }
   getRequirement(id: string) { return this.operations().getRequirement(id) }
-  createRequirement(projectId: string, input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateRequirementSchema, input); const operation = () => this.operations().createRequirement(projectId, parsed); return this.writeOperational(clientName, idempotencyKey, 'create_requirement', { projectId, parsed }, operation) }
-  updateRequirement(id: string, input: unknown) { const parsed = this.parse(UpdateRequirementSchema, input); return this.write(() => this.operations().updateRequirement(id, parsed)) }
-  linkRequirementWork(projectId: string, requirementId: string, workItemId: string) { return this.write(() => this.operations().linkRequirementWork(projectId, requirementId, workItemId)) }
-  unlinkRequirementWork(requirementId: string, workItemId: string) { return this.write(() => this.operations().unlinkRequirementWork(requirementId, workItemId)) }
+  createRequirement(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateRequirementSchema, input); const operation = () => this.operations().createRequirement(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_requirement', { projectId, parsed }, operation) }
+  updateRequirement(id: string, input: unknown, caller: OperationalCaller = 'ui') { const parsed = this.parse(UpdateRequirementSchema, input); return this.writeOperational(caller, undefined, 'update_requirement', { id, parsed }, () => this.operations().updateRequirement(id, parsed)) }
+  linkRequirementWork(projectId: string, requirementId: string, workItemId: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'link_requirement_work', { projectId, requirementId, workItemId }, () => this.operations().linkRequirementWork(projectId, requirementId, workItemId)) }
+  unlinkRequirementWork(requirementId: string, workItemId: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'unlink_requirement_work', { requirementId, workItemId }, () => this.operations().unlinkRequirementWork(requirementId, workItemId)) }
   getRequirementRollup(projectId: string) { return this.operations().getRequirementRollup(projectId) }
   listWorkQueues(projectId: string) { return this.operations().listWorkQueues(projectId) }
-  createWorkQueue(projectId: string, input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateWorkQueueSchema, input); const operation = () => this.operations().createWorkQueue(projectId, parsed); return this.writeOperational(clientName, idempotencyKey, 'create_work_queue', { projectId, parsed }, operation) }
+  createWorkQueue(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkQueueSchema, input); const operation = () => this.operations().createWorkQueue(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_work_queue', { projectId, parsed }, operation) }
   listOperationalWorkItems(projectId: string, queueId?: string) { return this.operations().listWorkItems(projectId, queueId) }
   listOperationalWorkItemsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listWorkItemsPage(projectId, parsed.limit, parsed.cursor, (input as { queueId?: string })?.queueId) }
-  linkWorkItems(projectId: string, input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateWorkRelationSchema, input); const operation = () => this.operations().linkWorkItems(projectId, parsed); return this.writeOperational(clientName, idempotencyKey, 'link_work_items', { projectId, parsed }, operation) }
-  unlinkWorkItems(id: string) { return this.write(() => this.operations().unlinkWorkItems(id)) }
+  linkWorkItems(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkRelationSchema, input); const operation = () => this.operations().linkWorkItems(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'link_work_items', { projectId, parsed }, operation) }
+  unlinkWorkItems(id: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'unlink_work_items', { id }, () => this.operations().unlinkWorkItems(id)) }
   listWorkRelations(projectId: string) { return this.operations().listWorkRelations(projectId) }
-  createExternalBlocker(projectId: string, input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateExternalBlockerSchema, input); const operation = () => this.operations().createExternalBlocker(projectId, parsed); return this.writeOperational(clientName, idempotencyKey, 'create_external_blocker', { projectId, parsed }, operation) }
+  createExternalBlocker(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateExternalBlockerSchema, input); const operation = () => this.operations().createExternalBlocker(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_external_blocker', { projectId, parsed }, operation) }
   listExternalBlockers(projectId: string, includeResolved = false) { return this.operations().listExternalBlockers(projectId, includeResolved) }
-  resolveExternalBlocker(id: string) { return this.write(() => this.operations().resolveExternalBlocker(id)) }
-  createWorkspace(input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateWorkspaceSchema, input); const operation = () => this.operations().createWorkspace(parsed); return this.writeOperational(clientName, idempotencyKey, 'create_workspace', parsed, operation) }
-  linkProjectWorkspace(projectId: string, workspaceId: string, idempotencyKey?: string, clientName = 'ui') { const operation = () => this.operations().linkProjectWorkspace(projectId, workspaceId); return this.writeOperational(clientName, idempotencyKey, 'link_project_workspace', { projectId, workspaceId }, operation) }
-  createWorkspaceRevision(input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateWorkspaceRevisionSchema, input); const operation = () => this.operations().createWorkspaceRevision(parsed); return this.writeOperational(clientName, idempotencyKey, 'create_workspace_revision', parsed, operation) }
+  resolveExternalBlocker(id: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'resolve_external_blocker', { id }, () => this.operations().resolveExternalBlocker(id)) }
+  createWorkspace(input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkspaceSchema, input); const operation = () => this.operations().createWorkspace(parsed); return this.writeOperational(caller, idempotencyKey, 'create_workspace', parsed, operation) }
+  linkProjectWorkspace(projectId: string, workspaceId: string, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const operation = () => this.operations().linkProjectWorkspace(projectId, workspaceId); return this.writeOperational(caller, idempotencyKey, 'link_project_workspace', { projectId, workspaceId }, operation) }
+  createWorkspaceRevision(input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkspaceRevisionSchema, input); const operation = () => this.operations().createWorkspaceRevision(parsed); return this.writeOperational(caller, idempotencyKey, 'create_workspace_revision', parsed, operation) }
   resolveProject(workspacePath: string) { return this.operations().resolveProject(workspacePath) }
-  createRun(projectId: string, input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateRunSchema, input); const operation = () => this.operations().createRun(projectId, parsed); return this.writeOperational(clientName, idempotencyKey, 'create_run', { projectId, parsed }, operation) }
+  createRun(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateRunSchema, input); const operation = () => this.operations().createRun(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_run', { projectId, parsed }, operation) }
   listRuns(projectId: string) { return this.operations().listRuns(projectId) }
   listRunsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listRunsPage(projectId, parsed.limit, parsed.cursor) }
-  createEvidence(projectId: string, input: unknown, idempotencyKey?: string, clientName = 'ui') { const parsed = this.parse(CreateEvidenceSchema, input); const operation = () => this.operations().createEvidence(projectId, parsed); return this.writeOperational(clientName, idempotencyKey, 'create_evidence', { projectId, parsed }, operation) }
+  createEvidence(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateEvidenceSchema, input); const operation = () => this.operations().createEvidence(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_evidence', { projectId, parsed }, operation) }
   listEvidence(projectId: string, includeStale = false) { return this.operations().listEvidence(projectId, includeStale) }
   listEvidencePage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listEvidencePage(projectId, parsed.limit, parsed.cursor, queryBoolean((input as { includeStale?: unknown })?.includeStale)) }
-  captureCheckpointSnapshot(projectId: string, checkpointId: string, idempotencyKey?: string, clientName = 'ui') { const operation = () => this.operations().captureCheckpointSnapshot(projectId, checkpointId); return this.writeOperational(clientName, idempotencyKey, 'capture_checkpoint_snapshot', { projectId, checkpointId }, operation) }
+  backfillLegacyCheckpointSnapshot(projectId: string, checkpointId: string, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const operation = () => this.operations().captureCheckpointSnapshot(projectId, checkpointId); return this.writeOperational(caller, idempotencyKey, 'legacy_backfill_checkpoint_snapshot', { projectId, checkpointId }, operation) }
   getCheckpointSnapshot(checkpointId: string) { return this.operations().getCheckpointSnapshot(checkpointId) }
   compareCheckpointSnapshots(leftCheckpointId: string, rightCheckpointId: string) { return this.operations().compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) }
   reconstructCheckpointState(checkpointId: string) { return this.operations().reconstructCheckpointState(checkpointId) }

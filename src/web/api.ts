@@ -2,6 +2,7 @@ import type {
   ActivityEvent,
   BackupStatus,
   CheckpointInput,
+  CheckpointSaveResult,
   CreateLabelInput,
   CreatePhaseInput,
   CreateProjectInput,
@@ -91,7 +92,7 @@ export const api = {
       body: JSON.stringify({ expectedVersion: project.version, archived }),
     }),
   createCheckpoint: (project: Project, payload: Omit<CheckpointInput, "expectedVersion">) =>
-    request<ProjectUpdate>(`/projects/${project.id}/checkpoints`, {
+    request<CheckpointSaveResult>(`/projects/${project.id}/checkpoints`, {
       method: "POST",
       body: JSON.stringify({ ...payload, expectedVersion: project.version }),
     }),
@@ -141,7 +142,7 @@ export const api = {
   listRunsPage: (projectId: string, limit = 50, cursor?: string) => request<Page<Run>>(`/projects/${projectId}/runs/page${queryString({ limit: String(limit), cursor })}`),
   listEvidence: (projectId: string) => request<Evidence[]>(`/projects/${projectId}/evidence?includeStale=true`),
   listEvidencePage: (projectId: string, limit = 50, cursor?: string, includeStale = true) => request<Page<Evidence>>(`/projects/${projectId}/evidence/page${queryString({ limit: String(limit), cursor, includeStale })}`),
-  captureCheckpointSnapshot: (projectId: string, checkpointId: string) => request<{ digest: string }>(`/projects/${projectId}/checkpoints/${checkpointId}/snapshot`, { method: "POST", body: JSON.stringify({}) }),
+  backfillLegacyCheckpointSnapshot: (projectId: string, checkpointId: string) => request<{ digest: string }>(`/projects/${projectId}/checkpoints/${checkpointId}/legacy-snapshot`, { method: "POST", body: JSON.stringify({}) }),
 
   listUpdates: (projectId: string) => request<ProjectUpdate[]>(`/projects/${projectId}/updates`),
   listUpdatesPage: (projectId: string, limit = 50, cursor?: string) => request<Page<ProjectUpdate>>(`/projects/${projectId}/updates/page${queryString({ limit: String(limit), cursor })}`),

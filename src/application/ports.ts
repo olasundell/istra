@@ -26,7 +26,7 @@ import type {
 
 export interface ExportBundle {
   format: 'istra-export'
-  formatVersion: 1 | 2
+  formatVersion: 3
   exportedAt: string
   tables: Record<string, Array<Record<string, unknown>>>
 }

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { validateRunInvariants } from './run-invariants.js'
 
 export const projectStates = ['active', 'paused', 'dormant', 'completed'] as const
 export const phaseStates = ['planned', 'active', 'completed', 'abandoned'] as const
@@ -11,6 +12,8 @@ export const requirementStateSemantics = ['open', 'partial', 'proven', 'defect']
 export const relationKinds = ['depends_on', 'blocks', 'relates_to'] as const
 export const runOutcomes = ['recorded', 'verified', 'failed', 'interrupted'] as const
 export const evidenceResults = ['recorded', 'verified', 'failed', 'interrupted'] as const
+export const proofStatuses = ['open', 'partial', 'proven', 'defect'] as const
+export const validationStatuses = ['validated', 'legacy_unvalidated', 'overridden'] as const
 
 export const ProjectStateSchema = z.enum(projectStates)
 export const PhaseStateSchema = z.enum(phaseStates)
@@ -23,6 +26,8 @@ export const RequirementStateSemanticSchema = z.enum(requirementStateSemantics)
 export const RelationKindSchema = z.enum(relationKinds)
 export const RunOutcomeSchema = z.enum(runOutcomes)
 export const EvidenceResultSchema = z.enum(evidenceResults)
+export const ProofStatusSchema = z.enum(proofStatuses)
+export const ValidationStatusSchema = z.enum(validationStatuses)
 
 export type ProjectState = z.infer<typeof ProjectStateSchema>
 export type PhaseState = z.infer<typeof PhaseStateSchema>
@@ -35,7 +40,10 @@ export type RequirementStateSemantic = z.infer<typeof RequirementStateSemanticSc
 export type RelationKind = z.infer<typeof RelationKindSchema>
 export type RunOutcome = z.infer<typeof RunOutcomeSchema>
 export type EvidenceResult = z.infer<typeof EvidenceResultSchema>
-export type Provenance = { source: 'ui' | 'mcp' | 'import' | 'system'; client?: string }
+export type ProofStatus = z.infer<typeof ProofStatusSchema>
+export type ValidationStatus = z.infer<typeof ValidationStatusSchema>
+export type Provenance = { source: 'ui' | 'mcp' | 'import' | 'system'; client?: string; actor?: string; idempotencyKey?: string | null; occurredAt?: string }
+export type MutationContext = Provenance & { actor: string; idempotencyKey: string | null; occurredAt: string }
 
 export interface Project {
   id: string
@@ -134,17 +142,20 @@ export interface ProjectUpdate {
 
 export interface ActivityEvent {
   id: string
-  projectId: string
+  projectId: string | null
   entityType: string
   entityId: string
   eventType: string
   payload: Record<string, unknown>
   source: string
   client: string | null
+  actor: string
+  idempotencyKey: string | null
   createdAt: string
 }
 
 export interface DashboardActivityEvent extends ActivityEvent {
+  projectId: string
   projectTitle: string
 }
 
@@ -206,6 +217,11 @@ export interface AcceptanceCriterion {
   description: string | null
   position: number
   required: boolean
+  version: number
+  archivedAt: string | null
+  proofStatus: ProofStatus
+  proofEvidenceId: string | null
+  proofReason: string
   createdAt: string
   updatedAt: string
 }
@@ -228,11 +244,24 @@ export interface Requirement {
   linkedWorkItemIds: string[]
   linkedEvidenceIds: string[]
   gate: 'satisfied' | 'unsatisfied' | 'not_configured'
+  proofStatus: ProofStatus
+  proofExplanation: RequirementProofExplanation
+}
+
+export interface RequirementProofExplanation {
+  status: ProofStatus
+  requiredCriteria: number
+  provenCriteria: number
+  defectiveCriteria: number
+  partialCriteria: number
+  openCriteria: number
+  criteria: Array<Pick<AcceptanceCriterion, 'id' | 'title' | 'required' | 'archivedAt' | 'proofStatus' | 'proofEvidenceId' | 'proofReason'>>
 }
 
 export interface RequirementRollup {
   total: number
   bySemantic: Record<RequirementStateSemantic, number>
+  byProofStatus: Record<ProofStatus, number>
   gateFailures: number
   defects: number
   byCapability: RequirementRollupBucket[]
@@ -314,6 +343,8 @@ export interface Run {
   stdoutTruncated: boolean
   stderrTruncated: boolean
   artifacts: ArtifactReference[]
+  validationStatus: ValidationStatus
+  redaction: RedactionMetadata
   createdAt: string
 }
 
@@ -338,8 +369,28 @@ export interface ArtifactReference {
   createdAt: string
 }
 
+export interface RedactionMetadata {
+  count: number
+  fields: string[]
+}
+
+export interface EvidenceCriterionLink {
+  criterionId: string
+  criterionVersion: number
+  stale: boolean
+}
+
+export interface EvidenceOverride {
+  reason: string
+  actor: string
+  source: Provenance['source']
+  client: string | null
+  createdAt: string
+}
+
 export interface Evidence {
   id: string
+  ordinal: number
   projectId: string
   runId: string | null
   result: EvidenceResult
@@ -354,15 +405,24 @@ export interface Evidence {
   updateIds: string[]
   checkpointIds: string[]
   artifacts: ArtifactReference[]
+  criterionLinks: EvidenceCriterionLink[]
+  validationStatus: ValidationStatus
+  redaction: RedactionMetadata
+  override: EvidenceOverride | null
 }
 
 export interface CheckpointSnapshot {
   id: string
   checkpointId: string
-  schemaVersion: 2
+  schemaVersion: 3
   capturedAt: string
   document: Record<string, unknown>
   digest: string
+}
+
+export interface CheckpointSaveResult {
+  checkpoint: ProjectUpdate
+  snapshot: Pick<CheckpointSnapshot, 'id' | 'digest' | 'schemaVersion' | 'capturedAt'>
 }
 
 export interface CheckpointComparison {
@@ -372,6 +432,8 @@ export interface CheckpointComparison {
   changedSections: string[]
   leftDigest: string
   rightDigest: string
+  leftLegacy: boolean
+  rightLegacy: boolean
 }
 
 export interface Page<T> {
@@ -486,6 +548,16 @@ export const CreateRequirementStateSchema = z.object({
   position: z.number().int().nonnegative().optional(),
   colour: z.string().regex(/^#[0-9a-fA-F]{6}$/).nullable().optional(),
 })
+export const AcceptanceCriterionInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  expectedVersion: z.number().int().positive().optional(),
+  title: z.string().trim().min(1).max(500),
+  description: nullableText,
+  required: z.boolean().default(true),
+}).superRefine((criterion, context) => {
+  if (criterion.id && criterion.expectedVersion === undefined) context.addIssue({ code: z.ZodIssueCode.custom, path: ['expectedVersion'], message: 'expectedVersion is required when updating an existing criterion' })
+  if (!criterion.id && criterion.expectedVersion !== undefined) context.addIssue({ code: z.ZodIssueCode.custom, path: ['expectedVersion'], message: 'expectedVersion requires an existing criterion id' })
+})
 export const CreateRequirementSchema = z.object({
   stableKey: z.string().trim().min(1).max(80).regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
   kind: RequirementKindSchema,
@@ -495,11 +567,7 @@ export const CreateRequirementSchema = z.object({
   stateId: z.string().uuid().optional(),
   responsiblePhaseId: z.string().uuid().nullable().optional(),
   relatedPhaseIds: z.array(z.string().uuid()).max(100).optional(),
-  criteria: z.array(z.object({
-    title: z.string().trim().min(1).max(500),
-    description: nullableText,
-    required: z.boolean().default(true),
-  })).max(100).optional(),
+  criteria: z.array(AcceptanceCriterionInputSchema).max(100).optional(),
 })
 export const UpdateRequirementSchema = CreateRequirementSchema.partial().extend({ expectedVersion: z.number().int().positive() })
 export const CreateRequirementLinkSchema = z.object({
@@ -538,7 +606,7 @@ export const CreateArtifactSchema = z.object({
   byteCount: z.number().int().nonnegative().nullable().optional(),
   digest: z.string().trim().max(200).nullable().optional(),
 })
-export const CreateRunSchema = z.object({
+export const CreateRunObjectSchema = z.object({
   workspaceRevisionId: z.string().uuid().nullable().optional(),
   command: z.string().trim().min(1).max(4_000),
   workingDirectory: z.string().trim().max(4_000).nullable().optional(),
@@ -560,16 +628,29 @@ export const CreateRunSchema = z.object({
     targetCount: z.number().int().nonnegative(),
   }).optional(),
 })
+export const CreateRunSchema = CreateRunObjectSchema.superRefine((run, context) => {
+  const startedAt = run.startedAt ?? new Date().toISOString()
+  const endedAt = run.endedAt ?? null
+  for (const violation of validateRunInvariants({ ...run, startedAt, endedAt })) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: violation.path.split('.'),
+      message: violation.message,
+    })
+  }
+})
 export const CreateEvidenceSchema = z.object({
   runId: z.string().uuid().nullable().optional(),
   result: EvidenceResultSchema,
   summary: z.string().trim().min(1).max(4_000),
   targetVersion: z.number().int().positive().nullable().optional(),
   requirementIds: z.array(z.string().uuid()).max(100).optional(),
+  criterionIds: z.array(z.string().uuid()).max(100).optional(),
   workItemIds: z.array(z.string().uuid()).max(100).optional(),
   updateIds: z.array(z.string().uuid()).max(100).optional(),
   checkpointIds: z.array(z.string().uuid()).max(100).optional(),
   artifacts: z.array(CreateArtifactSchema).max(100).optional(),
+  override: z.object({ reason: z.string().trim().min(20).max(2_000) }).optional(),
 })
 export const PageRequestSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),

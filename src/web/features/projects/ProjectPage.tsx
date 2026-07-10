@@ -203,12 +203,12 @@ function OperationalMemoryPanel({ pulse, requirements, loading, requirementsLoad
       {error ? <ErrorNotice error={error} onRetry={onRetry} /> : pulse ? (
         <>
           <div className="operational-memory-grid">
-            <div className="operational-memory-card"><span>Requirements</span><strong>{pulse.requirementRollup.total}</strong><small>{pulse.requirementRollup.bySemantic.proven} proven · {pulse.requirementRollup.gateFailures} gate failures · {pulse.requirementRollup.defects} defects</small></div>
+            <div className="operational-memory-card"><span>Requirements</span><strong>{pulse.requirementRollup.total}</strong><small>{pulse.requirementRollup.byProofStatus.proven} proven · {pulse.requirementRollup.gateFailures} gate failures · {pulse.requirementRollup.defects} defects</small></div>
             <div className="operational-memory-card"><span>Queue head</span><strong>{pulse.queueHead.length}</strong><small>{blocked} effectively blocked</small></div>
             <div className="operational-memory-card"><span>External blockers</span><strong>{pulse.blockers.length}</strong><small>Unresolved operational blockers</small></div>
             <div className="operational-memory-card"><span>Stale evidence</span><strong>{pulse.staleEvidenceCount}</strong><small>{pulse.failedEvidenceCount} failed verification</small></div>
           </div>
-          {requirementsLoading ? <p className="operational-memory__empty">Loading requirement ledger…</p> : requirements.length ? <div className="operational-memory__requirements"><h3>Requirement ledger</h3><ul>{requirements.map((requirement) => <li key={requirement.id}><strong>{requirement.stableKey}</strong><span>{requirement.title}</span><em className={`requirement-gate requirement-gate--${requirement.gate}`}>{humanise(requirement.gate)}</em></li>)}</ul></div> : <p className="operational-memory__empty">No requirements recorded yet. Add goals or acceptance criteria when this project needs traceability.</p>}
+          {requirementsLoading ? <p className="operational-memory__empty">Loading requirement ledger…</p> : requirements.length ? <div className="operational-memory__requirements"><h3>Requirement ledger</h3><ul>{requirements.map((requirement) => <li key={requirement.id}><strong>{requirement.stableKey}</strong><span>{requirement.title}</span><em className={`requirement-gate requirement-gate--${requirement.proofStatus}`}>{humanise(requirement.proofStatus)}</em></li>)}</ul></div> : <p className="operational-memory__empty">No requirements recorded yet. Add goals or acceptance criteria when this project needs traceability.</p>}
         </>
       ) : <p className="operational-memory__empty">Loading operational memory…</p>}
     </section>
