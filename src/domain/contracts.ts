@@ -6,6 +6,11 @@ export const workItemKinds = ['issue', 'task', 'idea', 'question', 'risk'] as co
 export const workItemStatuses = ['open', 'in_progress', 'blocked', 'resolved', 'dropped'] as const
 export const updateKinds = ['note', 'progress', 'decision', 'discovery', 'checkpoint'] as const
 export const priorities = ['low', 'medium', 'high', 'critical'] as const
+export const requirementKinds = ['goal', 'capability', 'requirement'] as const
+export const requirementStateSemantics = ['open', 'partial', 'proven', 'defect'] as const
+export const relationKinds = ['depends_on', 'blocks', 'relates_to'] as const
+export const runOutcomes = ['recorded', 'verified', 'failed', 'interrupted'] as const
+export const evidenceResults = ['recorded', 'verified', 'failed', 'interrupted'] as const
 
 export const ProjectStateSchema = z.enum(projectStates)
 export const PhaseStateSchema = z.enum(phaseStates)
@@ -13,6 +18,11 @@ export const WorkItemKindSchema = z.enum(workItemKinds)
 export const WorkItemStatusSchema = z.enum(workItemStatuses)
 export const UpdateKindSchema = z.enum(updateKinds)
 export const PrioritySchema = z.enum(priorities)
+export const RequirementKindSchema = z.enum(requirementKinds)
+export const RequirementStateSemanticSchema = z.enum(requirementStateSemantics)
+export const RelationKindSchema = z.enum(relationKinds)
+export const RunOutcomeSchema = z.enum(runOutcomes)
+export const EvidenceResultSchema = z.enum(evidenceResults)
 
 export type ProjectState = z.infer<typeof ProjectStateSchema>
 export type PhaseState = z.infer<typeof PhaseStateSchema>
@@ -20,6 +30,11 @@ export type WorkItemKind = z.infer<typeof WorkItemKindSchema>
 export type WorkItemStatus = z.infer<typeof WorkItemStatusSchema>
 export type UpdateKind = z.infer<typeof UpdateKindSchema>
 export type Priority = z.infer<typeof PrioritySchema>
+export type RequirementKind = z.infer<typeof RequirementKindSchema>
+export type RequirementStateSemantic = z.infer<typeof RequirementStateSemanticSchema>
+export type RelationKind = z.infer<typeof RelationKindSchema>
+export type RunOutcome = z.infer<typeof RunOutcomeSchema>
+export type EvidenceResult = z.infer<typeof EvidenceResultSchema>
 export type Provenance = { source: 'ui' | 'mcp' | 'import' | 'system'; client?: string }
 
 export interface Project {
@@ -67,6 +82,12 @@ export interface WorkItem {
   version: number
   createdAt: string
   updatedAt: string
+  stableKey?: string | null
+  parentId?: string | null
+  queueId?: string | null
+  rank?: string | null
+  effectiveBlocked?: boolean
+  blockerReasons?: string[]
 }
 
 export interface Label {
@@ -148,12 +169,226 @@ export interface ProjectDetail {
 }
 
 export interface SearchResult {
-  type: 'project' | 'phase' | 'work_item' | 'update'
+  type: 'project' | 'phase' | 'work_item' | 'update' | 'requirement' | 'run' | 'evidence'
   id: string
   projectId: string
   title: string
   excerpt: string
   score: number
+}
+
+export interface SearchFilters {
+  projectId?: string
+  entityTypes?: SearchResult['type'][]
+  state?: string
+  phaseId?: string
+  requirementId?: string
+  evidenceResult?: EvidenceResult
+  from?: string
+  to?: string
+}
+
+export interface RequirementStateDefinition {
+  id: string
+  projectId: string
+  name: string
+  semantic: RequirementStateSemantic
+  position: number
+  colour: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AcceptanceCriterion {
+  id: string
+  requirementId: string
+  title: string
+  description: string | null
+  position: number
+  required: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface Requirement {
+  id: string
+  projectId: string
+  stableKey: string
+  kind: RequirementKind
+  parentId: string | null
+  title: string
+  description: string | null
+  stateId: string
+  responsiblePhaseId: string | null
+  version: number
+  createdAt: string
+  updatedAt: string
+  criteria: AcceptanceCriterion[]
+  relatedPhaseIds: string[]
+  linkedWorkItemIds: string[]
+  linkedEvidenceIds: string[]
+  gate: 'satisfied' | 'unsatisfied' | 'not_configured'
+}
+
+export interface RequirementRollup {
+  total: number
+  bySemantic: Record<RequirementStateSemantic, number>
+  gateFailures: number
+  defects: number
+  byCapability: RequirementRollupBucket[]
+  byMilestone: RequirementRollupBucket[]
+  byGoal: RequirementRollupBucket[]
+}
+
+export interface RequirementRollupBucket {
+  id: string
+  stableKey?: string
+  name: string
+  counts: Record<RequirementStateSemantic, number>
+  total: number
+}
+
+export interface WorkQueue {
+  id: string
+  projectId: string
+  name: string
+  description: string | null
+  version: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WorkRelation {
+  id: string
+  projectId: string
+  fromWorkItemId: string
+  toWorkItemId: string
+  kind: RelationKind
+  createdAt: string
+}
+
+export interface ExternalBlocker {
+  id: string
+  projectId: string
+  workItemId: string | null
+  content: string
+  resolvedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface Workspace {
+  id: string
+  name: string
+  canonicalRoot: string
+  aliases: string[]
+  remote: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WorkspaceRevision {
+  id: string
+  workspaceId: string
+  branch: string | null
+  commit: string | null
+  dirty: boolean
+  diffHash: string | null
+  capturedAt: string
+}
+
+export interface Run {
+  id: string
+  projectId: string
+  workspaceRevisionId: string | null
+  command: string
+  workingDirectory: string | null
+  startedAt: string
+  endedAt: string | null
+  durationMs: number | null
+  outcome: RunOutcome
+  exitCode: number | null
+  toolchain: Record<string, string>
+  stdoutExcerpt: string | null
+  stderrExcerpt: string | null
+  stdoutTruncated: boolean
+  stderrTruncated: boolean
+  artifacts: ArtifactReference[]
+  createdAt: string
+}
+
+export interface TestSummary {
+  id: string
+  runId: string
+  scope: string
+  passed: number
+  failed: number
+  skipped: number
+  targetCount: number
+  createdAt: string
+}
+
+export interface ArtifactReference {
+  id: string
+  runId: string | null
+  uri: string
+  mediaType: string | null
+  byteCount: number | null
+  digest: string | null
+  createdAt: string
+}
+
+export interface Evidence {
+  id: string
+  projectId: string
+  runId: string | null
+  result: EvidenceResult
+  summary: string
+  targetVersion: number | null
+  stale: boolean
+  staleReason: string | null
+  createdAt: string
+  updatedAt: string
+  requirementIds: string[]
+  workItemIds: string[]
+  updateIds: string[]
+  checkpointIds: string[]
+  artifacts: ArtifactReference[]
+}
+
+export interface CheckpointSnapshot {
+  id: string
+  checkpointId: string
+  schemaVersion: 2
+  capturedAt: string
+  document: Record<string, unknown>
+  digest: string
+}
+
+export interface CheckpointComparison {
+  leftCheckpointId: string
+  rightCheckpointId: string
+  same: boolean
+  changedSections: string[]
+  leftDigest: string
+  rightDigest: string
+}
+
+export interface Page<T> {
+  items: T[]
+  nextCursor: string | null
+  hasMore: boolean
+}
+
+export interface ProjectPulseSummary {
+  project: Project
+  currentCheckpoint: { id: string; content: string; createdAt: string } | null
+  activePhases: Array<Pick<Phase, 'id' | 'name' | 'status'>>
+  requirementRollup: RequirementRollup
+  queueHead: WorkItem[]
+  blockers: ExternalBlocker[]
+  staleEvidenceCount: number
+  failedEvidenceCount: number
 }
 
 const nullableText = z.string().trim().max(20_000).nullable().optional()
@@ -197,13 +432,19 @@ export const UpdatePhaseSchema = CreatePhaseSchema.partial().extend({
 })
 
 export const CreateWorkItemSchema = z.object({
+  stableKey: z.string().trim().min(1).max(80).regex(/^[A-Za-z][A-Za-z0-9_-]*$/).nullable().optional(),
   phaseId: z.string().uuid().nullable().optional(),
+  parentId: z.string().uuid().nullable().optional(),
+  queueId: z.string().uuid().nullable().optional(),
+  rank: z.string().trim().min(1).max(200).nullable().optional(),
   kind: WorkItemKindSchema,
   title: z.string().trim().min(1).max(500),
   description: nullableText,
   status: WorkItemStatusSchema.default('open'),
   priority: PrioritySchema.nullable().optional(),
   labelIds: z.array(z.string().uuid()).max(50).optional(),
+  requirementIds: z.array(z.string().uuid()).max(100).optional(),
+  relatedPhaseIds: z.array(z.string().uuid()).max(100).optional(),
 })
 export const UpdateWorkItemSchema = CreateWorkItemSchema.partial().extend({ expectedVersion: z.number().int().positive() })
 
@@ -232,9 +473,116 @@ export type CreateProjectInput = z.infer<typeof CreateProjectSchema>
 export type UpdateProjectInput = z.infer<typeof UpdateProjectSchema>
 export type CreatePhaseInput = z.infer<typeof CreatePhaseSchema>
 export type UpdatePhaseInput = z.infer<typeof UpdatePhaseSchema>
-export type CreateWorkItemInput = z.infer<typeof CreateWorkItemSchema>
+export type CreateWorkItemInput = z.input<typeof CreateWorkItemSchema>
 export type UpdateWorkItemInput = z.infer<typeof UpdateWorkItemSchema>
 export type CreateUpdateInput = z.infer<typeof CreateUpdateSchema>
 export type ReviseUpdateInput = z.infer<typeof ReviseUpdateSchema>
 export type CheckpointInput = z.infer<typeof CheckpointSchema>
 export type CreateLabelInput = z.infer<typeof CreateLabelSchema>
+
+export const CreateRequirementStateSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  semantic: RequirementStateSemanticSchema,
+  position: z.number().int().nonnegative().optional(),
+  colour: z.string().regex(/^#[0-9a-fA-F]{6}$/).nullable().optional(),
+})
+export const CreateRequirementSchema = z.object({
+  stableKey: z.string().trim().min(1).max(80).regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
+  kind: RequirementKindSchema,
+  parentId: z.string().uuid().nullable().optional(),
+  title: z.string().trim().min(1).max(500),
+  description: nullableText,
+  stateId: z.string().uuid().optional(),
+  responsiblePhaseId: z.string().uuid().nullable().optional(),
+  relatedPhaseIds: z.array(z.string().uuid()).max(100).optional(),
+  criteria: z.array(z.object({
+    title: z.string().trim().min(1).max(500),
+    description: nullableText,
+    required: z.boolean().default(true),
+  })).max(100).optional(),
+})
+export const UpdateRequirementSchema = CreateRequirementSchema.partial().extend({ expectedVersion: z.number().int().positive() })
+export const CreateRequirementLinkSchema = z.object({
+  requirementId: z.string().uuid(),
+  workItemId: z.string().uuid(),
+})
+export const CreateWorkQueueSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  description: nullableText,
+})
+export const CreateWorkRelationSchema = z.object({
+  fromWorkItemId: z.string().uuid(),
+  toWorkItemId: z.string().uuid(),
+  kind: RelationKindSchema,
+})
+export const CreateExternalBlockerSchema = z.object({
+  workItemId: z.string().uuid().nullable().optional(),
+  content: z.string().trim().min(1).max(2_000),
+})
+export const CreateWorkspaceSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  canonicalRoot: z.string().trim().min(1).max(4_000),
+  aliases: z.array(z.string().trim().min(1).max(4_000)).max(20).optional(),
+  remote: z.string().trim().max(2_000).nullable().optional(),
+})
+export const CreateWorkspaceRevisionSchema = z.object({
+  workspaceId: z.string().uuid(),
+  branch: z.string().trim().max(500).nullable().optional(),
+  commit: z.string().trim().max(200).nullable().optional(),
+  dirty: z.boolean().default(false),
+  diffHash: z.string().trim().max(200).nullable().optional(),
+})
+export const CreateArtifactSchema = z.object({
+  uri: z.string().trim().min(1).max(4_000),
+  mediaType: z.string().trim().max(200).nullable().optional(),
+  byteCount: z.number().int().nonnegative().nullable().optional(),
+  digest: z.string().trim().max(200).nullable().optional(),
+})
+export const CreateRunSchema = z.object({
+  workspaceRevisionId: z.string().uuid().nullable().optional(),
+  command: z.string().trim().min(1).max(4_000),
+  workingDirectory: z.string().trim().max(4_000).nullable().optional(),
+  startedAt: z.string().datetime({ offset: true }).optional(),
+  endedAt: z.string().datetime({ offset: true }).nullable().optional(),
+  outcome: RunOutcomeSchema.default('recorded'),
+  exitCode: z.number().int().nullable().optional(),
+  toolchain: z.record(z.string().max(200)).optional(),
+  stdoutExcerpt: z.string().max(32_768).nullable().optional(),
+  stderrExcerpt: z.string().max(32_768).nullable().optional(),
+  stdoutTruncated: z.boolean().default(false),
+  stderrTruncated: z.boolean().default(false),
+  artifacts: z.array(CreateArtifactSchema).max(100).optional(),
+  testSummary: z.object({
+    scope: z.string().trim().min(1).max(500),
+    passed: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+    targetCount: z.number().int().nonnegative(),
+  }).optional(),
+})
+export const CreateEvidenceSchema = z.object({
+  runId: z.string().uuid().nullable().optional(),
+  result: EvidenceResultSchema,
+  summary: z.string().trim().min(1).max(4_000),
+  targetVersion: z.number().int().positive().nullable().optional(),
+  requirementIds: z.array(z.string().uuid()).max(100).optional(),
+  workItemIds: z.array(z.string().uuid()).max(100).optional(),
+  updateIds: z.array(z.string().uuid()).max(100).optional(),
+  checkpointIds: z.array(z.string().uuid()).max(100).optional(),
+  artifacts: z.array(CreateArtifactSchema).max(100).optional(),
+})
+export const PageRequestSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  cursor: z.string().trim().max(500).nullable().optional(),
+})
+
+export type CreateRequirementStateInput = z.infer<typeof CreateRequirementStateSchema>
+export type CreateRequirementInput = z.infer<typeof CreateRequirementSchema>
+export type UpdateRequirementInput = z.infer<typeof UpdateRequirementSchema>
+export type CreateWorkQueueInput = z.infer<typeof CreateWorkQueueSchema>
+export type CreateWorkRelationInput = z.infer<typeof CreateWorkRelationSchema>
+export type CreateExternalBlockerInput = z.infer<typeof CreateExternalBlockerSchema>
+export type CreateWorkspaceInput = z.infer<typeof CreateWorkspaceSchema>
+export type CreateWorkspaceRevisionInput = z.infer<typeof CreateWorkspaceRevisionSchema>
+export type CreateRunInput = z.infer<typeof CreateRunSchema>
+export type CreateEvidenceInput = z.infer<typeof CreateEvidenceSchema>

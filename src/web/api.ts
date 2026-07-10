@@ -8,14 +8,24 @@ import type {
   CreateUpdateInput,
   CreateWorkItemInput,
   DashboardActivityEvent,
+  Evidence,
+  ExternalBlocker,
   Label,
   Phase,
   Project,
   ProjectDetail,
+  ProjectPulseSummary,
   ProjectUpdate,
+  Requirement,
+  RequirementRollup,
+  RequirementStateDefinition,
+  Run,
   SearchResult,
   UpdateRevision,
   WorkItem,
+  WorkQueue,
+  WorkRelation,
+  Page,
 } from "./types";
 
 const API_ROOT = "/api/v1";
@@ -70,6 +80,7 @@ export const api = {
   listProjects: (options: { state?: string; includeArchived?: boolean; q?: string } = {}) =>
     request<Project[]>(`/projects${queryString(options)}`),
   getProject: (id: string) => request<ProjectDetail>(`/projects/${id}`),
+  getPulseSummary: (id: string) => request<ProjectPulseSummary>(`/projects/${id}/pulse`),
   createProject: (payload: CreateProjectInput) =>
     request<Project>("/projects", { method: "POST", body: JSON.stringify(payload) }),
   updateProject: (project: Project, payload: Partial<Project> & { expectedVersion: number }) =>
@@ -117,7 +128,23 @@ export const api = {
       body: JSON.stringify({ ...payload, expectedVersion: item.version }),
     }),
 
+  listRequirementStates: (projectId: string) => request<RequirementStateDefinition[]>(`/projects/${projectId}/requirements/states`),
+  listRequirements: (projectId: string) => request<Requirement[]>(`/projects/${projectId}/requirements`),
+  listRequirementsPage: (projectId: string, limit = 50, cursor?: string) => request<Page<Requirement>>(`/projects/${projectId}/requirements/page${queryString({ limit: String(limit), cursor })}`),
+  getRequirementRollup: (projectId: string) => request<RequirementRollup>(`/projects/${projectId}/requirements/rollup`),
+  listWorkQueues: (projectId: string) => request<WorkQueue[]>(`/projects/${projectId}/work-queues`),
+  listOperationalWorkItems: (projectId: string, queueId?: string) => request<WorkItem[]>(`/projects/${projectId}/operational-work-items${queryString({ queueId })}`),
+  listOperationalWorkItemsPage: (projectId: string, limit = 50, cursor?: string, queueId?: string) => request<Page<WorkItem>>(`/projects/${projectId}/operational-work-items/page${queryString({ limit: String(limit), cursor, queueId })}`),
+  listWorkRelations: (projectId: string) => request<WorkRelation[]>(`/projects/${projectId}/work-relations`),
+  listExternalBlockers: (projectId: string) => request<ExternalBlocker[]>(`/projects/${projectId}/external-blockers`),
+  listRuns: (projectId: string) => request<Run[]>(`/projects/${projectId}/runs`),
+  listRunsPage: (projectId: string, limit = 50, cursor?: string) => request<Page<Run>>(`/projects/${projectId}/runs/page${queryString({ limit: String(limit), cursor })}`),
+  listEvidence: (projectId: string) => request<Evidence[]>(`/projects/${projectId}/evidence?includeStale=true`),
+  listEvidencePage: (projectId: string, limit = 50, cursor?: string, includeStale = true) => request<Page<Evidence>>(`/projects/${projectId}/evidence/page${queryString({ limit: String(limit), cursor, includeStale })}`),
+  captureCheckpointSnapshot: (projectId: string, checkpointId: string) => request<{ digest: string }>(`/projects/${projectId}/checkpoints/${checkpointId}/snapshot`, { method: "POST", body: JSON.stringify({}) }),
+
   listUpdates: (projectId: string) => request<ProjectUpdate[]>(`/projects/${projectId}/updates`),
+  listUpdatesPage: (projectId: string, limit = 50, cursor?: string) => request<Page<ProjectUpdate>>(`/projects/${projectId}/updates/page${queryString({ limit: String(limit), cursor })}`),
   createUpdate: (projectId: string, payload: CreateUpdateInput) =>
     request<ProjectUpdate>(`/projects/${projectId}/updates`, { method: "POST", body: JSON.stringify(payload) }),
   reviseUpdate: (update: ProjectUpdate, content: string) =>
@@ -133,6 +160,7 @@ export const api = {
     }),
 
   getActivity: (projectId: string) => request<ActivityEvent[]>(`/projects/${projectId}/activity`),
+  getActivityPage: (projectId: string, limit = 50, cursor?: string) => request<Page<ActivityEvent>>(`/projects/${projectId}/activity/page${queryString({ limit: String(limit), cursor })}`),
   listRecentActivity: (limit = 10) => request<DashboardActivityEvent[]>(`/activity${queryString({ limit: String(limit) })}`),
   search: (q: string) => request<SearchResult[]>(`/search${queryString({ q })}`),
   backupStatus: () => request<BackupStatus>("/backups"),

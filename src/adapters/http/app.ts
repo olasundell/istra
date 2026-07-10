@@ -39,6 +39,11 @@ function source(request: { headers: Record<string, unknown> }) {
   return { source: 'ui' as const, client: typeof client === 'string' ? client.slice(0, 200) : 'http' }
 }
 
+function idempotencyKey(request: { headers: Record<string, unknown> }): string | undefined {
+  const value = request.headers['idempotency-key']
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined
+}
+
 export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 20 * 1024 * 1024 })
 
@@ -73,7 +78,7 @@ export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInst
     const query = request.query as { state?: string; includeArchived?: string; q?: string }
     return { data: options.service.listProjects({ state: query.state || undefined, includeArchived: query.includeArchived === 'true', q: query.q }) }
   })
-  app.post('/api/v1/projects', async (request) => ({ data: await options.service.createProject(request.body, source(request)) }))
+  app.post('/api/v1/projects', async (request) => ({ data: await options.service.createProject(request.body, source(request), idempotencyKey(request)) }))
   app.get('/api/v1/projects/:id', async (request) => {
     const { id } = idParams(request); const detail = options.service.getProject(id)
     if (!detail) throw new NotFoundError('Project', id)
@@ -81,33 +86,92 @@ export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInst
   })
   app.patch('/api/v1/projects/:id', async (request) => ({ data: await options.service.updateProject(idParams(request).id, request.body, source(request)) }))
   app.post('/api/v1/projects/:id/archive', async (request) => ({ data: await options.service.archiveProject(idParams(request).id, request.body, source(request)) }))
-  app.post('/api/v1/projects/:id/checkpoints', async (request) => ({ data: await options.service.saveCheckpoint(idParams(request).id, request.body, source(request)) }))
+  app.post('/api/v1/projects/:id/checkpoints', async (request) => ({ data: await options.service.saveCheckpoint(idParams(request).id, request.body, source(request), idempotencyKey(request)) }))
+  app.get('/api/v1/projects/:projectId/pulse', async (request) => {
+    const pulse = options.service.getProjectPulseSummary(projectParams(request).projectId)
+    if (!pulse) throw new NotFoundError('Project', projectParams(request).projectId)
+    return { data: pulse }
+  })
+  app.get('/api/v1/projects/:projectId/requirements/states', async (request) => ({ data: options.service.listRequirementStates(projectParams(request).projectId) }))
+  app.post('/api/v1/projects/:projectId/requirements/states', async (request) => ({ data: await options.service.createRequirementState(projectParams(request).projectId, request.body, idempotencyKey(request), source(request).client) }))
+  app.get('/api/v1/projects/:projectId/requirements', async (request) => ({ data: options.service.listRequirements(projectParams(request).projectId) }))
+  app.get('/api/v1/projects/:projectId/requirements/page', async (request) => ({ data: options.service.listRequirementsPage(projectParams(request).projectId, request.query) }))
+  app.post('/api/v1/projects/:projectId/requirements', async (request) => ({ data: await options.service.createRequirement(projectParams(request).projectId, request.body, idempotencyKey(request), source(request).client) }))
+  app.get('/api/v1/requirements/:id', async (request) => {
+    const requirement = options.service.getRequirement(idParams(request).id)
+    if (!requirement) throw new NotFoundError('Requirement', idParams(request).id)
+    return { data: requirement }
+  })
+  app.patch('/api/v1/requirements/:id', async (request) => ({ data: await options.service.updateRequirement(idParams(request).id, request.body) }))
+  app.get('/api/v1/projects/:projectId/requirements/rollup', async (request) => ({ data: options.service.getRequirementRollup(projectParams(request).projectId) }))
+  app.post('/api/v1/projects/:projectId/requirements/:requirementId/work-items/:workItemId', async (request) => { const params = request.params as { projectId: string; requirementId: string; workItemId: string }; await options.service.linkRequirementWork(params.projectId, params.requirementId, params.workItemId); return { data: { linked: true } } })
+  app.delete('/api/v1/requirements/:requirementId/work-items/:workItemId', async (request) => { const params = request.params as { requirementId: string; workItemId: string }; await options.service.unlinkRequirementWork(params.requirementId, params.workItemId); return { data: { linked: false } } })
+
+  app.get('/api/v1/projects/:projectId/work-queues', async (request) => ({ data: options.service.listWorkQueues(projectParams(request).projectId) }))
+  app.post('/api/v1/projects/:projectId/work-queues', async (request) => ({ data: await options.service.createWorkQueue(projectParams(request).projectId, request.body, idempotencyKey(request), source(request).client) }))
+  app.get('/api/v1/projects/:projectId/operational-work-items', async (request) => ({ data: options.service.listOperationalWorkItems(projectParams(request).projectId, (request.query as { queueId?: string }).queueId) }))
+  app.get('/api/v1/projects/:projectId/operational-work-items/page', async (request) => ({ data: options.service.listOperationalWorkItemsPage(projectParams(request).projectId, request.query) }))
+  app.get('/api/v1/projects/:projectId/work-relations', async (request) => ({ data: options.service.listWorkRelations(projectParams(request).projectId) }))
+  app.post('/api/v1/projects/:projectId/work-relations', async (request) => ({ data: await options.service.linkWorkItems(projectParams(request).projectId, request.body, idempotencyKey(request), source(request).client) }))
+  app.delete('/api/v1/work-relations/:id', async (request) => { await options.service.unlinkWorkItems(idParams(request).id); return { data: { linked: false } } })
+  app.get('/api/v1/projects/:projectId/external-blockers', async (request) => ({ data: options.service.listExternalBlockers(projectParams(request).projectId, (request.query as { includeResolved?: string }).includeResolved === 'true') }))
+  app.post('/api/v1/projects/:projectId/external-blockers', async (request) => ({ data: await options.service.createExternalBlocker(projectParams(request).projectId, request.body, idempotencyKey(request), source(request).client) }))
+  app.post('/api/v1/external-blockers/:id/resolve', async (request) => ({ data: await options.service.resolveExternalBlocker(idParams(request).id) }))
+
+  app.post('/api/v1/workspaces', async (request) => ({ data: await options.service.createWorkspace(request.body, idempotencyKey(request), source(request).client) }))
+  app.post('/api/v1/projects/:projectId/workspaces/:workspaceId', async (request) => { const params = request.params as { projectId: string; workspaceId: string }; await options.service.linkProjectWorkspace(params.projectId, params.workspaceId, idempotencyKey(request), source(request).client); return { data: { linked: true } } })
+  app.post('/api/v1/workspace-revisions', async (request) => ({ data: await options.service.createWorkspaceRevision(request.body, idempotencyKey(request), source(request).client) }))
+  app.post('/api/v1/project-resolution', async (request) => ({ data: options.service.resolveProject(String((request.body as { workspacePath?: string }).workspacePath ?? '')) }))
+
+  app.get('/api/v1/projects/:projectId/runs', async (request) => ({ data: options.service.listRuns(projectParams(request).projectId) }))
+  app.get('/api/v1/projects/:projectId/runs/page', async (request) => ({ data: options.service.listRunsPage(projectParams(request).projectId, request.query) }))
+  app.post('/api/v1/projects/:projectId/runs', async (request) => ({ data: await options.service.createRun(projectParams(request).projectId, request.body, idempotencyKey(request), source(request).client) }))
+  app.get('/api/v1/projects/:projectId/evidence', async (request) => ({ data: options.service.listEvidence(projectParams(request).projectId, (request.query as { includeStale?: string }).includeStale === 'true') }))
+  app.get('/api/v1/projects/:projectId/evidence/page', async (request) => ({ data: options.service.listEvidencePage(projectParams(request).projectId, request.query) }))
+  app.post('/api/v1/projects/:projectId/evidence', async (request) => ({ data: await options.service.createEvidence(projectParams(request).projectId, request.body, idempotencyKey(request), source(request).client) }))
+  app.post('/api/v1/projects/:projectId/checkpoints/:checkpointId/snapshot', async (request) => ({ data: await options.service.captureCheckpointSnapshot(projectParams(request).projectId, (request.params as { checkpointId: string }).checkpointId, idempotencyKey(request), source(request).client) }))
+  app.get('/api/v1/checkpoints/:id/snapshot', async (request) => {
+    const { id } = idParams(request); const snapshot = options.service.getCheckpointSnapshot(id)
+    if (!snapshot) throw new NotFoundError('Checkpoint snapshot', id)
+    return { data: snapshot }
+  })
+  app.get('/api/v1/checkpoints/:id/state', async (request) => {
+    const { id } = idParams(request); const state = options.service.reconstructCheckpointState(id)
+    if (!state) throw new NotFoundError('Checkpoint snapshot', id)
+    return { data: state }
+  })
+  app.get('/api/v1/checkpoints/:leftId/compare/:rightId', async (request) => { const params = request.params as { leftId: string; rightId: string }; return { data: options.service.compareCheckpointSnapshots(params.leftId, params.rightId) } })
 
   app.get('/api/v1/projects/:projectId/phases', async (request) => ({ data: options.service.listPhases(projectParams(request).projectId, (request.query as { includeArchived?: string }).includeArchived === 'true') }))
-  app.post('/api/v1/projects/:projectId/phases', async (request) => ({ data: await options.service.createPhase(projectParams(request).projectId, request.body, source(request)) }))
+  app.post('/api/v1/projects/:projectId/phases', async (request) => ({ data: await options.service.createPhase(projectParams(request).projectId, request.body, source(request), idempotencyKey(request)) }))
   app.patch('/api/v1/phases/:id', async (request) => ({ data: await options.service.updatePhase(idParams(request).id, request.body, source(request)) }))
 
   app.get('/api/v1/projects/:projectId/work-items', async (request) => {
     const statuses = (request.query as { status?: string }).status?.split(',').filter(Boolean)
     return { data: options.service.listWorkItems(projectParams(request).projectId, statuses) }
   })
-  app.post('/api/v1/projects/:projectId/work-items', async (request) => ({ data: await options.service.createWorkItem(projectParams(request).projectId, request.body, source(request)) }))
+  app.post('/api/v1/projects/:projectId/work-items', async (request) => ({ data: await options.service.createWorkItem(projectParams(request).projectId, request.body, source(request), idempotencyKey(request)) }))
   app.patch('/api/v1/work-items/:id', async (request) => ({ data: await options.service.updateWorkItem(idParams(request).id, request.body, source(request)) }))
 
   app.get('/api/v1/projects/:projectId/updates', async (request) => ({ data: options.service.listUpdates(projectParams(request).projectId, (request.query as { includeDeleted?: string }).includeDeleted === 'true') }))
-  app.post('/api/v1/projects/:projectId/updates', async (request) => ({ data: await options.service.createUpdate(projectParams(request).projectId, request.body, source(request)) }))
+  app.get('/api/v1/projects/:projectId/updates/page', async (request) => ({ data: options.service.listUpdatesPage(projectParams(request).projectId, request.query) }))
+  app.post('/api/v1/projects/:projectId/updates', async (request) => ({ data: await options.service.createUpdate(projectParams(request).projectId, request.body, source(request), idempotencyKey(request)) }))
   app.get('/api/v1/updates/:id/revisions', async (request) => ({ data: options.service.getUpdateRevisions(idParams(request).id) }))
-  app.post('/api/v1/updates/:id/revisions', async (request) => ({ data: await options.service.reviseUpdate(idParams(request).id, request.body, source(request)) }))
+  app.post('/api/v1/updates/:id/revisions', async (request) => ({ data: await options.service.reviseUpdate(idParams(request).id, request.body, source(request), idempotencyKey(request)) }))
   app.delete('/api/v1/updates/:id', async (request) => ({ data: await options.service.deleteUpdate(idParams(request).id, request.body, source(request)) }))
 
   app.get('/api/v1/labels', async () => ({ data: options.service.listLabels() }))
-  app.post('/api/v1/labels', async (request) => ({ data: await options.service.createLabel(request.body, source(request)) }))
+  app.post('/api/v1/labels', async (request) => ({ data: await options.service.createLabel(request.body, source(request), idempotencyKey(request)) }))
   app.put('/api/v1/work-items/:id/labels/:labelId', async (request) => ({ data: await options.service.attachLabel(labelParams(request).id, labelParams(request).labelId, request.body, source(request)) }))
   app.delete('/api/v1/work-items/:id/labels/:labelId', async (request) => ({ data: await options.service.detachLabel(labelParams(request).id, labelParams(request).labelId, request.body, source(request)) }))
 
   app.get('/api/v1/projects/:projectId/activity', async (request) => ({ data: options.service.listActivity(projectParams(request).projectId, Number((request.query as { limit?: string }).limit) || undefined) }))
+  app.get('/api/v1/projects/:projectId/activity/page', async (request) => ({ data: options.service.listActivityPage(projectParams(request).projectId, request.query) }))
   app.get('/api/v1/activity', async (request) => ({ data: options.service.listRecentActivity(Number((request.query as { limit?: string }).limit) || undefined) }))
-  app.get('/api/v1/search', async (request) => ({ data: options.service.search((request.query as { q?: string }).q ?? '', Number((request.query as { limit?: string }).limit) || undefined) }))
+  app.get('/api/v1/search', async (request) => {
+    const query = request.query as { q?: string; limit?: string; projectId?: string; entityTypes?: string; state?: string; phaseId?: string; requirementId?: string; evidenceResult?: string; from?: string; to?: string }
+    return { data: options.service.search(query.q ?? '', Number(query.limit) || undefined, { projectId: query.projectId, entityTypes: query.entityTypes?.split(',').filter(Boolean), state: query.state, phaseId: query.phaseId, requirementId: query.requirementId, evidenceResult: query.evidenceResult, from: query.from, to: query.to }) }
+  })
   app.get('/api/v1/export', async (_request, reply) => reply.header('Content-Disposition', `attachment; filename="istra-${new Date().toISOString().slice(0, 10)}.json"`).send(options.service.exportAll()))
   app.post('/api/v1/import', async (request) => { await options.service.importAll(request.body); return { data: { imported: true } } })
   app.get('/api/v1/backups', async () => ({ data: await options.service.backupStatus() }))

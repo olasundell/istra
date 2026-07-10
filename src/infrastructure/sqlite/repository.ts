@@ -21,14 +21,17 @@ import type {
   Provenance,
   PulseSnapshot,
   ReviseUpdateInput,
+  SearchFilters,
   SearchResult,
   UpdatePhaseInput,
   UpdateProjectInput,
   UpdateRevision,
   UpdateWorkItemInput,
   WorkItem,
+  Page,
 } from '../../domain/contracts.js'
 import { migrations } from './migrations.js'
+import { decodeCursor, encodeCursor, pageOf } from '../../application/pagination.js'
 
 type SqlRow = Record<string, unknown>
 const now = () => new Date().toISOString()
@@ -75,20 +78,89 @@ function revisionFromRow(row: SqlRow): UpdateRevision {
 const exportTables: Record<string, string[]> = {
   projects: ['id','title','description','intent','deadline','completion_criteria','state','current_focus','next_action','blockers_json','current_checkpoint_id','archived_at','version','created_at','updated_at','last_activity_at'],
   phases: ['id','project_id','name','description','status','position','archived_at','version','created_at','updated_at'],
-  work_items: ['id','project_id','phase_id','kind','title','description','status','priority','version','created_at','updated_at'],
+  work_items: ['id','project_id','phase_id','stable_key','parent_id','kind','title','description','status','priority','version','created_at','updated_at'],
   labels: ['id','name','colour','version','created_at','updated_at'],
   work_item_labels: ['work_item_id','label_id','created_at'],
   updates: ['id','project_id','kind','current_revision_id','deleted_at','version','created_at','updated_at'],
   update_revisions: ['id','update_id','revision','content','snapshot_json','source','client','created_at'],
   activity_events: ['id','project_id','entity_type','entity_id','event_type','payload_json','source','client','created_at'],
+  requirement_states: ['id','project_id','name','semantic','position','colour','created_at','updated_at'],
+  requirements: ['id','project_id','stable_key','kind','parent_id','title','description','state_id','responsible_phase_id','version','created_at','updated_at'],
+  requirement_key_aliases: ['requirement_id','alias','created_at'],
+  acceptance_criteria: ['id','requirement_id','title','description','position','required','created_at','updated_at'],
+  requirement_phase_links: ['requirement_id','phase_id','role','created_at'],
+  work_queues: ['id','project_id','name','description','version','created_at','updated_at'],
+  work_queue_items: ['queue_id','work_item_id','rank','created_at'],
+  requirement_work_links: ['requirement_id','work_item_id','created_at'],
+  work_phase_links: ['work_item_id','phase_id','role','created_at'],
+  work_relations: ['id','project_id','from_work_item_id','to_work_item_id','kind','created_at'],
+  external_blockers: ['id','project_id','work_item_id','content','resolved_at','created_at','updated_at'],
+  workspaces: ['id','name','canonical_root','remote','created_at','updated_at'],
+  workspace_aliases: ['workspace_id','alias','created_at'],
+  project_workspaces: ['project_id','workspace_id','created_at'],
+  workspace_revisions: ['id','workspace_id','branch','"commit"','dirty','diff_hash','captured_at'],
+  runs: ['id','project_id','workspace_revision_id','command','working_directory','started_at','ended_at','duration_ms','outcome','exit_code','toolchain_json','stdout_excerpt','stderr_excerpt','stdout_truncated','stderr_truncated','created_at'],
+  test_summaries: ['id','run_id','scope','passed','failed','skipped','target_count','created_at'],
+  artifact_references: ['id','run_id','uri','media_type','byte_count','digest','created_at'],
+  evidence: ['id','project_id','run_id','result','summary','target_version','stale','stale_reason','created_at','updated_at'],
+  evidence_artifact_links: ['evidence_id','artifact_id'],
+  evidence_requirement_links: ['evidence_id','requirement_id'],
+  evidence_work_links: ['evidence_id','work_item_id'],
+  evidence_update_links: ['evidence_id','update_id'],
+  evidence_checkpoint_links: ['evidence_id','checkpoint_id'],
+  checkpoint_snapshots: ['id','checkpoint_id','schema_version','captured_at','document_json','digest'],
+  idempotency_records: ['client','idempotency_key','operation','request_hash','result_json','created_at'],
 }
+const legacyRequiredExportTables = new Set(['projects', 'phases', 'work_items', 'labels', 'work_item_labels', 'updates', 'update_revisions', 'activity_events'])
 
 export class SqliteIstraRepository implements IstraRepository {
+  private savepointSequence = 0
+
   constructor(private readonly db: DatabaseSync) {}
 
   private transaction<T>(work: () => T): T {
+    if (this.db.isTransaction) {
+      const savepoint = `repository_${this.savepointSequence++}`
+      this.db.exec(`SAVEPOINT ${savepoint}`)
+      try {
+        const result = work()
+        this.db.exec(`RELEASE ${savepoint}`)
+        return result
+      } catch (error) {
+        this.db.exec(`ROLLBACK TO ${savepoint}`)
+        this.db.exec(`RELEASE ${savepoint}`)
+        throw error
+      }
+    }
     this.db.exec('BEGIN IMMEDIATE')
     try { const result = work(); this.db.exec('COMMIT'); return result } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  private seedOperationalDefaults(projectId: string, timestamp = now()): void {
+    const defaults = [
+      ['Missing', 'open', 0, '#7A8594'],
+      ['Partial', 'partial', 1, '#C18401'],
+      ['Proven', 'proven', 2, '#2D7A4B'],
+      ['Defect', 'defect', 3, '#B64D3A'],
+    ] as const
+    const insertState = this.db.prepare('INSERT OR IGNORE INTO requirement_states(id,project_id,name,semantic,position,colour,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
+    for (const [name, semantic, position, colour] of defaults) insertState.run(randomUUID(), projectId, name, semantic, position, colour, timestamp, timestamp)
+    if (!this.db.prepare('SELECT 1 FROM work_queues WHERE project_id=?').get(projectId)) {
+      this.db.prepare('INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES (?,?,?,?,?,?)').run(randomUUID(), projectId, 'Main queue', 'Default ordered work queue', timestamp, timestamp)
+    }
+  }
+
+  private backfillLegacyOperationalProjections(projectId: string): void {
+    const queueId = this.ensureDefaultQueue(projectId)
+    this.db.prepare(`INSERT OR IGNORE INTO work_queue_items(queue_id,work_item_id,rank,created_at)
+      SELECT ?,wi.id,'legacy:' || wi.created_at || ':' || wi.id,wi.created_at
+      FROM work_items wi
+      WHERE wi.project_id=? AND NOT EXISTS (SELECT 1 FROM work_queue_items existing WHERE existing.work_item_id=wi.id)`)
+      .run(queueId, projectId)
+    this.db.prepare(`INSERT OR IGNORE INTO work_phase_links(work_item_id,phase_id,role,created_at)
+      SELECT wi.id,wi.phase_id,'responsible',wi.created_at
+      FROM work_items wi WHERE wi.project_id=? AND wi.phase_id IS NOT NULL`)
+      .run(projectId)
   }
 
   private event(projectId: string, entityType: string, entityId: string, eventType: string, payload: Record<string, unknown>, provenance: Provenance): void {
@@ -103,11 +175,22 @@ export class SqliteIstraRepository implements IstraRepository {
   }
 
   private workItemFromRow(row: SqlRow): WorkItem {
-    const labels = this.db.prepare(`SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=? ORDER BY l.name COLLATE NOCASE`).all(String(row.id)) as SqlRow[]
+    const id = String(row.id)
+    const labels = this.db.prepare(`SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=? ORDER BY l.name COLLATE NOCASE`).all(id) as SqlRow[]
+    const queue = row.queue_id === undefined
+      ? this.db.prepare('SELECT queue_id,rank FROM work_queue_items WHERE work_item_id=? ORDER BY rank,queue_id LIMIT 1').get(id) as SqlRow | undefined
+      : row
+    const reasons: string[] = []
+    const dependencies = this.db.prepare("SELECT wi.title,wr.kind FROM work_relations wr JOIN work_items wi ON ((wr.kind='depends_on' AND wi.id=wr.to_work_item_id) OR (wr.kind='blocks' AND wi.id=wr.from_work_item_id)) WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=?) OR (wr.kind='blocks' AND wr.to_work_item_id=?)) AND wi.status NOT IN ('resolved','dropped')").all(id, id) as SqlRow[]
+    if (dependencies.length) reasons.push(...dependencies.map((dependency) => `${String(dependency.kind) === 'blocks' ? 'Blocked by' : 'Depends on'} ${String(dependency.title)}`))
+    const externalBlockers = this.db.prepare('SELECT content FROM external_blockers WHERE work_item_id=? AND resolved_at IS NULL').all(id) as SqlRow[]
+    if (externalBlockers.length) reasons.push(...externalBlockers.map((blocker) => String(blocker.content)))
     return {
-      id: String(row.id), projectId: String(row.project_id), phaseId: textOrNull(row.phase_id), kind: String(row.kind) as WorkItem['kind'],
+      id, projectId: String(row.project_id), phaseId: textOrNull(row.phase_id), kind: String(row.kind) as WorkItem['kind'],
       title: String(row.title), description: textOrNull(row.description), status: String(row.status) as WorkItem['status'], priority: textOrNull(row.priority) as WorkItem['priority'],
       labels: labels.map(labelFromRow), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+      stableKey: textOrNull(row.stable_key), parentId: textOrNull(row.parent_id), queueId: textOrNull(queue?.queue_id), rank: textOrNull(queue?.rank),
+      effectiveBlocked: String(row.status) === 'blocked' || reasons.length > 0, blockerReasons: reasons,
     }
   }
 
@@ -158,6 +241,7 @@ export class SqliteIstraRepository implements IstraRepository {
     return this.transaction(() => {
       this.db.prepare(`INSERT INTO projects(id,title,description,intent,deadline,completion_criteria,state,created_at,updated_at,last_activity_at) VALUES (?,?,?,?,?,?,'active',?,?,?)`)
         .run(id, input.title, input.description ?? null, input.intent ?? null, input.deadline ?? null, input.completionCriteria ?? null, timestamp, timestamp, timestamp)
+      this.seedOperationalDefaults(id, timestamp)
       this.replaceSearch('project', id, id, input.title, [input.description, input.intent, input.completionCriteria].filter(Boolean).join('\n'))
       this.event(id, 'project', id, 'project.created', { title: input.title }, provenance)
       return this.getProject(id)!
@@ -224,16 +308,29 @@ export class SqliteIstraRepository implements IstraRepository {
     return (this.db.prepare(`SELECT * FROM work_items WHERE project_id=?${filtered} ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, updated_at DESC`).all(projectId, ...(statuses ?? [])) as SqlRow[]).map((row) => this.workItemFromRow(row))
   }
 
+  listWorkItemsPage(projectId: string, limit: number, cursor?: string | null, statuses?: string[]): Page<WorkItem> {
+    return pageOf(this.listWorkItems(projectId, statuses), limit, cursor)
+  }
+
   createWorkItem(projectId: string, input: CreateWorkItemInput, provenance: Provenance): WorkItem {
     if (!this.getProject(projectId)) throw new NotFoundError('Project', projectId)
     if (input.phaseId) this.assertPhaseInProject(input.phaseId, projectId)
+    if (input.parentId) this.assertParentInProject(input.parentId, projectId)
+    const queueId = input.queueId === undefined ? this.ensureDefaultQueue(projectId) : input.queueId
+    if (queueId) this.assertQueueInProject(queueId, projectId)
+    for (const phaseId of new Set(input.relatedPhaseIds ?? [])) this.assertPhaseInProject(phaseId, projectId)
+    for (const requirementId of new Set(input.requirementIds ?? [])) this.assertProjectEntity('requirements', requirementId, projectId)
     const id = randomUUID(); const timestamp = now(); const labelIds = [...new Set(input.labelIds ?? [])]
     return this.transaction(() => {
-      this.db.prepare('INSERT INTO work_items(id,project_id,phase_id,kind,title,description,status,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
-        .run(id, projectId, input.phaseId ?? null, input.kind, input.title, input.description ?? null, input.status, input.priority ?? null, timestamp, timestamp)
+      this.db.prepare('INSERT INTO work_items(id,project_id,phase_id,stable_key,parent_id,kind,title,description,status,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(id, projectId, input.phaseId ?? null, input.stableKey ?? null, input.parentId ?? null, input.kind, input.title, input.description ?? null, input.status ?? 'open', input.priority ?? null, timestamp, timestamp)
       for (const labelId of labelIds) this.insertWorkItemLabel(id, labelId)
+      if (queueId) this.insertQueueItem(queueId, id, input.rank ?? `${timestamp}-${id}`)
+      if (input.phaseId) this.insertWorkPhaseLink(id, input.phaseId, 'responsible', projectId)
+      for (const phaseId of new Set(input.relatedPhaseIds ?? [])) if (phaseId !== input.phaseId) this.insertWorkPhaseLink(id, phaseId, 'related', projectId)
+      for (const requirementId of new Set(input.requirementIds ?? [])) this.db.prepare('INSERT OR IGNORE INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)').run(requirementId, id, timestamp)
       this.replaceSearch('work_item', id, projectId, input.title, input.description ?? '')
-      this.event(projectId, 'work_item', id, 'work_item.created', { title: input.title, kind: input.kind, status: input.status, phaseId: input.phaseId ?? null, labelIds }, provenance)
+      this.event(projectId, 'work_item', id, 'work_item.created', { title: input.title, kind: input.kind, status: input.status ?? 'open', phaseId: input.phaseId ?? null, stableKey: input.stableKey ?? null, parentId: input.parentId ?? null, queueId, rank: input.rank ?? null, labelIds }, provenance)
       for (const labelId of labelIds) this.event(projectId, 'work_item', id, 'work_item.label_attached', { labelId }, provenance)
       return this.workItemFromRow(this.db.prepare('SELECT * FROM work_items WHERE id=?').get(id) as SqlRow)
     })
@@ -242,18 +339,38 @@ export class SqliteIstraRepository implements IstraRepository {
   updateWorkItem(id: string, input: UpdateWorkItemInput, provenance: Provenance): WorkItem {
     const row = this.db.prepare('SELECT * FROM work_items WHERE id=?').get(id) as SqlRow | undefined; if (!row) throw new NotFoundError('Work item', id)
     const current = this.workItemFromRow(row); if (input.phaseId) this.assertPhaseInProject(input.phaseId, current.projectId)
-    const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([k,v]) => !['expectedVersion','labelIds'].includes(k) && v !== undefined)) }
+    const parentId = input.parentId === undefined ? current.parentId ?? null : input.parentId
+    if (parentId) this.assertParentInProject(parentId, current.projectId, id)
+    const queueId = input.queueId === undefined ? current.queueId ?? null : input.queueId
+    if (queueId) this.assertQueueInProject(queueId, current.projectId)
+    const relatedPhaseIds = input.relatedPhaseIds ?? (this.db.prepare("SELECT phase_id FROM work_phase_links WHERE work_item_id=? AND role='related'").all(id) as SqlRow[]).map((entry) => String(entry.phase_id))
+    for (const phaseId of new Set(relatedPhaseIds)) this.assertPhaseInProject(phaseId, current.projectId)
+    for (const requirementId of new Set(input.requirementIds ?? [])) this.assertProjectEntity('requirements', requirementId, current.projectId)
+    const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([k,v]) => !['expectedVersion','labelIds','requirementIds','relatedPhaseIds','queueId','rank'].includes(k) && v !== undefined)), parentId, queueId, rank: input.rank === undefined ? current.rank ?? null : input.rank }
     return this.transaction(() => {
-      const result = this.db.prepare('UPDATE work_items SET phase_id=?,kind=?,title=?,description=?,status=?,priority=?,version=version+1,updated_at=? WHERE id=? AND version=?')
-        .run(next.phaseId, next.kind, next.title, next.description, next.status, next.priority, now(), id, input.expectedVersion)
+      const result = this.db.prepare('UPDATE work_items SET phase_id=?,stable_key=?,parent_id=?,kind=?,title=?,description=?,status=?,priority=?,version=version+1,updated_at=? WHERE id=? AND version=?')
+        .run(next.phaseId, next.stableKey ?? null, parentId, next.kind, next.title, next.description, next.status, next.priority, now(), id, input.expectedVersion)
       if (Number(result.changes) === 0) throw new ConflictError('Work item', id)
       const previousLabelIds = current.labels.map((label) => label.id)
       if (input.labelIds) { this.db.prepare('DELETE FROM work_item_labels WHERE work_item_id=?').run(id); for (const labelId of new Set(input.labelIds)) this.insertWorkItemLabel(id, labelId) }
+      if (input.queueId !== undefined || input.rank !== undefined) {
+        this.db.prepare('DELETE FROM work_queue_items WHERE work_item_id=?').run(id)
+        if (queueId) this.insertQueueItem(queueId, id, input.rank ?? current.rank ?? `${now()}-${id}`)
+      }
+      if (input.relatedPhaseIds !== undefined || input.phaseId !== undefined) {
+        this.db.prepare('DELETE FROM work_phase_links WHERE work_item_id=?').run(id)
+        if (next.phaseId) this.insertWorkPhaseLink(id, next.phaseId, 'responsible', current.projectId)
+        for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== next.phaseId) this.insertWorkPhaseLink(id, phaseId, 'related', current.projectId)
+      }
+      if (input.requirementIds !== undefined) {
+        this.db.prepare('DELETE FROM requirement_work_links WHERE work_item_id=?').run(id)
+        for (const requirementId of new Set(input.requirementIds)) this.db.prepare('INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)').run(requirementId, id, now())
+      }
       this.replaceSearch('work_item', id, current.projectId, next.title, next.description ?? '')
       const updated = this.workItemFromRow(this.db.prepare('SELECT * FROM work_items WHERE id=?').get(id) as SqlRow)
       const currentEventState = { ...current, labelIds: previousLabelIds } as unknown as Record<string, unknown>
       const updatedEventState = { ...updated, labelIds: updated.labels.map((label) => label.id) } as unknown as Record<string, unknown>
-      const changes = beforeAfter(currentEventState, updatedEventState, ['title','description','kind','status','priority','phaseId','labelIds'])
+      const changes = beforeAfter(currentEventState, updatedEventState, ['title','description','kind','status','priority','phaseId','stableKey','parentId','queueId','rank','labelIds'])
       this.event(current.projectId, 'work_item', id, 'work_item.updated', { changed: Object.keys(changes), changes }, provenance)
       for (const labelId of updated.labels.map((label) => label.id).filter((labelId) => !previousLabelIds.includes(labelId))) this.event(current.projectId, 'work_item', id, 'work_item.label_attached', { labelId }, provenance)
       for (const labelId of previousLabelIds.filter((labelId) => !updated.labels.some((label) => label.id === labelId))) this.event(current.projectId, 'work_item', id, 'work_item.label_detached', { labelId }, provenance)
@@ -266,6 +383,51 @@ export class SqliteIstraRepository implements IstraRepository {
     if (!row || row.project_id !== projectId) throw new ValidationError('phaseId must refer to a phase in the same project')
   }
 
+  private assertProjectEntity(table: 'requirements' | 'work_items', id: string, projectId: string): void {
+    const row = this.db.prepare(`SELECT project_id FROM ${table} WHERE id=?`).get(id) as SqlRow | undefined
+    if (!row) throw new NotFoundError(table === 'requirements' ? 'Requirement' : 'Work item', id)
+    if (String(row.project_id) !== projectId) throw new ValidationError(`${table === 'requirements' ? 'requirementId' : 'workItemId'} must refer to an entity in the same project`)
+  }
+
+  private assertParentInProject(parentId: string, projectId: string, childId?: string): void {
+    this.assertProjectEntity('work_items', parentId, projectId)
+    if (parentId === childId) throw new ValidationError('A work item cannot be its own parent')
+    if (!childId) return
+    const cycle = this.db.prepare(`WITH RECURSIVE descendants(id) AS (
+      SELECT parent_id FROM work_items WHERE id=? AND parent_id IS NOT NULL
+      UNION
+      SELECT wi.parent_id FROM work_items wi JOIN descendants d ON wi.id=d.id WHERE wi.parent_id IS NOT NULL
+    ) SELECT 1 FROM descendants WHERE id=? LIMIT 1`).get(parentId, childId)
+    if (cycle) throw new ValidationError('Parent relationship would create a cycle')
+  }
+
+  private assertQueueInProject(queueId: string, projectId: string): void {
+    const row = this.db.prepare('SELECT project_id FROM work_queues WHERE id=?').get(queueId) as SqlRow | undefined
+    if (!row) throw new NotFoundError('Work queue', queueId)
+    if (String(row.project_id) !== projectId) throw new ValidationError('queueId must refer to a queue in the same project')
+  }
+
+  private ensureDefaultQueue(projectId: string): string {
+    const existing = this.db.prepare('SELECT id FROM work_queues WHERE project_id=? ORDER BY created_at LIMIT 1').get(projectId) as SqlRow | undefined
+    if (existing) return String(existing.id)
+    const id = randomUUID(); const timestamp = now()
+    this.db.prepare('INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES (?,?,?,?,?,?)').run(id, projectId, 'Main queue', 'Default ordered work queue', timestamp, timestamp)
+    return id
+  }
+
+  private insertQueueItem(queueId: string, workItemId: string, rank: string): void {
+    try {
+      this.db.prepare('INSERT INTO work_queue_items(queue_id,work_item_id,rank,created_at) VALUES (?,?,?,?)').run(queueId, workItemId, rank, now())
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : 'Could not add work item to queue')
+    }
+  }
+
+  private insertWorkPhaseLink(workItemId: string, phaseId: string, role: 'responsible' | 'related', projectId: string): void {
+    this.assertPhaseInProject(phaseId, projectId)
+    this.db.prepare('INSERT OR REPLACE INTO work_phase_links(work_item_id,phase_id,role,created_at) VALUES (?,?,?,?)').run(workItemId, phaseId, role, now())
+  }
+
   private insertWorkItemLabel(workItemId: string, labelId: string): void {
     if (!this.db.prepare('SELECT 1 FROM labels WHERE id=?').get(labelId)) throw new NotFoundError('Label', labelId)
     this.db.prepare('INSERT OR IGNORE INTO work_item_labels(work_item_id,label_id,created_at) VALUES (?,?,?)').run(workItemId, labelId, now())
@@ -273,6 +435,10 @@ export class SqliteIstraRepository implements IstraRepository {
 
   listUpdates(projectId: string, includeDeleted = false): ProjectUpdate[] {
     return (this.db.prepare(`SELECT * FROM updates WHERE project_id=? ${includeDeleted ? '' : 'AND deleted_at IS NULL'} ORDER BY created_at DESC`).all(projectId) as SqlRow[]).map((row) => this.updateFromRow(row))
+  }
+
+  listUpdatesPage(projectId: string, limit: number, cursor?: string | null, includeDeleted = false): Page<ProjectUpdate> {
+    return pageOf(this.listUpdates(projectId, includeDeleted), limit, cursor)
   }
 
   getUpdateRevisions(updateId: string): UpdateRevision[] {
@@ -391,10 +557,22 @@ export class SqliteIstraRepository implements IstraRepository {
   }
 
   listActivity(projectId: string, limit = 200): ActivityEvent[] {
-    return (this.db.prepare('SELECT * FROM activity_events WHERE project_id=? ORDER BY created_at DESC LIMIT ?').all(projectId, Math.min(Math.max(limit, 1), 1000)) as SqlRow[]).map((row) => ({
+    return (this.db.prepare('SELECT * FROM activity_events WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT ?').all(projectId, Math.min(Math.max(limit, 1), 1000)) as SqlRow[]).map((row) => ({
       id: String(row.id), projectId: String(row.project_id), entityType: String(row.entity_type), entityId: String(row.entity_id), eventType: String(row.event_type),
       payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), createdAt: String(row.created_at),
     }))
+  }
+
+  listActivityPage(projectId: string, limit: number, cursor?: string | null): Page<ActivityEvent> {
+    const start = decodeCursor(cursor)
+    const boundedLimit = Math.min(Math.max(limit, 1), 200)
+    const rows = this.db.prepare('SELECT * FROM activity_events WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?').all(projectId, boundedLimit + 1, start) as SqlRow[]
+    const hasMore = rows.length > boundedLimit
+    const items = rows.slice(0, boundedLimit).map((row) => ({
+      id: String(row.id), projectId: String(row.project_id), entityType: String(row.entity_type), entityId: String(row.entity_id), eventType: String(row.event_type),
+      payload: parseJson<Record<string, unknown>>(row.payload_json, {}), source: String(row.source), client: textOrNull(row.client), createdAt: String(row.created_at),
+    }))
+    return { items, nextCursor: hasMore ? encodeCursor(start + items.length) : null, hasMore }
   }
 
   listRecentActivity(limit = 50): DashboardActivityEvent[] {
@@ -405,30 +583,80 @@ export class SqliteIstraRepository implements IstraRepository {
     }))
   }
 
-  search(query: string, limit = 50): SearchResult[] {
+  search(query: string, limit = 50, filters: SearchFilters = {}): SearchResult[] {
     const terms = query.trim().split(/\s+/).filter(Boolean).map((term) => `"${term.replaceAll('"', '""')}"*`).join(' ')
     if (!terms) return []
-    const rows = this.db.prepare(`SELECT entity_type,entity_id,project_id,title,snippet(search_index,4,'','',' … ',24) AS excerpt,bm25(search_index,5.0,1.0) AS score FROM search_index WHERE search_index MATCH ? ORDER BY score LIMIT ?`).all(terms, Math.min(Math.max(limit, 1), 200)) as SqlRow[]
+    const clauses = ['search_index MATCH ?']
+    const parameters: Array<string | number> = [terms]
+    if (filters.projectId) { clauses.push('search_index.project_id=?'); parameters.push(filters.projectId) }
+    if (filters.entityTypes) {
+      if (!filters.entityTypes.length) clauses.push('0')
+      else { clauses.push(`search_index.entity_type IN (${filters.entityTypes.map(() => '?').join(',')})`); parameters.push(...filters.entityTypes) }
+    }
+    if (filters.state) { clauses.push('COALESCE(p.state,ph.status,wi.status)=?'); parameters.push(filters.state) }
+    if (filters.phaseId) {
+      clauses.push("(ph.id=? OR (search_index.entity_type='work_item' AND (wi.phase_id=? OR EXISTS (SELECT 1 FROM work_phase_links wpl WHERE wpl.work_item_id=search_index.entity_id AND wpl.phase_id=?))))")
+      parameters.push(filters.phaseId, filters.phaseId, filters.phaseId)
+    }
+    if (filters.requirementId) {
+      clauses.push("search_index.entity_type='work_item' AND EXISTS (SELECT 1 FROM requirement_work_links rwl WHERE rwl.work_item_id=search_index.entity_id AND rwl.requirement_id=?)")
+      parameters.push(filters.requirementId)
+    }
+    if (filters.evidenceResult) clauses.push('0')
+    if (filters.from) { clauses.push('COALESCE(p.created_at,ph.created_at,wi.created_at,u.created_at)>=?'); parameters.push(filters.from) }
+    if (filters.to) { clauses.push('COALESCE(p.created_at,ph.created_at,wi.created_at,u.created_at)<=?'); parameters.push(filters.to) }
+    parameters.push(Math.min(Math.max(limit, 1), 200))
+    const rows = this.db.prepare(`SELECT search_index.entity_type,search_index.entity_id,search_index.project_id,search_index.title,snippet(search_index,4,'','',' … ',24) AS excerpt,bm25(search_index,5.0,1.0) AS score
+      FROM search_index
+      LEFT JOIN projects p ON search_index.entity_type='project' AND p.id=search_index.entity_id
+      LEFT JOIN phases ph ON search_index.entity_type='phase' AND ph.id=search_index.entity_id
+      LEFT JOIN work_items wi ON search_index.entity_type='work_item' AND wi.id=search_index.entity_id
+      LEFT JOIN updates u ON search_index.entity_type='update' AND u.id=search_index.entity_id
+      WHERE ${clauses.join(' AND ')} ORDER BY score LIMIT ?`).all(...parameters) as SqlRow[]
     return rows.map((row) => ({ type: String(row.entity_type) as SearchResult['type'], id: String(row.entity_id), projectId: String(row.project_id), title: String(row.title), excerpt: String(row.excerpt), score: Number(row.score) }))
   }
 
   exportAll(): ExportBundle {
     const tables: ExportBundle['tables'] = {}
     for (const [table, columns] of Object.entries(exportTables)) tables[table] = this.db.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all() as Array<Record<string, unknown>>
-    return { format: 'istra-export', formatVersion: 1, exportedAt: now(), tables }
+    return { format: 'istra-export', formatVersion: 2, exportedAt: now(), tables }
   }
 
   validateImport(bundle: ExportBundle): void {
     const temp = new DatabaseSync(':memory:')
     try {
+      if (bundle.formatVersion !== 1 && bundle.formatVersion !== 2) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`)
       temp.exec('PRAGMA foreign_keys=ON;')
-      temp.exec(migrations[0]!.sql)
+      for (const migration of migrations) temp.exec(migration.sql)
+      temp.exec('BEGIN; PRAGMA defer_foreign_keys=ON;')
       this.loadTables(temp, bundle)
       const integrity = temp.prepare('PRAGMA integrity_check').get() as SqlRow
       const foreignKeys = temp.prepare('PRAGMA foreign_key_check').all()
       const invalidCheckpoints = temp.prepare(`SELECT p.id,p.current_checkpoint_id FROM projects p LEFT JOIN updates u ON u.id=p.current_checkpoint_id WHERE p.current_checkpoint_id IS NOT NULL AND (u.id IS NULL OR u.project_id<>p.id OR u.kind<>'checkpoint' OR u.deleted_at IS NOT NULL)`).all()
       const invalidCurrentRevisions = temp.prepare(`SELECT u.id,u.current_revision_id FROM updates u LEFT JOIN update_revisions r ON r.id=u.current_revision_id WHERE r.id IS NULL OR r.update_id<>u.id`).all()
       const invalidPhaseProjects = temp.prepare(`SELECT wi.id,wi.phase_id FROM work_items wi JOIN phases p ON p.id=wi.phase_id WHERE wi.project_id<>p.project_id`).all()
+      const invalidOperationalProjects = temp.prepare(`
+        SELECT relation,id FROM (
+          SELECT 'requirement_state' AS relation,r.id FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.project_id<>s.project_id
+          UNION ALL SELECT 'requirement_parent',r.id FROM requirements r JOIN requirements parent ON parent.id=r.parent_id WHERE r.project_id<>parent.project_id
+          UNION ALL SELECT 'requirement_responsible_phase',r.id FROM requirements r JOIN phases p ON p.id=r.responsible_phase_id WHERE r.project_id<>p.project_id
+          UNION ALL SELECT 'requirement_phase',l.requirement_id FROM requirement_phase_links l JOIN requirements r ON r.id=l.requirement_id JOIN phases p ON p.id=l.phase_id WHERE r.project_id<>p.project_id
+          UNION ALL SELECT 'work_parent',w.id FROM work_items w JOIN work_items parent ON parent.id=w.parent_id WHERE w.project_id<>parent.project_id
+          UNION ALL SELECT 'work_queue',q.work_item_id FROM work_queue_items q JOIN work_items w ON w.id=q.work_item_id JOIN work_queues queue ON queue.id=q.queue_id WHERE w.project_id<>queue.project_id
+          UNION ALL SELECT 'requirement_work',l.work_item_id FROM requirement_work_links l JOIN requirements r ON r.id=l.requirement_id JOIN work_items w ON w.id=l.work_item_id WHERE r.project_id<>w.project_id
+          UNION ALL SELECT 'work_phase',l.work_item_id FROM work_phase_links l JOIN work_items w ON w.id=l.work_item_id JOIN phases p ON p.id=l.phase_id WHERE w.project_id<>p.project_id
+          UNION ALL SELECT 'work_relation',r.id FROM work_relations r JOIN work_items source ON source.id=r.from_work_item_id JOIN work_items target ON target.id=r.to_work_item_id WHERE r.project_id<>source.project_id OR r.project_id<>target.project_id
+          UNION ALL SELECT 'external_blocker',b.id FROM external_blockers b JOIN work_items w ON w.id=b.work_item_id WHERE b.project_id<>w.project_id
+          UNION ALL SELECT 'run_workspace',r.id FROM runs r JOIN workspace_revisions revision ON revision.id=r.workspace_revision_id WHERE NOT EXISTS (SELECT 1 FROM project_workspaces pw WHERE pw.project_id=r.project_id AND pw.workspace_id=revision.workspace_id)
+          UNION ALL SELECT 'evidence_run',e.id FROM evidence e JOIN runs r ON r.id=e.run_id WHERE e.project_id<>r.project_id
+          UNION ALL SELECT 'evidence_requirement',l.evidence_id FROM evidence_requirement_links l JOIN evidence e ON e.id=l.evidence_id JOIN requirements r ON r.id=l.requirement_id WHERE e.project_id<>r.project_id
+          UNION ALL SELECT 'evidence_work',l.evidence_id FROM evidence_work_links l JOIN evidence e ON e.id=l.evidence_id JOIN work_items w ON w.id=l.work_item_id WHERE e.project_id<>w.project_id
+          UNION ALL SELECT 'evidence_update',l.evidence_id FROM evidence_update_links l JOIN evidence e ON e.id=l.evidence_id JOIN updates u ON u.id=l.update_id WHERE e.project_id<>u.project_id
+          UNION ALL SELECT 'evidence_checkpoint',l.evidence_id FROM evidence_checkpoint_links l JOIN evidence e ON e.id=l.evidence_id JOIN updates u ON u.id=l.checkpoint_id WHERE e.project_id<>u.project_id OR u.kind<>'checkpoint'
+          UNION ALL SELECT 'evidence_artifact',l.evidence_id FROM evidence_artifact_links l JOIN evidence e ON e.id=l.evidence_id JOIN artifact_references a ON a.id=l.artifact_id WHERE a.run_id IS NOT e.run_id
+          UNION ALL SELECT 'checkpoint_snapshot',s.id FROM checkpoint_snapshots s JOIN updates u ON u.id=s.checkpoint_id WHERE u.kind<>'checkpoint'
+        )
+      `).all()
       const invalidSnapshots: Array<{ updateId: string; reason: string }> = []
       const snapshots = temp.prepare(`SELECT u.id,u.project_id,r.snapshot_json FROM updates u JOIN update_revisions r ON r.update_id=u.id WHERE u.kind='checkpoint'`).all() as SqlRow[]
       for (const row of snapshots) {
@@ -440,21 +668,30 @@ export class SqliteIstraRepository implements IstraRepository {
         const workItemCount = workItemIds.length ? Number((temp.prepare(`SELECT COUNT(*) AS count FROM work_items WHERE project_id=? AND id IN (${workItemIds.map(() => '?').join(',')})`).get(String(row.project_id), ...workItemIds) as SqlRow).count) : 0
         if (phaseCount !== new Set(phaseIds).size || workItemCount !== new Set(workItemIds).size) invalidSnapshots.push({ updateId: String(row.id), reason: 'snapshot references an entity outside the project' })
       }
-      if (integrity.integrity_check !== 'ok' || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidSnapshots.length) {
-        throw new ValidationError('Import failed database integrity checks', { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidSnapshots })
+      if (integrity.integrity_check !== 'ok' || foreignKeys.length || invalidCheckpoints.length || invalidCurrentRevisions.length || invalidPhaseProjects.length || invalidOperationalProjects.length || invalidSnapshots.length) {
+        throw new ValidationError('Import failed database integrity checks', { integrity, foreignKeys, invalidCheckpoints, invalidCurrentRevisions, invalidPhaseProjects, invalidOperationalProjects, invalidSnapshots })
       }
     } catch (error) {
       if (error instanceof ValidationError) throw error
       throw new ValidationError('Import contains invalid relational data', { cause: error instanceof Error ? error.message : String(error) })
-    } finally { temp.close() }
+    } finally {
+      if (temp.isTransaction) temp.exec('ROLLBACK')
+      temp.close()
+    }
   }
 
   importAll(bundle: ExportBundle): void {
     this.transaction(() => {
+      this.db.exec('PRAGMA defer_foreign_keys=ON')
       this.db.prepare('UPDATE projects SET current_checkpoint_id=NULL').run()
       for (const table of Object.keys(exportTables).reverse()) this.db.prepare(`DELETE FROM ${table}`).run()
       this.db.prepare('DELETE FROM search_index').run()
       this.loadTables(this.db, bundle)
+      for (const row of this.db.prepare('SELECT id FROM projects').all() as SqlRow[]) {
+        const projectId = String(row.id)
+        this.seedOperationalDefaults(projectId)
+        if (bundle.formatVersion === 1) this.backfillLegacyOperationalProjections(projectId)
+      }
       this.rebuildSearch()
     })
   }
@@ -462,9 +699,15 @@ export class SqliteIstraRepository implements IstraRepository {
   private loadTables(db: DatabaseSync, bundle: ExportBundle): void {
     for (const [table, columns] of Object.entries(exportTables)) {
       const rows = bundle.tables[table]
-      if (!Array.isArray(rows)) throw new ValidationError(`Import is missing table ${table}`)
+      if (!Array.isArray(rows)) {
+        if (bundle.formatVersion === 1 && !legacyRequiredExportTables.has(table)) continue
+        throw new ValidationError(`Import is missing table ${table}`)
+      }
       const statement = db.prepare(`INSERT INTO ${table}(${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
-      for (const row of rows) statement.run(...columns.map((column) => row[column] == null ? null : row[column] as never))
+      for (const row of rows) statement.run(...columns.map((column) => {
+        const key = column.replaceAll('"', '')
+        return row[key] == null ? null : row[key] as never
+      }))
     }
   }
 

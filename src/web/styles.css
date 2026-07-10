@@ -415,6 +415,27 @@ h1, h2, h3, p { margin-top: 0; }
 .backup-list { margin: 15px 0 0; padding: 0; list-style: none; }
 .backup-list li { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 8px 0; color: var(--muted); font-size: 11px; }
 
+.operational-memory-section { border-top: 1px solid var(--line); margin-top: 34px; padding-top: 30px; }
+.operational-memory__status { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; }
+.operational-memory-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.operational-memory-card { display: grid; gap: 6px; min-height: 116px; padding: 18px 20px 18px 0; border-right: 1px solid var(--line); }
+.operational-memory-card + .operational-memory-card { padding-left: 20px; }
+.operational-memory-card:last-child { border-right: 0; }
+.operational-memory-card span { color: var(--muted); font-size: 12px; }
+.operational-memory-card strong { color: var(--ink); font-family: var(--display); font-size: 34px; font-weight: 500; }
+.operational-memory-card small { color: var(--muted); font-size: 11px; }
+.operational-memory__requirements { margin-top: 22px; }
+.operational-memory__requirements h3 { margin: 0 0 12px; font-size: 13px; }
+.operational-memory__requirements ul { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+.operational-memory__requirements li { display: grid; grid-template-columns: 100px minmax(0, 1fr) auto; align-items: center; gap: 14px; border-bottom: 1px solid var(--line); padding: 11px 0; font-size: 13px; }
+.operational-memory__requirements li strong { color: var(--blue); font-size: 11px; letter-spacing: .08em; }
+.operational-memory__requirements li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.requirement-gate { font-size: 10px; font-style: normal; text-transform: uppercase; letter-spacing: .08em; }
+.requirement-gate--satisfied { color: var(--green); }
+.requirement-gate--unsatisfied { color: var(--rust); }
+.requirement-gate--not_configured { color: var(--muted); }
+.operational-memory__empty { color: var(--muted); font-size: 13px; }
+
 @media (max-width: 1050px) {
   :root { --sidebar: 220px; }
   .page { padding-inline: 40px; }
@@ -424,6 +445,8 @@ h1, h2, h3, p { margin-top: 0; }
   .project-lower-grid { grid-template-columns: 1fr; }
   .work-items-section { border-right: 0; padding-right: 0; }
   .project-activity { border-top: 1px solid var(--line); padding-left: 0; }
+  .operational-memory-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .operational-memory-card:nth-child(2) { border-right: 0; }
 }
 
 @media (max-width: 760px) {
@@ -468,6 +491,11 @@ h1, h2, h3, p { margin-top: 0; }
   .search-result__type { grid-column: 1 / -1; }
   .archive-row { grid-template-columns: 1fr auto; }
   .archive-row p { grid-column: 1 / -1; }
+  .operational-memory-grid { grid-template-columns: 1fr 1fr; }
+  .operational-memory-card { padding-right: 12px; }
+  .operational-memory-card + .operational-memory-card { padding-left: 12px; }
+  .operational-memory__requirements li { grid-template-columns: 1fr auto; }
+  .operational-memory__requirements li span { grid-column: 1 / -1; grid-row: 2; }
 }
 
 @media (prefers-reduced-motion: reduce) {

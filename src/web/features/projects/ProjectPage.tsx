@@ -7,7 +7,7 @@ import { EmptyState, ErrorNotice } from "../../components/Overlay";
 import { Icon } from "../../components/Icon";
 import { KindMark, PriorityView, WorkItemStatusView } from "../../components/Status";
 import { formatDate, humanise, toActivityView, updateContent } from "../../format";
-import { projectStates, type Phase, type ProjectState, type ProjectUpdate, type WorkItem } from "../../types";
+import { projectStates, type Phase, type ProjectPulseSummary, type ProjectState, type ProjectUpdate, type Requirement, type WorkItem } from "../../types";
 import { useResource } from "../../useResource";
 import { CheckpointDrawer, EditProjectDialog, PhaseDialog, UpdateDialog, WorkItemDialog } from "./ProjectForms";
 
@@ -23,6 +23,8 @@ export function ProjectPage() {
   const { projectId = "" } = useParams();
   const navigate = useNavigate();
   const detail = useResource(() => api.getProject(projectId), [projectId]);
+  const operationalPulse = useResource(() => api.getPulseSummary(projectId), [projectId]);
+  const requirements = useResource(() => api.listRequirementsPage(projectId, 8), [projectId]);
   const allPhases = useResource(() => api.listPhases(projectId, true), [projectId]);
   const globalLabels = useResource(() => api.listLabels(), []);
   const [panel, setPanel] = useState<Panel>(null);
@@ -55,7 +57,7 @@ export function ProjectPage() {
     setMutationError(null);
     try {
       await api.updateProject(project, { expectedVersion: project.version, state });
-      await detail.reload();
+      await Promise.all([detail.reload(), operationalPulse.reload()]);
     } catch (cause) {
       setMutationError(cause instanceof Error ? cause.message : "Could not change project state");
     }
@@ -66,7 +68,7 @@ export function ProjectPage() {
     try {
       await api.setArchived(project, !project.archivedAt);
       if (!project.archivedAt) navigate("/archive");
-      else await detail.reload();
+      else await Promise.all([detail.reload(), operationalPulse.reload()]);
     } catch (cause) {
       setMutationError(cause instanceof Error ? cause.message : "Could not change archive state");
     }
@@ -76,7 +78,7 @@ export function ProjectPage() {
     setMutationError(null);
     try {
       await api.updatePhase(phase, { archived: false });
-      await Promise.all([detail.reload(), allPhases.reload()]);
+      await Promise.all([detail.reload(), allPhases.reload(), operationalPulse.reload()]);
     } catch (cause) {
       setMutationError(cause instanceof Error ? cause.message : "Could not restore the phase");
     }
@@ -87,7 +89,7 @@ export function ProjectPage() {
     setMutationError(null);
     try {
       await api.deleteUpdate(update);
-      await detail.reload();
+      await Promise.all([detail.reload(), operationalPulse.reload()]);
     } catch (cause) {
       setMutationError(cause instanceof Error ? cause.message : "Could not delete the update");
     }
@@ -125,6 +127,15 @@ export function ProjectPage() {
           <PulseValue accent="grey" label="Blockers" value={pulse.blockers.length ? pulse.blockers.join("; ") : "No blockers recorded"} />
         </div>
       </section>
+
+      <OperationalMemoryPanel
+        error={operationalPulse.error ?? requirements.error}
+        loading={operationalPulse.loading || requirements.loading}
+        onRetry={() => void Promise.all([operationalPulse.reload(), requirements.reload()])}
+        pulse={operationalPulse.data}
+        requirements={requirements.data?.items ?? []}
+        requirementsLoading={requirements.loading}
+      />
 
       <section aria-labelledby="phases-heading" className="phases-section">
         <div className="section-heading-row">
@@ -174,12 +185,33 @@ export function ProjectPage() {
         {updates.length ? <div className="journal-list">{updates.map((update) => <JournalEntry canDelete={project.currentCheckpointId !== update.id} key={update.id} update={update} onDelete={() => void deleteUpdate(update)} onEdit={() => setPanel({ type: "update", update })} />)}</div> : <EmptyState title="Nothing recorded yet">Add an update or record a checkpoint to begin the journal.</EmptyState>}
       </section>
 
-      {panel?.type === "checkpoint" ? <CheckpointDrawer project={project} onClose={() => setPanel(null)} onSaved={detail.reload} /> : null}
-      {panel?.type === "edit-project" ? <EditProjectDialog project={project} onClose={() => setPanel(null)} onSaved={detail.reload} /> : null}
-      {panel?.type === "phase" ? <PhaseDialog projectId={project.id} phase={panel.phase} onClose={() => setPanel(null)} onSaved={async () => { await Promise.all([detail.reload(), allPhases.reload()]); }} /> : null}
-      {panel?.type === "work-item" ? <WorkItemDialog projectId={project.id} item={panel.item} phases={sortedPhases} labels={globalLabels.data ?? detail.data.labels} onClose={() => setPanel(null)} onSaved={async () => { await Promise.all([detail.reload(), globalLabels.reload()]); }} /> : null}
-      {panel?.type === "update" ? <UpdateDialog projectId={project.id} update={panel.update} onClose={() => setPanel(null)} onSaved={detail.reload} /> : null}
+      {panel?.type === "checkpoint" ? <CheckpointDrawer project={project} onClose={() => setPanel(null)} onSaved={async () => { await Promise.all([detail.reload(), operationalPulse.reload()]); }} /> : null}
+      {panel?.type === "edit-project" ? <EditProjectDialog project={project} onClose={() => setPanel(null)} onSaved={async () => { await Promise.all([detail.reload(), operationalPulse.reload()]); }} /> : null}
+      {panel?.type === "phase" ? <PhaseDialog projectId={project.id} phase={panel.phase} onClose={() => setPanel(null)} onSaved={async () => { await Promise.all([detail.reload(), allPhases.reload(), operationalPulse.reload()]); }} /> : null}
+      {panel?.type === "work-item" ? <WorkItemDialog projectId={project.id} item={panel.item} phases={sortedPhases} labels={globalLabels.data ?? detail.data.labels} onClose={() => setPanel(null)} onSaved={async () => { await Promise.all([detail.reload(), globalLabels.reload(), operationalPulse.reload()]); }} /> : null}
+      {panel?.type === "update" ? <UpdateDialog projectId={project.id} update={panel.update} onClose={() => setPanel(null)} onSaved={async () => { await Promise.all([detail.reload(), operationalPulse.reload()]); }} /> : null}
     </div>
+  );
+}
+
+function OperationalMemoryPanel({ pulse, requirements, loading, requirementsLoading, error, onRetry }: { pulse: ProjectPulseSummary | null; requirements: Requirement[]; loading: boolean; requirementsLoading: boolean; error: Error | null; onRetry: () => void }) {
+  const blocked = pulse?.queueHead.filter((item) => item.effectiveBlocked).length ?? 0;
+  const status = error ? "Unavailable" : loading ? "Loading…" : "Live";
+  return (
+    <section aria-labelledby="operational-memory-heading" className="operational-memory-section">
+      <div className="section-heading-row"><div><h2 className="section-kicker" id="operational-memory-heading">Operational memory</h2><p>Trace intent through work and verification.</p></div><span className="operational-memory__status">{status}</span></div>
+      {error ? <ErrorNotice error={error} onRetry={onRetry} /> : pulse ? (
+        <>
+          <div className="operational-memory-grid">
+            <div className="operational-memory-card"><span>Requirements</span><strong>{pulse.requirementRollup.total}</strong><small>{pulse.requirementRollup.bySemantic.proven} proven · {pulse.requirementRollup.gateFailures} gate failures · {pulse.requirementRollup.defects} defects</small></div>
+            <div className="operational-memory-card"><span>Queue head</span><strong>{pulse.queueHead.length}</strong><small>{blocked} effectively blocked</small></div>
+            <div className="operational-memory-card"><span>External blockers</span><strong>{pulse.blockers.length}</strong><small>Unresolved operational blockers</small></div>
+            <div className="operational-memory-card"><span>Stale evidence</span><strong>{pulse.staleEvidenceCount}</strong><small>{pulse.failedEvidenceCount} failed verification</small></div>
+          </div>
+          {requirementsLoading ? <p className="operational-memory__empty">Loading requirement ledger…</p> : requirements.length ? <div className="operational-memory__requirements"><h3>Requirement ledger</h3><ul>{requirements.map((requirement) => <li key={requirement.id}><strong>{requirement.stableKey}</strong><span>{requirement.title}</span><em className={`requirement-gate requirement-gate--${requirement.gate}`}>{humanise(requirement.gate)}</em></li>)}</ul></div> : <p className="operational-memory__empty">No requirements recorded yet. Add goals or acceptance criteria when this project needs traceability.</p>}
+        </>
+      ) : <p className="operational-memory__empty">Loading operational memory…</p>}
+    </section>
   );
 }
 

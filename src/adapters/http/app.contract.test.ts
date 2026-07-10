@@ -2,26 +2,25 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { FastifyInstance } from 'fastify'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ExportBundle } from '../../application/ports.js'
 import { createRuntime } from '../../infrastructure/runtime.js'
 import { buildHttpApp } from './app.js'
 
 describe('HTTP API contract', () => {
   let app: FastifyInstance
-  let closeRuntime: () => void
+  let runtime: Awaited<ReturnType<typeof createRuntime>>
   let dataDir: string
 
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), 'istra-http-test-'))
-    const runtime = await createRuntime({ dataDir })
-    closeRuntime = runtime.close
+    runtime = await createRuntime({ dataDir })
     app = await buildHttpApp({ service: runtime.service })
   })
 
   afterEach(async () => {
     await app.close()
-    closeRuntime()
+    runtime.close()
     await rm(dataDir, { recursive: true, force: true })
   })
 
@@ -162,7 +161,7 @@ describe('HTTP API contract', () => {
     expect(exportResponse.statusCode).toBe(200)
     expect(exportResponse.headers['content-disposition']).toContain('attachment;')
     const exported = exportResponse.json() as ExportBundle
-    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 1 })
+    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 2 })
     expect(exported).not.toHaveProperty('data')
 
     const importResponse = await app.inject({
@@ -171,7 +170,7 @@ describe('HTTP API contract', () => {
       headers: jsonHeaders,
       payload: exported,
     })
-    expect(importResponse.statusCode).toBe(200)
+    expect(importResponse.statusCode, JSON.stringify(importResponse.json())).toBe(200)
     expect(importResponse.json()).toEqual({ data: { imported: true } })
 
     const secondExport = await app.inject({
@@ -255,5 +254,121 @@ describe('HTTP API contract', () => {
     expect(restoreResponse.json()).toMatchObject({
       error: { code: 'NOT_FOUND', message: expect.any(String) },
     })
+  })
+
+  it('normalises idempotency keys for operational writes', async () => {
+    const project = await createProject('Operational project')
+    const payload = { stableKey: 'REQ-1', kind: 'requirement', title: 'Durable requirement' }
+
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${project.id}/requirements`,
+      headers: { ...jsonHeaders, 'idempotency-key': '  requirement-key  ' },
+      payload,
+    })
+    const replay = await app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${project.id}/requirements`,
+      headers: { ...jsonHeaders, 'idempotency-key': 'requirement-key' },
+      payload,
+    })
+
+    expect(first.statusCode).toBe(200)
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data.id).toBe(first.json().data.id)
+  })
+
+  it('backs up operational writes', async () => {
+    const project = await createProject('Backed-up operational project')
+    const beforeWrite = vi.spyOn(runtime.backupManager, 'beforeWrite').mockResolvedValue()
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${project.id}/requirements`,
+      headers: jsonHeaders,
+      payload: { stableKey: 'REQ-2', kind: 'requirement', title: 'Backed-up requirement' },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(beforeWrite).toHaveBeenCalledTimes(1)
+  })
+
+  it('backs up every operational mutation path', async () => {
+    const project = await createProject('Operational mutation coverage')
+    const firstWorkItem = await runtime.service.createWorkItem(project.id, { kind: 'task', title: 'First linked task' })
+    const secondWorkItem = await runtime.service.createWorkItem(project.id, { kind: 'task', title: 'Second linked task' })
+    const checkpoint = await runtime.service.saveCheckpoint(project.id, { expectedVersion: project.version, content: 'Snapshot source' })
+    const beforeWrite = vi.spyOn(runtime.backupManager, 'beforeWrite').mockResolvedValue()
+
+    const state = await runtime.service.createRequirementState(project.id, { name: 'Reviewing', semantic: 'partial' }, 'state-key', 'test')
+    const requirement = await runtime.service.createRequirement(project.id, { stableKey: 'REQ-ALL', kind: 'requirement', title: 'Covered requirement', stateId: state.id })
+    await runtime.service.updateRequirement(requirement.id, { expectedVersion: requirement.version, title: 'Updated requirement' })
+    await runtime.service.linkRequirementWork(project.id, requirement.id, firstWorkItem.id)
+    await runtime.service.unlinkRequirementWork(requirement.id, firstWorkItem.id)
+    await runtime.service.createWorkQueue(project.id, { name: 'Secondary queue' }, 'queue-key', 'test')
+    const relation = await runtime.service.linkWorkItems(project.id, { fromWorkItemId: firstWorkItem.id, toWorkItemId: secondWorkItem.id, kind: 'relates_to' })
+    await runtime.service.unlinkWorkItems(relation.id)
+    const blocker = await runtime.service.createExternalBlocker(project.id, { content: 'External dependency' }, 'blocker-key', 'test')
+    await runtime.service.resolveExternalBlocker(blocker.id)
+    const workspace = await runtime.service.createWorkspace({ name: 'Coverage workspace', canonicalRoot: join(dataDir, 'workspace') })
+    await runtime.service.linkProjectWorkspace(project.id, workspace.id, 'workspace-link-key', 'test')
+    const revision = await runtime.service.createWorkspaceRevision({ workspaceId: workspace.id, dirty: false })
+    const run = await runtime.service.createRun(project.id, { workspaceRevisionId: revision.id, command: 'pnpm test' }, 'run-key', 'test')
+    await runtime.service.createEvidence(project.id, { runId: run.run.id, result: 'verified', summary: 'Tests passed' })
+    await runtime.service.captureCheckpointSnapshot(project.id, checkpoint.id, 'snapshot-key', 'test')
+
+    expect(beforeWrite).toHaveBeenCalledTimes(16)
+  })
+
+  it('applies search filters before the requested result limit', async () => {
+    const otherProject = await createProject('Other search project')
+    for (let index = 0; index < 201; index += 1) {
+      await runtime.service.createPhase(otherProject.id, { name: `needle ${index}`, description: 'needle needle' })
+    }
+    const targetProject = await createProject('Target search project')
+    const targetPhase = await runtime.service.createPhase(targetProject.id, { name: 'Target phase', description: 'needle' })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/v1/search?q=needle&limit=1&projectId=${targetProject.id}&entityTypes=phase`,
+      headers: { host: 'localhost:4317' },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().data).toEqual([
+      expect.objectContaining({ id: targetPhase.id, projectId: targetProject.id, type: 'phase' }),
+    ])
+  })
+
+  it('excludes core search results that do not match state filters', async () => {
+    const project = await createProject('State-filtered search project')
+    const openItem = await runtime.service.createWorkItem(project.id, { kind: 'task', title: 'shared search term', status: 'open' })
+    const resolvedItem = await runtime.service.createWorkItem(project.id, { kind: 'task', title: 'shared search term', status: 'resolved' })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/v1/search?q=shared&projectId=${project.id}&entityTypes=work_item&state=resolved`,
+      headers: { host: 'localhost:4317' },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().data).toEqual([
+      expect.objectContaining({ id: resolvedItem.id, projectId: project.id, type: 'work_item' }),
+    ])
+    expect(response.json().data).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: openItem.id }),
+    ]))
+  })
+
+  it('returns not-found errors for missing checkpoint snapshot resources', async () => {
+    const checkpointId = '00000000-0000-4000-8000-000000000000'
+    for (const suffix of ['snapshot', 'state']) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/v1/checkpoints/${checkpointId}/${suffix}`,
+        headers: { host: 'localhost:4317' },
+      })
+      expect(response.statusCode).toBe(404)
+      expect(response.json()).toMatchObject({ error: { code: 'NOT_FOUND' } })
+    }
   })
 })

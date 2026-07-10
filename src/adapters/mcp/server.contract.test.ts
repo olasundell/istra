@@ -125,4 +125,48 @@ describe('MCP server contract', () => {
     }))
     expect(runtime.service.getProject(mcpProject.id)?.project.title).toBe('Visible to HTTP services')
   })
+
+  it('preserves existing MCP write call shapes without idempotency keys', async () => {
+    const project = structured<Project>(await client.callTool({
+      name: 'create_project',
+      arguments: { title: 'Backwards-compatible project' },
+    }))
+    const phase = await client.callTool({
+      name: 'create_phase',
+      arguments: { projectId: project.id, name: 'Compatibility phase' },
+    })
+    const workItem = await client.callTool({
+      name: 'create_work_item',
+      arguments: { projectId: project.id, kind: 'task', title: 'Compatibility task' },
+    })
+    const update = structured<{ id: string; version: number }>(await client.callTool({
+      name: 'create_update',
+      arguments: { projectId: project.id, kind: 'progress', content: 'Initial update' },
+    }))
+    const revision = await client.callTool({
+      name: 'revise_update',
+      arguments: { updateId: update.id, expectedVersion: update.version, content: 'Revised update' },
+    })
+    const checkpoint = await client.callTool({
+      name: 'save_checkpoint',
+      arguments: { projectId: project.id, expectedVersion: project.version, content: 'Compatibility checkpoint' },
+    })
+
+    for (const response of [phase, workItem, revision, checkpoint]) expect(response.isError).not.toBe(true)
+  })
+
+  it('returns tool errors for missing nullable resources', async () => {
+    const missingId = '00000000-0000-4000-8000-000000000000'
+    const calls = [
+      { name: 'get_project_pulse_summary', arguments: { projectId: missingId } },
+      { name: 'get_requirement', arguments: { requirementId: missingId } },
+      { name: 'get_checkpoint_snapshot', arguments: { checkpointId: missingId } },
+      { name: 'reconstruct_checkpoint_state', arguments: { checkpointId: missingId } },
+    ]
+
+    for (const call of calls) {
+      const response = await client.callTool(call)
+      expect(response.isError).toBe(true)
+    }
+  })
 })

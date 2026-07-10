@@ -26,3 +26,9 @@ export class ValidationError extends AppError {
     super('VALIDATION_ERROR', message, 400, details)
   }
 }
+
+export class IdempotencyConflictError extends AppError {
+  constructor(key: string) {
+    super('IDEMPOTENCY_CONFLICT', `Idempotency key ${key} was already used with different input`, 409)
+  }
+}

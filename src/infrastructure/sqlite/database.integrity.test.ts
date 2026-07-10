@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { openIstraDatabase, type OpenDatabaseResult } from './database.js'
+import { migrations } from './migrations.js'
 
 describe('SQLite database integrity', () => {
   const directories: string[] = []
@@ -37,6 +38,25 @@ describe('SQLite database integrity', () => {
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(randomUUID(), randomUUID(), 'Orphan', 'planned', new Date().toISOString(), new Date().toISOString())
     }).toThrow()
+  })
+
+  it('backfills legacy work into the default queue and responsible phase projection', () => {
+    const db = new DatabaseSync(':memory:')
+    databases.push(db)
+    db.exec('PRAGMA foreign_keys=ON')
+    for (const migration of migrations.filter(({ version }) => version <= 3)) db.exec(migration.sql)
+    const timestamp = '2026-07-10T08:00:00.000Z'
+    const projectId = randomUUID()
+    const phaseId = randomUUID()
+    const workItemId = randomUUID()
+    db.prepare("INSERT INTO projects(id,title,state,created_at,updated_at) VALUES (?,?,'active',?,?)").run(projectId, 'Legacy project', timestamp, timestamp)
+    db.prepare("INSERT INTO phases(id,project_id,name,status,created_at,updated_at) VALUES (?,?,?,'active',?,?)").run(phaseId, projectId, 'Legacy phase', timestamp, timestamp)
+    db.prepare("INSERT INTO work_items(id,project_id,phase_id,kind,title,status,created_at,updated_at) VALUES (?,?,?,'task',?,'open',?,?)").run(workItemId, projectId, phaseId, 'Legacy work', timestamp, timestamp)
+
+    db.exec(migrations.find(({ version }) => version === 4)!.sql)
+
+    expect(db.prepare('SELECT q.project_id,i.work_item_id FROM work_queue_items i JOIN work_queues q ON q.id=i.queue_id WHERE i.work_item_id=?').get(workItemId)).toEqual({ project_id: projectId, work_item_id: workItemId })
+    expect(db.prepare('SELECT phase_id,role FROM work_phase_links WHERE work_item_id=?').get(workItemId)).toEqual({ phase_id: phaseId, role: 'responsible' })
   })
 
   it('rejects a current checkpoint that is missing, deleted, the wrong kind, or owned by another project', async () => {
