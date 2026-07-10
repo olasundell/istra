@@ -67,20 +67,38 @@ Build the self-contained plugin runtime with:
 pnpm build:plugin
 ```
 
-The resulting `plugins/istra/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Its `.mcp.json` uses the same platform data directory and `ISTRA_DATA_DIR` override as the web application, so the plugin does not create a second data path.
+The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Its `.mcp.json` uses the same platform data directory and `ISTRA_DATA_DIR` override as the web application, so the plugin does not create a second data path.
+
+## OpenCode plugin
+
+The same `plugins/istra` directory is an npm package named `opencode-istra`. Once published, install it globally with:
+
+```bash
+opencode plugin opencode-istra --global
+```
+
+The OpenCode entrypoint adds the bundled local `istra` MCP server and the Istra project-memory instructions. It preserves a pre-existing `mcp.istra` configuration, and uses the same default data directory and `ISTRA_DATA_DIR` override as the application.
+
+For local development before publishing, add the absolute `plugins/istra` path to the `plugin` array in `opencode.json`:
+
+```json
+{
+  "plugin": ["/absolute/path/to/Istra/plugins/istra"]
+}
+```
 
 ## Commands
 
 ```bash
 pnpm dev            # API and Vite development servers
 pnpm build          # server and production web build
-pnpm build:plugin   # self-contained MCP runtime for the Codex plugin
+pnpm build:plugin   # self-contained MCP runtime and OpenCode server package
 pnpm start          # production-style loopback server
 pnpm migrate        # open the database and apply pending migrations
 pnpm mcp            # stdio MCP server from source
 pnpm typecheck      # browser and server TypeScript checks
 pnpm test           # unit and integration tests
-pnpm test:plugin    # spawn and verify the packaged plugin MCP server
+pnpm test:plugin    # verify the packaged Codex and OpenCode plugins
 pnpm test:e2e       # Playwright browser journeys
 ```
 

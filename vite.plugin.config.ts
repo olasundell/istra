@@ -3,14 +3,18 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   build: {
-    emptyOutDir: true,
+    emptyOutDir: false,
     minify: false,
-    outDir: "plugins/istra/mcp",
-    ssr: resolve(__dirname, "src/adapters/mcp/stdio.ts"),
+    outDir: "plugins/istra/dist",
+    ssr: true,
     target: "node24",
     rollupOptions: {
+      input: {
+        server: resolve(__dirname, "src/adapters/opencode/plugin.ts"),
+        "mcp/stdio": resolve(__dirname, "src/adapters/mcp/stdio.ts"),
+      },
       output: {
-        entryFileNames: "stdio.mjs",
+        entryFileNames: "[name].mjs",
         format: "es",
       },
     },

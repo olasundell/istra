@@ -1,6 +1,10 @@
 node_modules/
 .pnpm-store/
 dist/
+!plugins/
+!plugins/istra/
+!plugins/istra/dist/
+!plugins/istra/dist/**
 dist-web/
 coverage/
 playwright-report/

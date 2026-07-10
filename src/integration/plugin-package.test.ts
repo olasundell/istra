@@ -36,7 +36,7 @@ describe("Codex plugin package", () => {
     );
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ["./mcp/stdio.mjs"],
+      args: ["./dist/mcp/stdio.mjs"],
       cwd: pluginRoot,
       env: { ...environment, ISTRA_DATA_DIR: dataDir },
       stderr: "pipe",

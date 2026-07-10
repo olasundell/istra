@@ -2,7 +2,7 @@
   "mcpServers": {
     "istra": {
       "command": "node",
-      "args": ["./mcp/stdio.mjs"],
+      "args": ["./dist/mcp/stdio.mjs"],
       "cwd": ".",
       "tool_timeout_sec": 120
     }

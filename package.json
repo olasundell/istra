@@ -21,7 +21,7 @@
     "test": "vitest run",
     "test:backend": "vitest run src --exclude 'src/web/**'",
     "test:web": "vitest run src/web",
-    "test:plugin": "vitest run src/integration/plugin-package.test.ts",
+    "test:plugin": "vitest run src/integration/plugin-package.test.ts src/integration/opencode-plugin.test.ts",
     "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json"
   },
@@ -36,6 +36,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.17.18",
     "@playwright/test": "^1.55.0",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
