@@ -1,5 +1,5 @@
 import fastifyStatic from '@fastify/static'
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
 import { resolve } from 'node:path'
 import { AppError, NotFoundError, ValidationError } from '../../application/errors.js'
 import type { IstraService } from '../../application/istra-service.js'
@@ -7,7 +7,8 @@ import type { IstraService } from '../../application/istra-service.js'
 export interface HttpAppOptions {
   service: IstraService
   staticDir?: string
-  logger?: boolean
+  logger?: FastifyServerOptions['logger']
+  readinessCheck?: () => void | Promise<void>
 }
 
 const idParams = (request: { params: unknown }) => request.params as { id: string }
@@ -74,6 +75,15 @@ export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInst
   app.setNotFoundHandler((_request, reply) => reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found' } }))
 
   app.get('/api/v1/health', async () => ({ data: { status: 'ok' } }))
+  app.get('/api/v1/ready', async (_request, reply) => {
+    try {
+      await options.readinessCheck?.()
+      return { data: { status: 'ready' } }
+    } catch (error) {
+      app.log.error(error, 'Readiness check failed')
+      return reply.status(503).send({ error: { code: 'NOT_READY', message: 'Istra is not ready' } })
+    }
+  })
   app.get('/api/v1/projects', async (request) => {
     const query = request.query as { state?: string; includeArchived?: string; q?: string }
     return { data: options.service.listProjects({ state: query.state || undefined, includeArchived: query.includeArchived === 'true', q: query.q }) }

@@ -11,14 +11,21 @@ export interface DatabasePaths {
   backupDir: string
 }
 
-export function resolveDatabasePaths(dataDir = process.env.ISTRA_DATA_DIR): DatabasePaths {
+export function resolveDatabasePaths(
+  dataDir = process.env.ISTRA_DATA_DIR,
+  backupDir = process.env.ISTRA_BACKUP_DIR,
+): DatabasePaths {
   const platformDefault = process.platform === 'darwin'
     ? join(homedir(), 'Library', 'Application Support', 'Istra')
     : process.platform === 'win32'
       ? join(process.env.LOCALAPPDATA ?? homedir(), 'Istra')
       : join(process.env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share'), 'istra')
   const absolute = resolve(dataDir ?? platformDefault)
-  return { dataDir: absolute, databasePath: join(absolute, 'istra.sqlite3'), backupDir: join(absolute, 'backups') }
+  return {
+    dataDir: absolute,
+    databasePath: join(absolute, 'istra.sqlite3'),
+    backupDir: resolve(backupDir ?? join(absolute, 'backups')),
+  }
 }
 
 export interface OpenDatabaseResult {
@@ -184,14 +191,20 @@ function assertCompatibleMigrationHistory(db: DatabaseSync, databasePath: string
   }
 }
 
-export async function openIstraDatabase(options: { dataDir?: string; databasePath?: string } = {}): Promise<OpenDatabaseResult> {
-  const resolved = resolveDatabasePaths(options.dataDir)
+export async function openIstraDatabase(options: { dataDir?: string; databasePath?: string; backupDir?: string } = {}): Promise<OpenDatabaseResult> {
+  const resolved = resolveDatabasePaths(options.dataDir, options.backupDir)
   const databasePath = options.databasePath ? resolve(options.databasePath) : resolved.databasePath
-  const paths = { dataDir: dirname(databasePath), databasePath, backupDir: join(dirname(databasePath), 'backups') }
+  const paths = {
+    dataDir: dirname(databasePath),
+    databasePath,
+    backupDir: options.databasePath && !options.backupDir && !process.env.ISTRA_BACKUP_DIR
+      ? join(dirname(databasePath), 'backups')
+      : resolved.backupDir,
+  }
   await mkdir(paths.dataDir, { recursive: true })
   const existed = await stat(databasePath).then(() => true, () => false)
   const db = new DatabaseSync(databasePath)
-  db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;')
+  db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;')
   const backupManager = new BackupManager(db, paths)
   try {
     assertCompatibleMigrationHistory(db, databasePath)

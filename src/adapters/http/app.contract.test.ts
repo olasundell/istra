@@ -15,7 +15,10 @@ describe('HTTP API contract', () => {
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), 'istra-http-test-'))
     runtime = await createRuntime({ dataDir })
-    app = await buildHttpApp({ service: runtime.service })
+    app = await buildHttpApp({
+      service: runtime.service,
+      readinessCheck: () => { runtime.db.prepare('SELECT 1').get() },
+    })
   })
 
   afterEach(async () => {
@@ -36,6 +39,23 @@ describe('HTTP API contract', () => {
     expect(response.statusCode).toBe(200)
     return response.json().data as { id: string; title: string; version: number }
   }
+
+  it('reports liveness separately from database readiness', async () => {
+    const health = await app.inject({ method: 'GET', url: '/api/v1/health', headers: { host: 'localhost:4317' } })
+    const ready = await app.inject({ method: 'GET', url: '/api/v1/ready', headers: { host: 'localhost:4317' } })
+    expect(health).toMatchObject({ statusCode: 200 })
+    expect(ready.statusCode).toBe(200)
+    expect(ready.json()).toEqual({ data: { status: 'ready' } })
+
+    const unavailable = await buildHttpApp({
+      service: runtime.service,
+      readinessCheck: () => { throw new Error('database unavailable') },
+    })
+    const response = await unavailable.inject({ method: 'GET', url: '/api/v1/ready', headers: { host: 'localhost:4317' } })
+    expect(response.statusCode).toBe(503)
+    expect(response.json()).toEqual({ error: { code: 'NOT_READY', message: 'Istra is not ready' } })
+    await unavailable.close()
+  })
 
   it('rejects foreign hosts, foreign origins and non-JSON mutations', async () => {
     const foreignHost = await app.inject({ method: 'GET', url: '/api/v1/health', headers: { host: 'istra.example.com' } })

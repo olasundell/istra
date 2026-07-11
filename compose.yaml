@@ -1,0 +1,42 @@
+services:
+  istra:
+    build:
+      context: .
+    image: istra:local
+    init: true
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "4317"
+      ISTRA_HOST: 0.0.0.0
+      ISTRA_LOG_LEVEL: info
+      ISTRA_DATA_DIR: /var/lib/istra
+      ISTRA_BACKUP_DIR: /var/backups/istra
+      ISTRA_STATIC_DIR: /app/dist-web
+    ports:
+      - "127.0.0.1:${ISTRA_PORT:-4317}:4317"
+    volumes:
+      - istra-data:/var/lib/istra
+      - istra-backups:/var/backups/istra
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:4317/api/v1/ready').then(response=>{if(!response.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 15s
+
+volumes:
+  istra-data:
+  istra-backups:

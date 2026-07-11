@@ -31,6 +31,7 @@ describe('SQLite database integrity', () => {
     expect((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys).toBe(1)
     expect((db.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode).toBe('wal')
     expect((db.prepare('PRAGMA busy_timeout').get() as { timeout: number }).timeout).toBe(5_000)
+    expect((db.prepare('PRAGMA synchronous').get() as { synchronous: number }).synchronous).toBe(2)
 
     expect(() => {
       db.prepare(`
@@ -38,6 +39,20 @@ describe('SQLite database integrity', () => {
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(randomUUID(), randomUUID(), 'Orphan', 'planned', new Date().toISOString(), new Date().toISOString())
     }).toThrow()
+  })
+
+  it('can keep automatic backups outside the primary data directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'istra-separated-backups-'))
+    directories.push(root)
+    const dataDir = join(root, 'data')
+    const backupDir = join(root, 'backups')
+    const result = await openIstraDatabase({ dataDir, backupDir })
+    databases.push(result.db)
+
+    await result.backupManager.beforeWrite()
+
+    expect(result.paths).toMatchObject({ dataDir, backupDir })
+    expect(await result.backupManager.list()).toHaveLength(2)
   })
 
   it('creates the complete authoritative schema including the global error inbox', async () => {

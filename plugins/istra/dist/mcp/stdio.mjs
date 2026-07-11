@@ -10486,10 +10486,14 @@ const migrations = [{
     CREATE INDEX error_reports_project_created ON error_reports(project_id, created_at DESC, id DESC);
   `
 }];
-function resolveDatabasePaths(dataDir = process.env.ISTRA_DATA_DIR) {
+function resolveDatabasePaths(dataDir = process.env.ISTRA_DATA_DIR, backupDir = process.env.ISTRA_BACKUP_DIR) {
   const platformDefault = process.platform === "darwin" ? join(homedir(), "Library", "Application Support", "Istra") : process.platform === "win32" ? join(process.env.LOCALAPPDATA ?? homedir(), "Istra") : join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "istra");
   const absolute = resolve$1(dataDir ?? platformDefault);
-  return { dataDir: absolute, databasePath: join(absolute, "istra.sqlite3"), backupDir: join(absolute, "backups") };
+  return {
+    dataDir: absolute,
+    databasePath: join(absolute, "istra.sqlite3"),
+    backupDir: resolve$1(backupDir ?? join(absolute, "backups"))
+  };
 }
 function isoFileTimestamp(date2 = /* @__PURE__ */ new Date()) {
   return date2.toISOString().replaceAll(":", "-").replaceAll(".", "-");
@@ -10650,13 +10654,17 @@ function assertCompatibleMigrationHistory(db, databasePath) {
   }
 }
 async function openIstraDatabase(options = {}) {
-  const resolved = resolveDatabasePaths(options.dataDir);
+  const resolved = resolveDatabasePaths(options.dataDir, options.backupDir);
   const databasePath = options.databasePath ? resolve$1(options.databasePath) : resolved.databasePath;
-  const paths = { dataDir: dirname(databasePath), databasePath, backupDir: join(dirname(databasePath), "backups") };
+  const paths = {
+    dataDir: dirname(databasePath),
+    databasePath,
+    backupDir: options.databasePath && !options.backupDir && !process.env.ISTRA_BACKUP_DIR ? join(dirname(databasePath), "backups") : resolved.backupDir
+  };
   await mkdir(paths.dataDir, { recursive: true });
   const existed = await stat(databasePath).then(() => true, () => false);
   const db = new DatabaseSync(databasePath);
-  db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;");
+  db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;");
   const backupManager = new BackupManager(db, paths);
   try {
     assertCompatibleMigrationHistory(db, databasePath);
