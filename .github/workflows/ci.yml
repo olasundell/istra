@@ -12,7 +12,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v4
         with:
           version: 11.11.0
@@ -45,7 +45,7 @@ jobs:
       POSTGRES_PASSWORD: istra-ci-only
       ISTRA_COMPOSE_DATABASE_URL: postgresql://istra:istra-ci-only@postgres:5432/istra
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build and start the production service
         run: docker compose up --build --detach --wait
       - name: Smoke-test the loopback service
