@@ -1,7 +1,12 @@
 import { expect, test } from "@playwright/test";
 
 test("durable project memory journey", async ({ page }) => {
-  const title = `Signal Garden ${Date.now()}`;
+  const suffix = Date.now();
+  const title = `Signal Garden ${suffix}`;
+  const labelName = `field-test-${suffix}`;
+  const updateMarker = `signal${suffix}`;
+  const updateContent = `Adaptive filtering reduced false positives in high wind. ${updateMarker}`;
+  const revisedUpdateContent = `Adaptive filtering reduced false positives in high wind and rain. ${updateMarker}`;
   await page.goto("/");
 
   await page.getByRole("button", { name: "New project" }).click();
@@ -18,12 +23,14 @@ test("durable project memory journey", async ({ page }) => {
   await expect(page.getByLabel("Project state")).toHaveValue("active");
 
   await page.getByRole("button", { name: "Record checkpoint" }).click();
-  await page.getByLabel("What changed?").fill("Deployed firmware v0.3.2 to the field mesh and reduced false positives.");
-  await page.getByLabel("Current focus").fill("Adaptive antenna array firmware");
-  await page.getByLabel("Next action").fill("Implement phase calibration routine");
-  await page.getByLabel("Blockers").fill("Waiting on low-noise amplifiers");
-  await page.getByRole("button", { name: "Save checkpoint" }).click();
-  await expect(page.getByText("Adaptive antenna array firmware", { exact: true })).toBeVisible();
+  const checkpointDialog = page.getByRole("dialog", { name: "Record checkpoint" });
+  await checkpointDialog.getByLabel("What changed?").fill("Deployed firmware v0.3.2 to the field mesh and reduced false positives.");
+  await checkpointDialog.getByLabel("Current focus").fill("Adaptive antenna array firmware");
+  await checkpointDialog.getByLabel("Next action").fill("Implement phase calibration routine");
+  await checkpointDialog.getByLabel("Blockers").fill("Waiting on low-noise amplifiers");
+  await checkpointDialog.getByRole("button", { name: "Save checkpoint" }).click();
+  await expect(checkpointDialog).toBeHidden();
+  await expect(page.getByRole("region", { name: "Current pulse" }).getByText("Adaptive antenna array firmware", { exact: true })).toBeVisible();
 
   for (const phaseName of ["Field mesh", "Power study"]) {
     await page.getByRole("button", { name: "Add phase" }).click();
@@ -41,26 +48,27 @@ test("durable project memory journey", async ({ page }) => {
   await workItemDialog.getByLabel("Status").selectOption("in_progress");
   await workItemDialog.getByLabel("Priority").selectOption("high");
   await workItemDialog.getByRole("combobox", { name: "Phase" }).selectOption({ label: "Field mesh" });
-  await workItemDialog.getByLabel("Create and assign a new label").fill("field-test");
+  await workItemDialog.getByLabel("Create and assign a new label").fill(labelName);
   await workItemDialog.getByRole("button", { name: "Save work item" }).click();
-  await expect(page.getByText("field-test", { exact: true })).toBeVisible();
+  await expect(workItemDialog).toBeHidden();
+  await expect(page.getByRole("cell", { name: `Resolve calibration drift ${labelName}`, exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "Add update" }).click();
   const updateDialog = page.getByRole("dialog");
   await updateDialog.getByLabel("Update type").selectOption("progress");
-  await updateDialog.getByLabel("What happened?").fill("Adaptive filtering reduced false positives in high wind.");
+  await updateDialog.getByLabel("What happened?").fill(updateContent);
   await updateDialog.getByRole("button", { name: "Add update" }).click();
   const progressEntry = page.locator(".journal-entry--progress");
-  await expect(progressEntry).toContainText("Adaptive filtering reduced false positives");
+  await expect(progressEntry).toContainText(updateContent);
   await progressEntry.getByRole("button", { name: "Revise update" }).click();
-  await page.getByLabel("What happened?").fill("Adaptive filtering reduced false positives in high wind and rain.");
+  await page.getByLabel("What happened?").fill(revisedUpdateContent);
   await page.getByRole("button", { name: "Save revision" }).click();
-  await expect(progressEntry).toContainText("high wind and rain");
+  await expect(progressEntry).toContainText(revisedUpdateContent);
 
   await page.getByRole("link", { name: "Search" }).click();
-  await page.getByLabel("Search all project memory").fill("false positives");
+  await page.getByLabel("Search all project memory").fill(updateMarker);
   await page.getByRole("button", { name: "Search" }).click();
-  await expect(page.getByText(/high wind and rain/i)).toBeVisible();
+  await expect(page.getByText(revisedUpdateContent, { exact: true })).toBeVisible();
 
   await page.goto(projectUrl);
   await page.getByRole("button", { name: "Archive", exact: true }).click();
