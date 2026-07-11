@@ -24,15 +24,16 @@ Most tools capture tasks. Istra captures continuity.
 - **Operational memory** — Trace intent through requirements, work queues, external blockers, runs and evidence.
 - **Durable journal** — Record progress, decisions, discoveries and checkpoints with revision history.
 - **Searchable by default** — Find a project, phase, work item or remembered decision without reconstructing the story.
-- **Local and calm** — SQLite, loopback-only HTTP, portable exports and backups; no accounts, remote sync or collaboration layer required.
+- **Local and calm** — Zero-configuration SQLite or local PostgreSQL, loopback-only HTTP and portable exports; no accounts, remote sync or collaboration layer required.
 - **Agent-ready** — Use the same application service from the web UI, MCP, Codex and OpenCode.
 
 Istra is designed for the moment after the meeting, the interrupted investigation or the half-finished build: the important thing is not only what exists, but why it exists, what was proved, and what should happen next.
 
 ## Requirements
 
-- Node.js 24 LTS or Node.js 26 (Istra uses the built-in `node:sqlite` module)
+- Node.js 24 LTS or Node.js 26 (SQLite uses the built-in `node:sqlite` module)
 - pnpm 11.11.0
+- Docker Compose when using the local PostgreSQL service
 
 The repository's `.nvmrc`, package metadata, container image and CI all use the Node.js 24 compatibility baseline.
 
@@ -54,18 +55,38 @@ pnpm start
 
 The production server serves both the UI and API at `http://127.0.0.1:4317`.
 
-## Run with Docker Compose
+## Run PostgreSQL with Docker Compose
 
-Docker Compose provides a hardened, reproducible single-user deployment:
+SQLite remains the zero-configuration default. To share PostgreSQL between the host-run API, Codex MCP and OpenCode MCP, start only the PostgreSQL service:
 
 ```bash
 cp .env.example .env
-docker compose up --build --detach --wait
+chmod 600 .env
+docker compose up --detach --wait postgres
+docker compose ps postgres
 ```
 
-Open `http://127.0.0.1:4317`. The service runs as a non-root user, publishes only on host loopback, persists the database and backups in separate named volumes, and exposes liveness and SQLite readiness checks.
+PostgreSQL is published on host loopback only, using port `5433` by default, and persists data in the `istra-postgres-data` named volume. Set the same private password in `POSTGRES_PASSWORD` and the percent-encoded password portions of `ISTRA_DATABASE_URL` and `ISTRA_COMPOSE_DATABASE_URL`. The host URL uses `127.0.0.1:5433`; the container URL uses `postgres:5432`. Then load the ignored file into the maintenance shell and migrate:
 
-Compose is an isolated app deployment, not the default development topology. Host-run Codex and OpenCode plugins cannot share its named-volume database, and the unauthenticated API must not be exposed to a LAN or the internet. Do not run more than one Istra container against the same SQLite database.
+```bash
+set -a
+. ./.env
+set +a
+pnpm storage:migrate:postgres
+pnpm storage:status
+```
+
+The migration command is the supported SQLite-to-PostgreSQL cutover path. It verifies the copied data before atomically selecting PostgreSQL in the platform-local Istra configuration. Environment variables override that shared configuration.
+
+The `istra` Compose service uses the Compose PostgreSQL service and waits for its health check. Starting the application service also starts PostgreSQL:
+
+```bash
+docker compose up --build --detach --wait istra
+```
+
+Open `http://127.0.0.1:4317`. The application container runs as a non-root user, publishes only on host loopback, and connects to PostgreSQL over the private Compose network at `postgres:5432`.
+
+Do not start the application during a host-side migration into the same PostgreSQL database. The unauthenticated API and database ports must not be exposed to a LAN or the internet.
 
 See [Operating Istra](docs/operations.md) for configuration, upgrades, logs, off-volume backups and restore steps.
 
@@ -77,15 +98,15 @@ The default database path is platform-specific:
 - Linux: `${XDG_DATA_HOME:-~/.local/share}/istra/istra.sqlite3`
 - Windows: `%LOCALAPPDATA%\Istra\istra.sqlite3`
 
-Set `ISTRA_DATA_DIR` to keep the database elsewhere and `ISTRA_BACKUP_DIR` to separate its snapshots. Istra enables foreign keys, WAL mode and full synchronous durability, takes daily and weekly online snapshots before the first write, and creates dedicated snapshots before migrations and imports.
+Set `ISTRA_DATA_DIR` to keep SQLite elsewhere and `ISTRA_BACKUP_DIR` to separate its snapshots. Istra enables foreign keys, WAL mode and full synchronous durability, takes daily and weekly online snapshots before the first write, and creates dedicated snapshots before migrations and imports.
 
-Use the Data management view for a portable, versioned JSON export or a full replacement import. Import validates the bundle before changing active data and takes a pre-import backup. Import is intentionally not a merge operation.
+Use the Data management view for a portable, versioned JSON export. SQLite supports validated full-replacement import and creates a pre-import snapshot. PostgreSQL automated backups and destructive full-replacement imports are deferred; export remains available, but PostgreSQL reports backups as unavailable and rejects replacement import.
 
-The authoritative ledger starts at migration v1 and adds the global error-report inbox in v2. Existing databases with the matching v1 history upgrade automatically after a pre-migration backup; incompatible legacy histories still fail closed and are never deleted automatically. Istra exports format v4, accepts v3 and v4 imports, and treats a v3 import as a full replacement with an empty error inbox.
+The authoritative ledger starts at migration v1 and adds the global error-report inbox in v2; PostgreSQL v3 adds indexed accent-insensitive search parity. Existing databases with matching migration history upgrade transactionally; SQLite takes a pre-migration snapshot first, while incompatible legacy histories fail closed and are never deleted automatically. Istra exports format v4, accepts v3 and v4 SQLite imports, and treats a v3 import as a full replacement with an empty error inbox.
 
 ## MCP
 
-The stdio MCP server uses the same application service and database as the UI:
+The stdio MCP server uses the same application service and storage selection as the UI:
 
 ```bash
 pnpm mcp
@@ -113,7 +134,7 @@ Build the self-contained plugin runtime with:
 pnpm build:plugin
 ```
 
-The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Its `.mcp.json` uses the same platform data directory and `ISTRA_DATA_DIR` override as the web application, so the plugin does not create a second data path.
+The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Its `.mcp.json` reads the same platform-local storage configuration and environment overrides as the web application, so the plugin does not create a second data path.
 
 ## OpenCode plugin
 
@@ -123,7 +144,7 @@ The same `plugins/istra` directory is an npm package named `opencode-istra`. Onc
 opencode plugin opencode-istra --global
 ```
 
-The OpenCode entrypoint adds the bundled local `istra` MCP server and matching operational project-memory instructions. It preserves a pre-existing `mcp.istra` configuration, and uses the same default data directory and `ISTRA_DATA_DIR` override as the application.
+The OpenCode entrypoint adds the bundled local `istra` MCP server and matching operational project-memory instructions. It preserves a pre-existing `mcp.istra` configuration and uses the same shared storage selection as the application.
 
 For local development before publishing, add the absolute `plugins/istra` path to the `plugin` array in `opencode.json`:
 
@@ -142,9 +163,12 @@ pnpm build:app      # server and web build without rebuilding plugin artefacts
 pnpm build:plugin   # self-contained MCP runtime and OpenCode server package
 pnpm start          # production-style loopback server
 pnpm migrate        # open the database and apply pending migrations
+pnpm storage:status # show the selected backend and redacted readiness status
+pnpm storage:migrate:postgres # copy local SQLite data to PostgreSQL and activate it
 pnpm mcp            # stdio MCP server from source
 pnpm typecheck      # browser and server TypeScript checks
 pnpm test           # unit and integration tests
+pnpm test:postgres  # live PostgreSQL suite (requires TEST_DATABASE_URL)
 pnpm check          # typecheck, tests and all production builds
 pnpm test:plugin    # verify the packaged Codex and OpenCode plugins
 pnpm test:e2e       # Playwright browser journeys
@@ -154,7 +178,8 @@ pnpm test:e2e       # Playwright browser journeys
 
 - `src/domain` contains shared contracts and validation schemas.
 - `src/application` contains the use-case service and persistence port.
-- `src/infrastructure/sqlite` contains migrations, repositories, search, imports and backups.
+- `src/infrastructure/sqlite` contains the default local backend, imports and snapshot backups.
+- `src/infrastructure/postgres` contains PostgreSQL migrations, repositories and search.
 - `src/adapters/http` and `src/adapters/mcp` expose the same application service.
 - `src/web` contains the React application.
 

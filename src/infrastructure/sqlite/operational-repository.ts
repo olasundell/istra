@@ -49,6 +49,7 @@ import { evaluateCriterionProof, explainRequirementProof, type CriterionEvidence
 import { assertEvidenceInvariants, assertRunInvariants, validateRunInvariants } from '../../domain/run-invariants.js'
 import { SecretRedactor, type SecretRedactionResult } from '../../application/secret-redactor.js'
 import { canonicalJson, canonicaliseJson } from '../../domain/canonical-json.js'
+import type { Awaitable, OperationalRepository } from '../../application/ports.js'
 
 type Row = Record<string, unknown>
 
@@ -63,51 +64,6 @@ const redactionMetadata = (entries: Array<{ field: string; result: SecretRedacti
   count: entries.reduce((total, entry) => total + entry.result.count, 0),
   fields: [...new Set(entries.flatMap((entry) => entry.result.redactions.map((redaction) => `${entry.field}:${redaction.kind}:${redaction.name}`)))],
 })
-
-export interface OperationalRepository {
-  runMutation<T>(context: MutationContext, operation: string, payload: unknown, work: () => T): T
-  runIdempotent<T>(client: string, key: string, operation: string, payload: unknown, work: () => T): T
-  listRequirementStates(projectId: string): RequirementStateDefinition[]
-  createRequirementState(projectId: string, input: CreateRequirementStateInput): RequirementStateDefinition
-  listRequirements(projectId: string): Requirement[]
-  listRequirementsPage(projectId: string, limit: number, cursor?: string | null): Page<Requirement>
-  getRequirement(id: string): Requirement | null
-  createRequirement(projectId: string, input: CreateRequirementInput): Requirement
-  updateRequirement(id: string, input: UpdateRequirementInput): Requirement
-  linkRequirementWork(projectId: string, requirementId: string, workItemId: string): void
-  unlinkRequirementWork(requirementId: string, workItemId: string): void
-  getRequirementRollup(projectId: string): RequirementRollup
-  listWorkQueues(projectId: string): WorkQueue[]
-  createWorkQueue(projectId: string, input: CreateWorkQueueInput): WorkQueue
-  listWorkItems(projectId: string, queueId?: string): WorkItem[]
-  listWorkItemsPage(projectId: string, limit: number, cursor?: string | null, queueId?: string): Page<WorkItem>
-  linkWorkItems(projectId: string, input: CreateWorkRelationInput): WorkRelation
-  unlinkWorkItems(id: string): void
-  listWorkRelations(projectId: string): WorkRelation[]
-  createExternalBlocker(projectId: string, input: CreateExternalBlockerInput): ExternalBlocker
-  listExternalBlockers(projectId: string, includeResolved?: boolean): ExternalBlocker[]
-  resolveExternalBlocker(id: string): ExternalBlocker
-  createWorkspace(input: CreateWorkspaceInput): Workspace
-  linkProjectWorkspace(projectId: string, workspaceId: string): void
-  createWorkspaceRevision(input: CreateWorkspaceRevisionInput): WorkspaceRevision
-  resolveProject(workspacePath: string): Project[]
-  createRun(projectId: string, input: CreateRunInput): { run: Run; testSummary: TestSummary | null; artifacts: ArtifactReference[] }
-  listRuns(projectId: string): Run[]
-  listRunsPage(projectId: string, limit: number, cursor?: string | null): Page<Run>
-  createEvidence(projectId: string, input: CreateEvidenceInput): Evidence
-  listEvidence(projectId: string, includeStale?: boolean): Evidence[]
-  listEvidencePage(projectId: string, limit: number, cursor?: string | null, includeStale?: boolean): Page<Evidence>
-  createErrorReport(input: CreateErrorReportInput): ErrorReport
-  listErrorReportsPage(limit: number, cursor?: string | null, statuses?: ErrorReport['status'][], kinds?: ErrorReport['kind'][], component?: string): Page<ErrorReport>
-  getErrorReport(id: string): { report: ErrorReport; history: ActivityEvent[] } | null
-  updateErrorReport(id: string, input: UpdateErrorReportInput): ErrorReport
-  captureCheckpointSnapshot(projectId: string, checkpointId: string): CheckpointSnapshot
-  getCheckpointSnapshot(checkpointId: string): CheckpointSnapshot | null
-  compareCheckpointSnapshots(leftCheckpointId: string, rightCheckpointId: string): CheckpointComparison
-  reconstructCheckpointState(checkpointId: string): Record<string, unknown> | null
-  getProjectPulseSummary(projectId: string): ProjectPulseSummary | null
-  search(query: string, limit?: number, filters?: SearchFilters): SearchResult[]
-}
 
 export class SqliteOperationalRepository implements OperationalRepository {
   private savepointSequence = 0
@@ -133,11 +89,11 @@ export class SqliteOperationalRepository implements OperationalRepository {
     try { const result = work(); this.db.exec('COMMIT'); return result } catch (error) { this.db.exec('ROLLBACK'); throw error }
   }
 
-  runIdempotent<T>(client: string, key: string, operation: string, payload: unknown, work: () => T): T {
+  runIdempotent<T>(client: string, key: string, operation: string, payload: unknown, work: () => Awaitable<T>): Awaitable<T> {
     return this.runMutation({ source: 'system', actor: client, client, idempotencyKey: key, occurredAt: now() }, operation, payload, work)
   }
 
-  runMutation<T>(context: MutationContext, operation: string, payload: unknown, work: () => T): T {
+  runMutation<T>(context: MutationContext, operation: string, payload: unknown, work: () => Awaitable<T>): Awaitable<T> {
     const requestHash = createHash('sha256').update(JSON.stringify(payload)).digest('hex')
     return this.transaction(() => {
       const previousContext = this.activeContext
@@ -152,6 +108,7 @@ export class SqliteOperationalRepository implements OperationalRepository {
           }
         }
         const result = work()
+        if (result instanceof Promise) throw new Error('SQLite mutation callbacks must complete synchronously')
         if (context.idempotencyKey) this.db.prepare('INSERT INTO idempotency_records(client,idempotency_key,operation,request_hash,result_json,created_at) VALUES (?,?,?,?,?,?)').run(idempotencyClient, context.idempotencyKey, operation, requestHash, JSON.stringify(result) ?? 'null', context.occurredAt)
         return result
       } finally {

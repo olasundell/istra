@@ -27,7 +27,7 @@ describe('MCP server contract', () => {
   afterEach(async () => {
     await client.close()
     await server.close()
-    runtime.close()
+    await runtime.close()
     await rm(dataDir, { recursive: true, force: true })
   })
 
@@ -47,6 +47,7 @@ describe('MCP server contract', () => {
       'report_error',
       'list_error_reports_page',
       'get_error_report',
+      'get_storage_status',
       'update_error_report',
       'create_phase',
       'create_project',
@@ -100,9 +101,26 @@ describe('MCP server contract', () => {
     expect(createRunSchema.properties?.testSummary).toMatchObject({ type: 'object' })
 
     for (const tool of tools) expect(tool.annotations?.destructiveHint).toBe(false)
-    for (const readTool of ['list_projects', 'get_project_pulse', 'list_work_items', 'search']) {
+    for (const readTool of ['get_storage_status', 'list_projects', 'get_project_pulse', 'list_work_items', 'search']) {
       expect(byName.get(readTool)?.annotations?.readOnlyHint).toBe(true)
     }
+
+    const storage = structured<{
+      backend: string
+      target: string
+      schemaVersion: number
+      ready: boolean
+      automaticBackups: boolean
+      importSupported: boolean
+    }>(await client.callTool({ name: 'get_storage_status', arguments: {} }))
+    expect(storage).toMatchObject({
+      backend: 'sqlite',
+      target: expect.stringContaining('istra.sqlite3'),
+      schemaVersion: expect.any(Number),
+      ready: true,
+      automaticBackups: true,
+      importSupported: true,
+    })
   })
 
   it('returns machine-readable results and records MCP client provenance on writes', async () => {
@@ -161,7 +179,7 @@ describe('MCP server contract', () => {
       name: 'create_project',
       arguments: { title: 'Visible to HTTP services' },
     }))
-    expect(runtime.service.getProject(mcpProject.id)?.project.title).toBe('Visible to HTTP services')
+    expect((await runtime.service.getProject(mcpProject.id))?.project.title).toBe('Visible to HTTP services')
   })
 
   it('reports and triages Istra faults through strict, idempotent MCP tools', async () => {

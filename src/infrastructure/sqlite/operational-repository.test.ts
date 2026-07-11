@@ -157,21 +157,21 @@ describe('operational project memory', () => {
     expect(rollup.byMilestone[0]).toMatchObject({ name: 'Prototype', total: 1 })
   })
 
-  it('resolves projects by workspace and records redacted runs and idempotent retries', () => {
+  it('resolves projects by workspace and records redacted runs and idempotent retries', async () => {
     const project = repository.createProject({ title: 'Workspace probe' }, provenance)
     const workspace = operational.createWorkspace({ name: 'Istra', canonicalRoot: dataDir, aliases: [], remote: null })
     operational.linkProjectWorkspace(project.id, workspace.id)
     expect(operational.resolveProject(join(dataDir, 'src'))[0]?.id).toBe(project.id)
     const revision = operational.createWorkspaceRevision({ workspaceId: workspace.id, branch: 'main', commit: 'abc', dirty: true, diffHash: 'def' })
     const payload = { workspaceRevisionId: revision.id, command: 'TOKEN=secret pnpm test', startedAt: '2026-07-10T10:00:00.000Z', endedAt: '2026-07-10T10:00:01.000Z', outcome: 'failed' as const, exitCode: 1, stdoutExcerpt: 'token=secret\nfailed', stdoutTruncated: false, stderrTruncated: false, toolchain: { node: '24' } }
-    const first = operational.runIdempotent('test-client', 'run-1', 'create_run', payload, () => operational.createRun(project.id, payload))
-    const second = operational.runIdempotent('test-client', 'run-1', 'create_run', payload, () => operational.createRun(project.id, payload))
+    const first = await operational.runIdempotent('test-client', 'run-1', 'create_run', payload, () => operational.createRun(project.id, payload))
+    const second = await operational.runIdempotent('test-client', 'run-1', 'create_run', payload, () => operational.createRun(project.id, payload))
     expect(second.run.id).toBe(first.run.id)
     expect(first.run.stdoutExcerpt).toContain('[REDACTED]')
     expect(operational.listRuns(project.id)).toHaveLength(1)
   })
 
-  it('stores global Istra error reports with redaction, history, triage and exact retries', () => {
+  it('stores global Istra error reports with redaction, history, triage and exact retries', async () => {
     const project = repository.createProject({ title: 'Error report context' }, provenance)
     const payload = {
       kind: 'bug' as const,
@@ -185,8 +185,8 @@ describe('operational project memory', () => {
       projectId: project.id,
       workspacePath: dataDir,
     }
-    const first = operational.runIdempotent('error-report-test', 'report-1', 'report_error', payload, () => operational.createErrorReport(payload))
-    const replay = operational.runIdempotent<typeof first>('error-report-test', 'report-1', 'report_error', payload, () => { throw new Error('replay must not execute') })
+    const first = await operational.runIdempotent('error-report-test', 'report-1', 'report_error', payload, () => operational.createErrorReport(payload))
+    const replay = await operational.runIdempotent<typeof first>('error-report-test', 'report-1', 'report_error', payload, () => { throw new Error('replay must not execute') })
 
     expect(replay.id).toBe(first.id)
     expect(first).toMatchObject({ kind: 'bug', status: 'open', projectId: project.id, redaction: { count: expect.any(Number) } })
@@ -195,7 +195,7 @@ describe('operational project memory', () => {
     expect(operational.getErrorReport(first.id)).toMatchObject({ report: { id: first.id }, history: [expect.objectContaining({ eventType: 'error_report.created' })] })
 
     expect(() => operational.runIdempotent('error-report-test', 'report-1', 'report_error', { ...payload, summary: 'Changed' }, () => operational.createErrorReport(payload))).toThrow(/idempotency/i)
-    const independent = operational.runIdempotent('error-report-test', 'report-2', 'report_error', { ...payload, kind: 'design' as const, summary: 'The recovery path is misleading' }, () => operational.createErrorReport({ ...payload, kind: 'design', summary: 'The recovery path is misleading' }))
+    const independent = await operational.runIdempotent('error-report-test', 'report-2', 'report_error', { ...payload, kind: 'design' as const, summary: 'The recovery path is misleading' }, () => operational.createErrorReport({ ...payload, kind: 'design', summary: 'The recovery path is misleading' }))
     expect(independent.id).not.toBe(first.id)
 
     expect(() => operational.updateErrorReport(first.id, { expectedVersion: first.version + 1, status: 'acknowledged' })).toThrow(/changed; refresh/i)
@@ -467,15 +467,15 @@ describe('operational project memory', () => {
     expect(exists(dualOwned.artifacts[0]!.id)).toBe(false)
   })
 
-  it('audits one provenance event and project pulse for idempotent operational writes', () => {
+  it('audits one provenance event and project pulse for idempotent operational writes', async () => {
     const project = repository.createProject({ title: 'Mutation provenance' }, provenance)
     const before = Number((database.db.prepare('SELECT COUNT(*) AS count FROM activity_events WHERE project_id=?').get(project.id) as { count: number }).count)
     const context = { source: 'ui' as const, actor: 'local-human', client: 'web', idempotencyKey: 'requirement-1', occurredAt: '2026-07-10T12:00:00.000Z' }
     const payload = { projectId: project.id, stableKey: 'AUDIT-1' }
-    const first = operational.runMutation(context, 'create_requirement', payload, () => operational.createRequirement(project.id, {
+    const first = await operational.runMutation(context, 'create_requirement', payload, () => operational.createRequirement(project.id, {
       stableKey: 'AUDIT-1', kind: 'requirement', title: 'Audit this mutation',
     }))
-    const replay = operational.runMutation<typeof first>(context, 'create_requirement', payload, () => { throw new Error('replay must not execute') })
+    const replay = await operational.runMutation<typeof first>(context, 'create_requirement', payload, () => { throw new Error('replay must not execute') })
 
     expect(replay.id).toBe(first.id)
     expect(Number((database.db.prepare('SELECT COUNT(*) AS count FROM activity_events WHERE project_id=?').get(project.id) as { count: number }).count)).toBe(before + 1)
@@ -486,10 +486,10 @@ describe('operational project memory', () => {
     expect(() => operational.runMutation(context, 'create_requirement', { ...payload, stableKey: 'AUDIT-2' }, () => first)).toThrow(/Idempotency key/)
 
     const changedActor = { ...context, actor: 'rotated-local-actor' }
-    expect(operational.runMutation<typeof first>(changedActor, 'create_requirement', payload, () => { throw new Error('same client must replay') }).id).toBe(first.id)
+    expect((await operational.runMutation<typeof first>(changedActor, 'create_requirement', payload, () => { throw new Error('same client must replay') })).id).toBe(first.id)
 
     const otherClient = { ...context, client: 'cli', occurredAt: '2026-07-10T12:01:00.000Z' }
-    const independent = operational.runMutation(otherClient, 'create_requirement', { ...payload, stableKey: 'AUDIT-2' }, () => operational.createRequirement(project.id, {
+    const independent = await operational.runMutation(otherClient, 'create_requirement', { ...payload, stableKey: 'AUDIT-2' }, () => operational.createRequirement(project.id, {
       stableKey: 'AUDIT-2', kind: 'requirement', title: 'Independent client namespace',
     }))
     expect(independent.id).not.toBe(first.id)

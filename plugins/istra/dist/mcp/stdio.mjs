@@ -1,10 +1,22 @@
 import process$1 from "node:process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import require$$0$3 from "events";
+import require$$1$1 from "util/types";
+import require$$0$7 from "util";
+import require$$0 from "crypto";
+import require$$0$2 from "dns";
+import require$$0$1 from "fs";
+import require$$0$4 from "net";
+import require$$1$2 from "tls";
+import require$$0$6 from "path";
+import require$$0$5 from "stream";
+import require$$1$3 from "string_decoder";
+import { randomUUID, createHash } from "node:crypto";
+import { resolve as resolve$1, join, dirname, basename } from "node:path";
 import { mkdir, stat, open, readFile, rm, copyFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve as resolve$1, join, dirname, basename } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
-import { randomUUID, createHash } from "node:crypto";
 function $constructor(name, initializer2, params) {
   function init(inst, def) {
     var _a;
@@ -9427,6 +9439,10 @@ function validateRunInvariants(input) {
   }
   return violations;
 }
+function assertRunInvariants(input) {
+  const violations = validateRunInvariants(input);
+  if (violations.length) throw new RunEvidenceInvariantError(violations);
+}
 function validateEvidenceInvariants(input, context = {}) {
   if (input.result !== "verified") return [];
   if (context.verifiedOverride?.reason.trim()) return [];
@@ -9730,6 +9746,11 @@ class IdempotencyConflictError extends AppError {
     super("IDEMPOTENCY_CONFLICT", `Idempotency key ${key} was already used with different input`, 409);
   }
 }
+class UnsupportedOperationError extends AppError {
+  constructor(message) {
+    super("UNSUPPORTED_OPERATION", message, 501);
+  }
+}
 const ExportBundleSchema = objectType({
   format: literalType("istra-export"),
   formatVersion: unionType([literalType(3), literalType(4)]),
@@ -9737,15 +9758,20 @@ const ExportBundleSchema = objectType({
   tables: recordType(arrayType(recordType(unknownType())))
 }).strict();
 const queryBoolean = (value) => value === true || value === "true";
+function flatMapAwaitable(value, map) {
+  return value instanceof Promise ? value.then(map) : map(value);
+}
 class IstraService {
-  constructor(repository, backups, operational) {
+  constructor(repository, dataProtection, operational, readStorageStatus) {
     this.repository = repository;
-    this.backups = backups;
+    this.dataProtection = dataProtection;
     this.operational = operational;
+    this.readStorageStatus = readStorageStatus;
   }
   repository;
-  backups;
+  dataProtection;
   operational;
+  readStorageStatus;
   operations() {
     if (!this.operational) throw new ValidationError("Operational memory is not configured");
     return this.operational;
@@ -9767,75 +9793,88 @@ class IstraService {
     };
   }
   async writeOperational(caller, key, operationName, payload, operation) {
-    await this.backups.beforeWrite();
-    return this.operations().runMutation(this.mutationContext(caller, key), operationName, payload, operation);
+    await this.dataProtection.beforeWrite();
+    return await this.operations().runMutation(this.mutationContext(caller, key), operationName, payload, operation);
   }
   async writeCore(source2, key, operationName, payload, operation) {
-    await this.backups.beforeWrite();
+    await this.dataProtection.beforeWrite();
     const context = this.mutationContext(source2, key);
-    return this.operations().runMutation(context, operationName, payload, () => operation(context));
+    return await this.operations().runMutation(context, operationName, payload, () => operation(context));
   }
-  listProjects(filters = {}) {
+  async listProjects(filters = {}) {
     const parsed = this.parse(objectType({ state: ProjectStateSchema.optional(), includeArchived: booleanType().optional(), q: stringType().max(500).optional() }), filters);
-    return this.repository.listProjects(parsed);
+    return await this.repository.listProjects(parsed);
   }
-  getProject(id2) {
-    return this.repository.getProjectDetail(id2);
+  async getProject(id2) {
+    return await this.repository.getProjectDetail(id2);
   }
-  listPhases(projectId, includeArchived = false) {
-    return this.repository.listPhases(projectId, includeArchived);
+  async listPhases(projectId, includeArchived = false) {
+    return await this.repository.listPhases(projectId, includeArchived);
   }
-  listWorkItems(projectId, statuses) {
+  async listWorkItems(projectId, statuses) {
     const parsed = this.parse(arrayType(WorkItemStatusSchema).max(10).optional(), statuses);
-    return this.repository.listWorkItems(projectId, parsed);
+    return await this.repository.listWorkItems(projectId, parsed);
   }
-  listWorkItemsPage(projectId, input = {}) {
+  async listWorkItemsPage(projectId, input = {}) {
     const parsed = this.parse(PageRequestSchema, input);
-    return this.repository.listWorkItemsPage(projectId, parsed.limit, parsed.cursor, this.parse(arrayType(WorkItemStatusSchema).max(10).optional(), input?.statuses));
+    return await this.repository.listWorkItemsPage(projectId, parsed.limit, parsed.cursor, this.parse(arrayType(WorkItemStatusSchema).max(10).optional(), input?.statuses));
   }
-  listUpdates(projectId, includeDeleted = false) {
-    return this.repository.listUpdates(projectId, includeDeleted);
+  async listUpdates(projectId, includeDeleted = false) {
+    return await this.repository.listUpdates(projectId, includeDeleted);
   }
-  listUpdatesPage(projectId, input = {}) {
+  async listUpdatesPage(projectId, input = {}) {
     const parsed = this.parse(PageRequestSchema, input);
-    return this.repository.listUpdatesPage(projectId, parsed.limit, parsed.cursor, queryBoolean(input?.includeDeleted));
+    return await this.repository.listUpdatesPage(projectId, parsed.limit, parsed.cursor, queryBoolean(input?.includeDeleted));
   }
-  listActivity(projectId, limit2) {
-    return this.repository.listActivity(projectId, limit2);
+  async listActivity(projectId, limit2) {
+    return await this.repository.listActivity(projectId, limit2);
   }
-  listActivityPage(projectId, input = {}) {
+  async listActivityPage(projectId, input = {}) {
     const parsed = this.parse(PageRequestSchema, input);
-    return this.repository.listActivityPage(projectId, parsed.limit, parsed.cursor);
+    return await this.repository.listActivityPage(projectId, parsed.limit, parsed.cursor);
   }
-  listRecentActivity(limit2) {
-    return this.repository.listRecentActivity(limit2);
+  async listRecentActivity(limit2) {
+    return await this.repository.listRecentActivity(limit2);
   }
-  getUpdateRevisions(updateId) {
-    return this.repository.getUpdateRevisions(updateId);
+  async getUpdateRevisions(updateId) {
+    return await this.repository.getUpdateRevisions(updateId);
   }
-  listLabels() {
-    return this.repository.listLabels();
+  async listLabels() {
+    return await this.repository.listLabels();
   }
-  listErrorReportsPage(input = {}) {
+  async listErrorReportsPage(input = {}) {
     const parsed = this.parse(ErrorReportPageRequestSchema, input);
-    return this.operations().listErrorReportsPage(parsed.limit, parsed.cursor, parsed.statuses, parsed.kinds, parsed.component);
+    return await this.operations().listErrorReportsPage(parsed.limit, parsed.cursor, parsed.statuses, parsed.kinds, parsed.component);
   }
-  getErrorReport(id2) {
-    return this.operations().getErrorReport(id2);
+  async getErrorReport(id2) {
+    return await this.operations().getErrorReport(id2);
   }
-  search(query, limit2, filters = {}) {
+  async search(query2, limit2, filters = {}) {
     const parsed = this.parse(objectType({ projectId: stringType().uuid().optional(), entityTypes: arrayType(enumType(["project", "phase", "work_item", "update", "requirement", "run", "evidence"])).max(10).optional(), state: stringType().trim().max(100).optional(), phaseId: stringType().uuid().optional(), requirementId: stringType().uuid().optional(), evidenceResult: enumType(["recorded", "verified", "failed", "interrupted"]).optional(), from: stringType().datetime({ offset: true }).optional(), to: stringType().datetime({ offset: true }).optional() }), filters);
     const max = this.parse(numberType().int().min(1).max(200), limit2 ?? 50);
-    const core2 = this.repository.search(query, 200, parsed);
-    const operational = this.operational ? this.operations().search(query, 200, parsed) : [];
+    const [core2, operational] = await Promise.all([
+      this.repository.search(query2, 200, parsed),
+      this.operations().search(query2, 200, parsed)
+    ]);
     const merged = new Map([...core2, ...operational].map((entry) => [`${entry.type}:${entry.id}`, entry]));
     return [...merged.values()].slice(0, max);
   }
-  exportAll() {
-    return this.repository.exportAll();
+  async exportAll() {
+    return await this.repository.exportAll();
+  }
+  async storageStatus() {
+    if (this.readStorageStatus) return await this.readStorageStatus();
+    return {
+      backend: this.dataProtection.backend,
+      target: this.dataProtection.databasePath ?? this.dataProtection.backend,
+      schemaVersion: 0,
+      ready: true,
+      automaticBackups: this.dataProtection.automatic,
+      importSupported: this.dataProtection.importSupported
+    };
   }
   async backupStatus() {
-    const files = await this.backups.list();
+    const files = await this.dataProtection.list();
     const backups = files.map((file) => ({
       name: file.name,
       kind: file.name.startsWith("pre-import-") ? "pre-import" : file.name.startsWith("pre-migration-") ? "pre-migration" : file.name.startsWith("weekly-") ? "weekly" : "daily",
@@ -9844,9 +9883,12 @@ class IstraService {
     })).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     const lastBackupAt = backups.reduce((latest, file) => !latest || file.createdAt > latest ? file.createdAt : latest, null);
     return {
-      databasePath: this.backups.paths.databasePath,
+      backend: this.dataProtection.backend,
+      automaticBackups: this.dataProtection.automatic,
+      importSupported: this.dataProtection.importSupported,
+      databasePath: this.dataProtection.databasePath,
       lastBackupAt,
-      nextBackupKind: "daily",
+      ...this.dataProtection.automatic ? { nextBackupKind: "daily" } : {},
       backups
     };
   }
@@ -9901,12 +9943,11 @@ class IstraService {
   async saveCheckpoint(projectId, input, source2, idempotencyKey) {
     const parsed = this.parse(CheckpointSchema, input);
     const context = this.mutationContext(source2, idempotencyKey);
-    await this.backups.beforeWrite();
-    return this.operations().runMutation(context, "save_checkpoint", { projectId, parsed }, () => {
-      const checkpoint = this.repository.saveCheckpoint(projectId, parsed, context);
-      const snapshot = this.operations().captureCheckpointSnapshot(projectId, checkpoint.id);
-      return { checkpoint, snapshot: { id: snapshot.id, digest: snapshot.digest, schemaVersion: snapshot.schemaVersion, capturedAt: snapshot.capturedAt } };
-    });
+    await this.dataProtection.beforeWrite();
+    return await this.operations().runMutation(context, "save_checkpoint", { projectId, parsed }, () => flatMapAwaitable(this.repository.saveCheckpoint(projectId, parsed, context), (checkpoint) => flatMapAwaitable(this.operations().captureCheckpointSnapshot(projectId, checkpoint.id), (snapshot) => ({
+      checkpoint,
+      snapshot: { id: snapshot.id, digest: snapshot.digest, schemaVersion: snapshot.schemaVersion, capturedAt: snapshot.capturedAt }
+    }))));
   }
   createLabel(input, source2, idempotencyKey) {
     const parsed = this.parse(CreateLabelSchema, input);
@@ -9921,28 +9962,31 @@ class IstraService {
     return this.writeCore(source2, void 0, "detach_label", { workItemId, labelId, parsed }, (context) => this.repository.detachLabel(workItemId, labelId, parsed.expectedVersion, context));
   }
   async importAll(value) {
+    if (!this.dataProtection.importSupported) {
+      throw new UnsupportedOperationError("Full replacement import is unavailable for PostgreSQL until backup and restore support is configured");
+    }
     const bundle = this.parse(ExportBundleSchema, value);
-    this.repository.validateImport(bundle);
-    await this.backups.create("pre-import");
-    this.repository.importAll(bundle);
+    await this.repository.validateImport(bundle);
+    await this.dataProtection.create("pre-import");
+    await this.repository.importAll(bundle);
   }
-  listRequirementStates(projectId) {
-    return this.operations().listRequirementStates(projectId);
+  async listRequirementStates(projectId) {
+    return await this.operations().listRequirementStates(projectId);
   }
   createRequirementState(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateRequirementStateSchema, input);
     const operation = () => this.operations().createRequirementState(projectId, parsed);
     return this.writeOperational(caller, idempotencyKey, "create_requirement_state", { projectId, parsed }, operation);
   }
-  listRequirements(projectId) {
-    return this.operations().listRequirements(projectId);
+  async listRequirements(projectId) {
+    return await this.operations().listRequirements(projectId);
   }
-  listRequirementsPage(projectId, input = {}) {
+  async listRequirementsPage(projectId, input = {}) {
     const parsed = this.parse(PageRequestSchema, input);
-    return this.operations().listRequirementsPage(projectId, parsed.limit, parsed.cursor);
+    return await this.operations().listRequirementsPage(projectId, parsed.limit, parsed.cursor);
   }
-  getRequirement(id2) {
-    return this.operations().getRequirement(id2);
+  async getRequirement(id2) {
+    return await this.operations().getRequirement(id2);
   }
   createRequirement(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateRequirementSchema, input);
@@ -9959,23 +10003,23 @@ class IstraService {
   unlinkRequirementWork(requirementId, workItemId, caller = "ui") {
     return this.writeOperational(caller, void 0, "unlink_requirement_work", { requirementId, workItemId }, () => this.operations().unlinkRequirementWork(requirementId, workItemId));
   }
-  getRequirementRollup(projectId) {
-    return this.operations().getRequirementRollup(projectId);
+  async getRequirementRollup(projectId) {
+    return await this.operations().getRequirementRollup(projectId);
   }
-  listWorkQueues(projectId) {
-    return this.operations().listWorkQueues(projectId);
+  async listWorkQueues(projectId) {
+    return await this.operations().listWorkQueues(projectId);
   }
   createWorkQueue(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateWorkQueueSchema, input);
     const operation = () => this.operations().createWorkQueue(projectId, parsed);
     return this.writeOperational(caller, idempotencyKey, "create_work_queue", { projectId, parsed }, operation);
   }
-  listOperationalWorkItems(projectId, queueId) {
-    return this.operations().listWorkItems(projectId, queueId);
+  async listOperationalWorkItems(projectId, queueId) {
+    return await this.operations().listWorkItems(projectId, queueId);
   }
-  listOperationalWorkItemsPage(projectId, input = {}) {
+  async listOperationalWorkItemsPage(projectId, input = {}) {
     const parsed = this.parse(PageRequestSchema, input);
-    return this.operations().listWorkItemsPage(projectId, parsed.limit, parsed.cursor, input?.queueId);
+    return await this.operations().listWorkItemsPage(projectId, parsed.limit, parsed.cursor, input?.queueId);
   }
   linkWorkItems(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateWorkRelationSchema, input);
@@ -9985,16 +10029,16 @@ class IstraService {
   unlinkWorkItems(id2, caller = "ui") {
     return this.writeOperational(caller, void 0, "unlink_work_items", { id: id2 }, () => this.operations().unlinkWorkItems(id2));
   }
-  listWorkRelations(projectId) {
-    return this.operations().listWorkRelations(projectId);
+  async listWorkRelations(projectId) {
+    return await this.operations().listWorkRelations(projectId);
   }
   createExternalBlocker(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateExternalBlockerSchema, input);
     const operation = () => this.operations().createExternalBlocker(projectId, parsed);
     return this.writeOperational(caller, idempotencyKey, "create_external_blocker", { projectId, parsed }, operation);
   }
-  listExternalBlockers(projectId, includeResolved = false) {
-    return this.operations().listExternalBlockers(projectId, includeResolved);
+  async listExternalBlockers(projectId, includeResolved = false) {
+    return await this.operations().listExternalBlockers(projectId, includeResolved);
   }
   resolveExternalBlocker(id2, caller = "ui") {
     return this.writeOperational(caller, void 0, "resolve_external_blocker", { id: id2 }, () => this.operations().resolveExternalBlocker(id2));
@@ -10013,48 +10057,8015 @@ class IstraService {
     const operation = () => this.operations().createWorkspaceRevision(parsed);
     return this.writeOperational(caller, idempotencyKey, "create_workspace_revision", parsed, operation);
   }
-  resolveProject(workspacePath) {
-    return this.operations().resolveProject(workspacePath);
+  async resolveProject(workspacePath) {
+    return await this.operations().resolveProject(workspacePath);
   }
   createRun(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateRunSchema, input);
     const operation = () => this.operations().createRun(projectId, parsed);
     return this.writeOperational(caller, idempotencyKey, "create_run", { projectId, parsed }, operation);
   }
-  listRuns(projectId) {
-    return this.operations().listRuns(projectId);
+  async listRuns(projectId) {
+    return await this.operations().listRuns(projectId);
   }
-  listRunsPage(projectId, input = {}) {
+  async listRunsPage(projectId, input = {}) {
     const parsed = this.parse(PageRequestSchema, input);
-    return this.operations().listRunsPage(projectId, parsed.limit, parsed.cursor);
+    return await this.operations().listRunsPage(projectId, parsed.limit, parsed.cursor);
   }
   createEvidence(projectId, input, idempotencyKey, caller = "ui") {
     const parsed = this.parse(CreateEvidenceSchema, input);
     const operation = () => this.operations().createEvidence(projectId, parsed);
     return this.writeOperational(caller, idempotencyKey, "create_evidence", { projectId, parsed }, operation);
   }
-  listEvidence(projectId, includeStale = false) {
-    return this.operations().listEvidence(projectId, includeStale);
+  async listEvidence(projectId, includeStale = false) {
+    return await this.operations().listEvidence(projectId, includeStale);
   }
-  listEvidencePage(projectId, input = {}) {
+  async listEvidencePage(projectId, input = {}) {
     const parsed = this.parse(PageRequestSchema, input);
-    return this.operations().listEvidencePage(projectId, parsed.limit, parsed.cursor, queryBoolean(input?.includeStale));
+    return await this.operations().listEvidencePage(projectId, parsed.limit, parsed.cursor, queryBoolean(input?.includeStale));
   }
   backfillLegacyCheckpointSnapshot(projectId, checkpointId, idempotencyKey, caller = "ui") {
     const operation = () => this.operations().captureCheckpointSnapshot(projectId, checkpointId);
     return this.writeOperational(caller, idempotencyKey, "legacy_backfill_checkpoint_snapshot", { projectId, checkpointId }, operation);
   }
-  getCheckpointSnapshot(checkpointId) {
-    return this.operations().getCheckpointSnapshot(checkpointId);
+  async getCheckpointSnapshot(checkpointId) {
+    return await this.operations().getCheckpointSnapshot(checkpointId);
   }
-  compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) {
-    return this.operations().compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId);
+  async compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) {
+    return await this.operations().compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId);
   }
-  reconstructCheckpointState(checkpointId) {
-    return this.operations().reconstructCheckpointState(checkpointId);
+  async reconstructCheckpointState(checkpointId) {
+    return await this.operations().reconstructCheckpointState(checkpointId);
   }
-  getProjectPulseSummary(projectId) {
-    return this.operations().getProjectPulseSummary(projectId);
+  async getProjectPulseSummary(projectId) {
+    return await this.operations().getProjectPulseSummary(projectId);
+  }
+}
+function sqliteDataProtection(manager) {
+  return {
+    backend: "sqlite",
+    automatic: true,
+    importSupported: true,
+    databasePath: manager.paths.databasePath,
+    beforeWrite: () => manager.beforeWrite(),
+    create: (kind, suffix) => manager.create(kind, suffix),
+    list: () => manager.list()
+  };
+}
+function postgresDataProtection() {
+  return {
+    backend: "postgresql",
+    automatic: false,
+    importSupported: false,
+    beforeWrite: async () => void 0,
+    create: async () => {
+      throw new Error("PostgreSQL backup and restore support is not configured");
+    },
+    list: async () => []
+  };
+}
+var commonjsGlobal = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : {};
+function getDefaultExportFromCjs(x) {
+  return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, "default") ? x["default"] : x;
+}
+function getAugmentedNamespace(n) {
+  if (Object.prototype.hasOwnProperty.call(n, "__esModule")) return n;
+  var f = n.default;
+  if (typeof f == "function") {
+    var a = function a2() {
+      var isInstance = false;
+      try {
+        isInstance = this instanceof a2;
+      } catch {
+      }
+      if (isInstance) {
+        return Reflect.construct(f, arguments, this.constructor);
+      }
+      return f.apply(this, arguments);
+    };
+    a.prototype = f.prototype;
+  } else a = {};
+  Object.defineProperty(a, "__esModule", { value: true });
+  Object.keys(n).forEach(function(k) {
+    var d = Object.getOwnPropertyDescriptor(n, k);
+    Object.defineProperty(a, k, d.get ? d : {
+      enumerable: true,
+      get: function() {
+        return n[k];
+      }
+    });
+  });
+  return a;
+}
+var lib$1 = { exports: {} };
+var defaults$1 = { exports: {} };
+var pgTypes = {};
+var postgresArray = {};
+var hasRequiredPostgresArray;
+function requirePostgresArray() {
+  if (hasRequiredPostgresArray) return postgresArray;
+  hasRequiredPostgresArray = 1;
+  postgresArray.parse = function(source2, transform2) {
+    return new ArrayParser(source2, transform2).parse();
+  };
+  class ArrayParser {
+    constructor(source2, transform2) {
+      this.source = source2;
+      this.transform = transform2 || identity;
+      this.position = 0;
+      this.entries = [];
+      this.recorded = [];
+      this.dimension = 0;
+    }
+    isEof() {
+      return this.position >= this.source.length;
+    }
+    nextCharacter() {
+      var character = this.source[this.position++];
+      if (character === "\\") {
+        return {
+          value: this.source[this.position++],
+          escaped: true
+        };
+      }
+      return {
+        value: character,
+        escaped: false
+      };
+    }
+    record(character) {
+      this.recorded.push(character);
+    }
+    newEntry(includeEmpty) {
+      var entry;
+      if (this.recorded.length > 0 || includeEmpty) {
+        entry = this.recorded.join("");
+        if (entry === "NULL" && !includeEmpty) {
+          entry = null;
+        }
+        if (entry !== null) entry = this.transform(entry);
+        this.entries.push(entry);
+        this.recorded = [];
+      }
+    }
+    consumeDimensions() {
+      if (this.source[0] === "[") {
+        while (!this.isEof()) {
+          var char = this.nextCharacter();
+          if (char.value === "=") break;
+        }
+      }
+    }
+    parse(nested) {
+      var character, parser2, quote;
+      this.consumeDimensions();
+      while (!this.isEof()) {
+        character = this.nextCharacter();
+        if (character.value === "{" && !quote) {
+          this.dimension++;
+          if (this.dimension > 1) {
+            parser2 = new ArrayParser(this.source.substr(this.position - 1), this.transform);
+            this.entries.push(parser2.parse(true));
+            this.position += parser2.position - 2;
+          }
+        } else if (character.value === "}" && !quote) {
+          this.dimension--;
+          if (!this.dimension) {
+            this.newEntry();
+            if (nested) return this.entries;
+          }
+        } else if (character.value === '"' && !character.escaped) {
+          if (quote) this.newEntry(true);
+          quote = !quote;
+        } else if (character.value === "," && !quote) {
+          this.newEntry();
+        } else {
+          this.record(character.value);
+        }
+      }
+      if (this.dimension !== 0) {
+        throw new Error("array dimension not balanced");
+      }
+      return this.entries;
+    }
+  }
+  function identity(value) {
+    return value;
+  }
+  return postgresArray;
+}
+var arrayParser;
+var hasRequiredArrayParser;
+function requireArrayParser() {
+  if (hasRequiredArrayParser) return arrayParser;
+  hasRequiredArrayParser = 1;
+  var array2 = requirePostgresArray();
+  arrayParser = {
+    create: function(source2, transform2) {
+      return {
+        parse: function() {
+          return array2.parse(source2, transform2);
+        }
+      };
+    }
+  };
+  return arrayParser;
+}
+var postgresDate;
+var hasRequiredPostgresDate;
+function requirePostgresDate() {
+  if (hasRequiredPostgresDate) return postgresDate;
+  hasRequiredPostgresDate = 1;
+  var DATE_TIME = /(\d{1,})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(\.\d{1,})?.*?( BC)?$/;
+  var DATE = /^(\d{1,})-(\d{2})-(\d{2})( BC)?$/;
+  var TIME_ZONE = /([Z+-])(\d{2})?:?(\d{2})?:?(\d{2})?/;
+  var INFINITY = /^-?infinity$/;
+  postgresDate = function parseDate(isoDate2) {
+    if (INFINITY.test(isoDate2)) {
+      return Number(isoDate2.replace("i", "I"));
+    }
+    var matches = DATE_TIME.exec(isoDate2);
+    if (!matches) {
+      return getDate(isoDate2) || null;
+    }
+    var isBC = !!matches[8];
+    var year = parseInt(matches[1], 10);
+    if (isBC) {
+      year = bcYearToNegativeYear(year);
+    }
+    var month = parseInt(matches[2], 10) - 1;
+    var day = matches[3];
+    var hour = parseInt(matches[4], 10);
+    var minute = parseInt(matches[5], 10);
+    var second = parseInt(matches[6], 10);
+    var ms = matches[7];
+    ms = ms ? 1e3 * parseFloat(ms) : 0;
+    var date2;
+    var offset = timeZoneOffset(isoDate2);
+    if (offset != null) {
+      date2 = new Date(Date.UTC(year, month, day, hour, minute, second, ms));
+      if (is0To99(year)) {
+        date2.setUTCFullYear(year);
+      }
+      if (offset !== 0) {
+        date2.setTime(date2.getTime() - offset);
+      }
+    } else {
+      date2 = new Date(year, month, day, hour, minute, second, ms);
+      if (is0To99(year)) {
+        date2.setFullYear(year);
+      }
+    }
+    return date2;
+  };
+  function getDate(isoDate2) {
+    var matches = DATE.exec(isoDate2);
+    if (!matches) {
+      return;
+    }
+    var year = parseInt(matches[1], 10);
+    var isBC = !!matches[4];
+    if (isBC) {
+      year = bcYearToNegativeYear(year);
+    }
+    var month = parseInt(matches[2], 10) - 1;
+    var day = matches[3];
+    var date2 = new Date(year, month, day);
+    if (is0To99(year)) {
+      date2.setFullYear(year);
+    }
+    return date2;
+  }
+  function timeZoneOffset(isoDate2) {
+    if (isoDate2.endsWith("+00")) {
+      return 0;
+    }
+    var zone = TIME_ZONE.exec(isoDate2.split(" ")[1]);
+    if (!zone) return;
+    var type2 = zone[1];
+    if (type2 === "Z") {
+      return 0;
+    }
+    var sign = type2 === "-" ? -1 : 1;
+    var offset = parseInt(zone[2], 10) * 3600 + parseInt(zone[3] || 0, 10) * 60 + parseInt(zone[4] || 0, 10);
+    return offset * sign * 1e3;
+  }
+  function bcYearToNegativeYear(year) {
+    return -(year - 1);
+  }
+  function is0To99(num) {
+    return num >= 0 && num < 100;
+  }
+  return postgresDate;
+}
+var mutable;
+var hasRequiredMutable;
+function requireMutable() {
+  if (hasRequiredMutable) return mutable;
+  hasRequiredMutable = 1;
+  mutable = extend2;
+  var hasOwnProperty = Object.prototype.hasOwnProperty;
+  function extend2(target) {
+    for (var i = 1; i < arguments.length; i++) {
+      var source2 = arguments[i];
+      for (var key in source2) {
+        if (hasOwnProperty.call(source2, key)) {
+          target[key] = source2[key];
+        }
+      }
+    }
+    return target;
+  }
+  return mutable;
+}
+var postgresInterval;
+var hasRequiredPostgresInterval;
+function requirePostgresInterval() {
+  if (hasRequiredPostgresInterval) return postgresInterval;
+  hasRequiredPostgresInterval = 1;
+  var extend2 = requireMutable();
+  postgresInterval = PostgresInterval;
+  function PostgresInterval(raw) {
+    if (!(this instanceof PostgresInterval)) {
+      return new PostgresInterval(raw);
+    }
+    extend2(this, parse2(raw));
+  }
+  var properties2 = ["seconds", "minutes", "hours", "days", "months", "years"];
+  PostgresInterval.prototype.toPostgres = function() {
+    var filtered = properties2.filter(this.hasOwnProperty, this);
+    if (this.milliseconds && filtered.indexOf("seconds") < 0) {
+      filtered.push("seconds");
+    }
+    if (filtered.length === 0) return "0";
+    return filtered.map(function(property) {
+      var value = this[property] || 0;
+      if (property === "seconds" && this.milliseconds) {
+        value = (value + this.milliseconds / 1e3).toFixed(6).replace(/\.?0+$/, "");
+      }
+      return value + " " + property;
+    }, this).join(" ");
+  };
+  var propertiesISOEquivalent = {
+    years: "Y",
+    months: "M",
+    days: "D",
+    hours: "H",
+    minutes: "M",
+    seconds: "S"
+  };
+  var dateProperties = ["years", "months", "days"];
+  var timeProperties = ["hours", "minutes", "seconds"];
+  PostgresInterval.prototype.toISOString = PostgresInterval.prototype.toISO = function() {
+    var datePart = dateProperties.map(buildProperty, this).join("");
+    var timePart = timeProperties.map(buildProperty, this).join("");
+    return "P" + datePart + "T" + timePart;
+    function buildProperty(property) {
+      var value = this[property] || 0;
+      if (property === "seconds" && this.milliseconds) {
+        value = (value + this.milliseconds / 1e3).toFixed(6).replace(/0+$/, "");
+      }
+      return value + propertiesISOEquivalent[property];
+    }
+  };
+  var NUMBER = "([+-]?\\d+)";
+  var YEAR = NUMBER + "\\s+years?";
+  var MONTH = NUMBER + "\\s+mons?";
+  var DAY = NUMBER + "\\s+days?";
+  var TIME = "([+-])?([\\d]*):(\\d\\d):(\\d\\d)\\.?(\\d{1,6})?";
+  var INTERVAL = new RegExp([YEAR, MONTH, DAY, TIME].map(function(regexString) {
+    return "(" + regexString + ")?";
+  }).join("\\s*"));
+  var positions = {
+    years: 2,
+    months: 4,
+    days: 6,
+    hours: 9,
+    minutes: 10,
+    seconds: 11,
+    milliseconds: 12
+  };
+  var negatives = ["hours", "minutes", "seconds", "milliseconds"];
+  function parseMilliseconds(fraction) {
+    var microseconds = fraction + "000000".slice(fraction.length);
+    return parseInt(microseconds, 10) / 1e3;
+  }
+  function parse2(interval) {
+    if (!interval) return {};
+    var matches = INTERVAL.exec(interval);
+    var isNegative = matches[8] === "-";
+    return Object.keys(positions).reduce(function(parsed, property) {
+      var position = positions[property];
+      var value = matches[position];
+      if (!value) return parsed;
+      value = property === "milliseconds" ? parseMilliseconds(value) : parseInt(value, 10);
+      if (!value) return parsed;
+      if (isNegative && ~negatives.indexOf(property)) {
+        value *= -1;
+      }
+      parsed[property] = value;
+      return parsed;
+    }, {});
+  }
+  return postgresInterval;
+}
+var postgresBytea;
+var hasRequiredPostgresBytea;
+function requirePostgresBytea() {
+  if (hasRequiredPostgresBytea) return postgresBytea;
+  hasRequiredPostgresBytea = 1;
+  var bufferFrom = Buffer.from || Buffer;
+  postgresBytea = function parseBytea(input) {
+    if (/^\\x/.test(input)) {
+      return bufferFrom(input.substr(2), "hex");
+    }
+    var output = "";
+    var i = 0;
+    while (i < input.length) {
+      if (input[i] !== "\\") {
+        output += input[i];
+        ++i;
+      } else {
+        if (/[0-7]{3}/.test(input.substr(i + 1, 3))) {
+          output += String.fromCharCode(parseInt(input.substr(i + 1, 3), 8));
+          i += 4;
+        } else {
+          var backslashes = 1;
+          while (i + backslashes < input.length && input[i + backslashes] === "\\") {
+            backslashes++;
+          }
+          for (var k = 0; k < Math.floor(backslashes / 2); ++k) {
+            output += "\\";
+          }
+          i += Math.floor(backslashes / 2) * 2;
+        }
+      }
+    }
+    return bufferFrom(output, "binary");
+  };
+  return postgresBytea;
+}
+var textParsers;
+var hasRequiredTextParsers;
+function requireTextParsers() {
+  if (hasRequiredTextParsers) return textParsers;
+  hasRequiredTextParsers = 1;
+  var array2 = requirePostgresArray();
+  var arrayParser2 = requireArrayParser();
+  var parseDate = requirePostgresDate();
+  var parseInterval = requirePostgresInterval();
+  var parseByteA = requirePostgresBytea();
+  function allowNull(fn) {
+    return function nullAllowed(value) {
+      if (value === null) return value;
+      return fn(value);
+    };
+  }
+  function parseBool(value) {
+    if (value === null) return value;
+    return value === "TRUE" || value === "t" || value === "true" || value === "y" || value === "yes" || value === "on" || value === "1";
+  }
+  function parseBoolArray(value) {
+    if (!value) return null;
+    return array2.parse(value, parseBool);
+  }
+  function parseBaseTenInt(string2) {
+    return parseInt(string2, 10);
+  }
+  function parseIntegerArray(value) {
+    if (!value) return null;
+    return array2.parse(value, allowNull(parseBaseTenInt));
+  }
+  function parseBigIntegerArray(value) {
+    if (!value) return null;
+    return array2.parse(value, allowNull(function(entry) {
+      return parseBigInteger(entry).trim();
+    }));
+  }
+  var parsePointArray = function(value) {
+    if (!value) {
+      return null;
+    }
+    var p = arrayParser2.create(value, function(entry) {
+      if (entry !== null) {
+        entry = parsePoint(entry);
+      }
+      return entry;
+    });
+    return p.parse();
+  };
+  var parseFloatArray = function(value) {
+    if (!value) {
+      return null;
+    }
+    var p = arrayParser2.create(value, function(entry) {
+      if (entry !== null) {
+        entry = parseFloat(entry);
+      }
+      return entry;
+    });
+    return p.parse();
+  };
+  var parseStringArray = function(value) {
+    if (!value) {
+      return null;
+    }
+    var p = arrayParser2.create(value);
+    return p.parse();
+  };
+  var parseDateArray = function(value) {
+    if (!value) {
+      return null;
+    }
+    var p = arrayParser2.create(value, function(entry) {
+      if (entry !== null) {
+        entry = parseDate(entry);
+      }
+      return entry;
+    });
+    return p.parse();
+  };
+  var parseIntervalArray = function(value) {
+    if (!value) {
+      return null;
+    }
+    var p = arrayParser2.create(value, function(entry) {
+      if (entry !== null) {
+        entry = parseInterval(entry);
+      }
+      return entry;
+    });
+    return p.parse();
+  };
+  var parseByteAArray = function(value) {
+    if (!value) {
+      return null;
+    }
+    return array2.parse(value, allowNull(parseByteA));
+  };
+  var parseInteger = function(value) {
+    return parseInt(value, 10);
+  };
+  var parseBigInteger = function(value) {
+    var valStr = String(value);
+    if (/^\d+$/.test(valStr)) {
+      return valStr;
+    }
+    return value;
+  };
+  var parseJsonArray = function(value) {
+    if (!value) {
+      return null;
+    }
+    return array2.parse(value, allowNull(JSON.parse));
+  };
+  var parsePoint = function(value) {
+    if (value[0] !== "(") {
+      return null;
+    }
+    value = value.substring(1, value.length - 1).split(",");
+    return {
+      x: parseFloat(value[0]),
+      y: parseFloat(value[1])
+    };
+  };
+  var parseCircle = function(value) {
+    if (value[0] !== "<" && value[1] !== "(") {
+      return null;
+    }
+    var point = "(";
+    var radius = "";
+    var pointParsed = false;
+    for (var i = 2; i < value.length - 1; i++) {
+      if (!pointParsed) {
+        point += value[i];
+      }
+      if (value[i] === ")") {
+        pointParsed = true;
+        continue;
+      } else if (!pointParsed) {
+        continue;
+      }
+      if (value[i] === ",") {
+        continue;
+      }
+      radius += value[i];
+    }
+    var result2 = parsePoint(point);
+    result2.radius = parseFloat(radius);
+    return result2;
+  };
+  var init = function(register) {
+    register(20, parseBigInteger);
+    register(21, parseInteger);
+    register(23, parseInteger);
+    register(26, parseInteger);
+    register(700, parseFloat);
+    register(701, parseFloat);
+    register(16, parseBool);
+    register(1082, parseDate);
+    register(1114, parseDate);
+    register(1184, parseDate);
+    register(600, parsePoint);
+    register(651, parseStringArray);
+    register(718, parseCircle);
+    register(1e3, parseBoolArray);
+    register(1001, parseByteAArray);
+    register(1005, parseIntegerArray);
+    register(1007, parseIntegerArray);
+    register(1028, parseIntegerArray);
+    register(1016, parseBigIntegerArray);
+    register(1017, parsePointArray);
+    register(1021, parseFloatArray);
+    register(1022, parseFloatArray);
+    register(1231, parseFloatArray);
+    register(1014, parseStringArray);
+    register(1015, parseStringArray);
+    register(1008, parseStringArray);
+    register(1009, parseStringArray);
+    register(1040, parseStringArray);
+    register(1041, parseStringArray);
+    register(1115, parseDateArray);
+    register(1182, parseDateArray);
+    register(1185, parseDateArray);
+    register(1186, parseInterval);
+    register(1187, parseIntervalArray);
+    register(17, parseByteA);
+    register(114, JSON.parse.bind(JSON));
+    register(3802, JSON.parse.bind(JSON));
+    register(199, parseJsonArray);
+    register(3807, parseJsonArray);
+    register(3907, parseStringArray);
+    register(2951, parseStringArray);
+    register(791, parseStringArray);
+    register(1183, parseStringArray);
+    register(1270, parseStringArray);
+  };
+  textParsers = {
+    init
+  };
+  return textParsers;
+}
+var pgInt8;
+var hasRequiredPgInt8;
+function requirePgInt8() {
+  if (hasRequiredPgInt8) return pgInt8;
+  hasRequiredPgInt8 = 1;
+  var BASE = 1e6;
+  function readInt8(buffer) {
+    var high = buffer.readInt32BE(0);
+    var low = buffer.readUInt32BE(4);
+    var sign = "";
+    if (high < 0) {
+      high = ~high + (low === 0);
+      low = ~low + 1 >>> 0;
+      sign = "-";
+    }
+    var result2 = "";
+    var carry;
+    var t;
+    var digits;
+    var pad;
+    var l;
+    var i;
+    {
+      carry = high % BASE;
+      high = high / BASE >>> 0;
+      t = 4294967296 * carry + low;
+      low = t / BASE >>> 0;
+      digits = "" + (t - BASE * low);
+      if (low === 0 && high === 0) {
+        return sign + digits + result2;
+      }
+      pad = "";
+      l = 6 - digits.length;
+      for (i = 0; i < l; i++) {
+        pad += "0";
+      }
+      result2 = pad + digits + result2;
+    }
+    {
+      carry = high % BASE;
+      high = high / BASE >>> 0;
+      t = 4294967296 * carry + low;
+      low = t / BASE >>> 0;
+      digits = "" + (t - BASE * low);
+      if (low === 0 && high === 0) {
+        return sign + digits + result2;
+      }
+      pad = "";
+      l = 6 - digits.length;
+      for (i = 0; i < l; i++) {
+        pad += "0";
+      }
+      result2 = pad + digits + result2;
+    }
+    {
+      carry = high % BASE;
+      high = high / BASE >>> 0;
+      t = 4294967296 * carry + low;
+      low = t / BASE >>> 0;
+      digits = "" + (t - BASE * low);
+      if (low === 0 && high === 0) {
+        return sign + digits + result2;
+      }
+      pad = "";
+      l = 6 - digits.length;
+      for (i = 0; i < l; i++) {
+        pad += "0";
+      }
+      result2 = pad + digits + result2;
+    }
+    {
+      carry = high % BASE;
+      t = 4294967296 * carry + low;
+      digits = "" + t % BASE;
+      return sign + digits + result2;
+    }
+  }
+  pgInt8 = readInt8;
+  return pgInt8;
+}
+var binaryParsers;
+var hasRequiredBinaryParsers;
+function requireBinaryParsers() {
+  if (hasRequiredBinaryParsers) return binaryParsers;
+  hasRequiredBinaryParsers = 1;
+  var parseInt64 = requirePgInt8();
+  var parseBits = function(data, bits, offset, invert, callback) {
+    offset = offset || 0;
+    invert = invert || false;
+    callback = callback || function(lastValue, newValue, bits2) {
+      return lastValue * Math.pow(2, bits2) + newValue;
+    };
+    var offsetBytes = offset >> 3;
+    var inv = function(value) {
+      if (invert) {
+        return ~value & 255;
+      }
+      return value;
+    };
+    var mask = 255;
+    var firstBits = 8 - offset % 8;
+    if (bits < firstBits) {
+      mask = 255 << 8 - bits & 255;
+      firstBits = bits;
+    }
+    if (offset) {
+      mask = mask >> offset % 8;
+    }
+    var result2 = 0;
+    if (offset % 8 + bits >= 8) {
+      result2 = callback(0, inv(data[offsetBytes]) & mask, firstBits);
+    }
+    var bytes = bits + offset >> 3;
+    for (var i = offsetBytes + 1; i < bytes; i++) {
+      result2 = callback(result2, inv(data[i]), 8);
+    }
+    var lastBits = (bits + offset) % 8;
+    if (lastBits > 0) {
+      result2 = callback(result2, inv(data[bytes]) >> 8 - lastBits, lastBits);
+    }
+    return result2;
+  };
+  var parseFloatFromBits = function(data, precisionBits, exponentBits) {
+    var bias = Math.pow(2, exponentBits - 1) - 1;
+    var sign = parseBits(data, 1);
+    var exponent = parseBits(data, exponentBits, 1);
+    if (exponent === 0) {
+      return 0;
+    }
+    var precisionBitsCounter = 1;
+    var parsePrecisionBits = function(lastValue, newValue, bits) {
+      if (lastValue === 0) {
+        lastValue = 1;
+      }
+      for (var i = 1; i <= bits; i++) {
+        precisionBitsCounter /= 2;
+        if ((newValue & 1 << bits - i) > 0) {
+          lastValue += precisionBitsCounter;
+        }
+      }
+      return lastValue;
+    };
+    var mantissa = parseBits(data, precisionBits, exponentBits + 1, false, parsePrecisionBits);
+    if (exponent == Math.pow(2, exponentBits + 1) - 1) {
+      if (mantissa === 0) {
+        return sign === 0 ? Infinity : -Infinity;
+      }
+      return NaN;
+    }
+    return (sign === 0 ? 1 : -1) * Math.pow(2, exponent - bias) * mantissa;
+  };
+  var parseInt16 = function(value) {
+    if (parseBits(value, 1) == 1) {
+      return -1 * (parseBits(value, 15, 1, true) + 1);
+    }
+    return parseBits(value, 15, 1);
+  };
+  var parseInt32 = function(value) {
+    if (parseBits(value, 1) == 1) {
+      return -1 * (parseBits(value, 31, 1, true) + 1);
+    }
+    return parseBits(value, 31, 1);
+  };
+  var parseFloat32 = function(value) {
+    return parseFloatFromBits(value, 23, 8);
+  };
+  var parseFloat64 = function(value) {
+    return parseFloatFromBits(value, 52, 11);
+  };
+  var parseNumeric = function(value) {
+    var sign = parseBits(value, 16, 32);
+    if (sign == 49152) {
+      return NaN;
+    }
+    var weight = Math.pow(1e4, parseBits(value, 16, 16));
+    var result2 = 0;
+    var ndigits = parseBits(value, 16);
+    for (var i = 0; i < ndigits; i++) {
+      result2 += parseBits(value, 16, 64 + 16 * i) * weight;
+      weight /= 1e4;
+    }
+    var scale = Math.pow(10, parseBits(value, 16, 48));
+    return (sign === 0 ? 1 : -1) * Math.round(result2 * scale) / scale;
+  };
+  var parseDate = function(isUTC, value) {
+    var sign = parseBits(value, 1);
+    var rawValue = parseBits(value, 63, 1);
+    var result2 = new Date((sign === 0 ? 1 : -1) * rawValue / 1e3 + 9466848e5);
+    if (!isUTC) {
+      result2.setTime(result2.getTime() + result2.getTimezoneOffset() * 6e4);
+    }
+    result2.usec = rawValue % 1e3;
+    result2.getMicroSeconds = function() {
+      return this.usec;
+    };
+    result2.setMicroSeconds = function(value2) {
+      this.usec = value2;
+    };
+    result2.getUTCMicroSeconds = function() {
+      return this.usec;
+    };
+    return result2;
+  };
+  var parseArray = function(value) {
+    var dim = parseBits(value, 32);
+    parseBits(value, 32, 32);
+    var elementType = parseBits(value, 32, 64);
+    var offset = 96;
+    var dims = [];
+    for (var i = 0; i < dim; i++) {
+      dims[i] = parseBits(value, 32, offset);
+      offset += 32;
+      offset += 32;
+    }
+    var parseElement = function(elementType2) {
+      var length = parseBits(value, 32, offset);
+      offset += 32;
+      if (length == 4294967295) {
+        return null;
+      }
+      var result2;
+      if (elementType2 == 23 || elementType2 == 20) {
+        result2 = parseBits(value, length * 8, offset);
+        offset += length * 8;
+        return result2;
+      } else if (elementType2 == 25) {
+        result2 = value.toString(this.encoding, offset >> 3, (offset += length << 3) >> 3);
+        return result2;
+      } else {
+        console.log("ERROR: ElementType not implemented: " + elementType2);
+      }
+    };
+    var parse2 = function(dimension, elementType2) {
+      var array2 = [];
+      var i2;
+      if (dimension.length > 1) {
+        var count = dimension.shift();
+        for (i2 = 0; i2 < count; i2++) {
+          array2[i2] = parse2(dimension, elementType2);
+        }
+        dimension.unshift(count);
+      } else {
+        for (i2 = 0; i2 < dimension[0]; i2++) {
+          array2[i2] = parseElement(elementType2);
+        }
+      }
+      return array2;
+    };
+    return parse2(dims, elementType);
+  };
+  var parseText = function(value) {
+    return value.toString("utf8");
+  };
+  var parseBool = function(value) {
+    if (value === null) return null;
+    return parseBits(value, 8) > 0;
+  };
+  var init = function(register) {
+    register(20, parseInt64);
+    register(21, parseInt16);
+    register(23, parseInt32);
+    register(26, parseInt32);
+    register(1700, parseNumeric);
+    register(700, parseFloat32);
+    register(701, parseFloat64);
+    register(16, parseBool);
+    register(1114, parseDate.bind(null, false));
+    register(1184, parseDate.bind(null, true));
+    register(1e3, parseArray);
+    register(1007, parseArray);
+    register(1016, parseArray);
+    register(1008, parseArray);
+    register(1009, parseArray);
+    register(25, parseText);
+  };
+  binaryParsers = {
+    init
+  };
+  return binaryParsers;
+}
+var builtins;
+var hasRequiredBuiltins;
+function requireBuiltins() {
+  if (hasRequiredBuiltins) return builtins;
+  hasRequiredBuiltins = 1;
+  builtins = {
+    BOOL: 16,
+    BYTEA: 17,
+    CHAR: 18,
+    INT8: 20,
+    INT2: 21,
+    INT4: 23,
+    REGPROC: 24,
+    TEXT: 25,
+    OID: 26,
+    TID: 27,
+    XID: 28,
+    CID: 29,
+    JSON: 114,
+    XML: 142,
+    PG_NODE_TREE: 194,
+    SMGR: 210,
+    PATH: 602,
+    POLYGON: 604,
+    CIDR: 650,
+    FLOAT4: 700,
+    FLOAT8: 701,
+    ABSTIME: 702,
+    RELTIME: 703,
+    TINTERVAL: 704,
+    CIRCLE: 718,
+    MACADDR8: 774,
+    MONEY: 790,
+    MACADDR: 829,
+    INET: 869,
+    ACLITEM: 1033,
+    BPCHAR: 1042,
+    VARCHAR: 1043,
+    DATE: 1082,
+    TIME: 1083,
+    TIMESTAMP: 1114,
+    TIMESTAMPTZ: 1184,
+    INTERVAL: 1186,
+    TIMETZ: 1266,
+    BIT: 1560,
+    VARBIT: 1562,
+    NUMERIC: 1700,
+    REFCURSOR: 1790,
+    REGPROCEDURE: 2202,
+    REGOPER: 2203,
+    REGOPERATOR: 2204,
+    REGCLASS: 2205,
+    REGTYPE: 2206,
+    UUID: 2950,
+    TXID_SNAPSHOT: 2970,
+    PG_LSN: 3220,
+    PG_NDISTINCT: 3361,
+    PG_DEPENDENCIES: 3402,
+    TSVECTOR: 3614,
+    TSQUERY: 3615,
+    GTSVECTOR: 3642,
+    REGCONFIG: 3734,
+    REGDICTIONARY: 3769,
+    JSONB: 3802,
+    REGNAMESPACE: 4089,
+    REGROLE: 4096
+  };
+  return builtins;
+}
+var hasRequiredPgTypes;
+function requirePgTypes() {
+  if (hasRequiredPgTypes) return pgTypes;
+  hasRequiredPgTypes = 1;
+  var textParsers2 = requireTextParsers();
+  var binaryParsers2 = requireBinaryParsers();
+  var arrayParser2 = requireArrayParser();
+  var builtinTypes = requireBuiltins();
+  pgTypes.getTypeParser = getTypeParser;
+  pgTypes.setTypeParser = setTypeParser;
+  pgTypes.arrayParser = arrayParser2;
+  pgTypes.builtins = builtinTypes;
+  var typeParsers = {
+    text: {},
+    binary: {}
+  };
+  function noParse(val) {
+    return String(val);
+  }
+  function getTypeParser(oid, format2) {
+    format2 = format2 || "text";
+    if (!typeParsers[format2]) {
+      return noParse;
+    }
+    return typeParsers[format2][oid] || noParse;
+  }
+  function setTypeParser(oid, format2, parseFn) {
+    if (typeof format2 == "function") {
+      parseFn = format2;
+      format2 = "text";
+    }
+    typeParsers[format2][oid] = parseFn;
+  }
+  textParsers2.init(function(oid, converter) {
+    typeParsers.text[oid] = converter;
+  });
+  binaryParsers2.init(function(oid, converter) {
+    typeParsers.binary[oid] = converter;
+  });
+  return pgTypes;
+}
+var hasRequiredDefaults$1;
+function requireDefaults$1() {
+  if (hasRequiredDefaults$1) return defaults$1.exports;
+  hasRequiredDefaults$1 = 1;
+  (function(module) {
+    let user;
+    try {
+      user = process.platform === "win32" ? process.env.USERNAME : process.env.USER;
+    } catch {
+    }
+    module.exports = {
+      // database host. defaults to localhost
+      host: "localhost",
+      // database user's name
+      user,
+      // name of database to connect
+      database: void 0,
+      // database user's password
+      password: null,
+      // a Postgres connection string to be used instead of setting individual connection items
+      // NOTE:  Setting this value will cause it to override any other value (such as database or user) defined
+      // in the defaults object.
+      connectionString: void 0,
+      // database port
+      port: 5432,
+      // number of rows to return at a time from a prepared statement's
+      // portal. 0 will return all rows at once
+      rows: 0,
+      // binary result mode
+      binary: false,
+      // Connection pool options - see https://github.com/brianc/node-pg-pool
+      // number of connections to use in connection pool
+      // 0 will disable connection pooling
+      max: 10,
+      // max milliseconds a client can go unused before it is removed
+      // from the pool and destroyed
+      idleTimeoutMillis: 3e4,
+      client_encoding: "",
+      ssl: false,
+      // SSL negotiation style: 'postgres' (traditional SSLRequest) or 'direct'
+      sslnegotiation: void 0,
+      application_name: void 0,
+      fallback_application_name: void 0,
+      options: void 0,
+      parseInputDatesAsUTC: false,
+      // max milliseconds any query using this connection will execute for before timing out in error.
+      // false=unlimited
+      statement_timeout: false,
+      // Abort any statement that waits longer than the specified duration in milliseconds while attempting to acquire a lock.
+      // false=unlimited
+      lock_timeout: false,
+      // Terminate any session with an open transaction that has been idle for longer than the specified duration in milliseconds
+      // false=unlimited
+      idle_in_transaction_session_timeout: false,
+      // max milliseconds to wait for query to complete (client side)
+      query_timeout: false,
+      connect_timeout: 0,
+      keepalives: 1,
+      keepalives_idle: 0
+    };
+    const pgTypes2 = requirePgTypes();
+    const parseBigInteger = pgTypes2.getTypeParser(20, "text");
+    const parseBigIntegerArray = pgTypes2.getTypeParser(1016, "text");
+    module.exports.__defineSetter__("parseInt8", function(val) {
+      pgTypes2.setTypeParser(20, "text", val ? pgTypes2.getTypeParser(23, "text") : parseBigInteger);
+      pgTypes2.setTypeParser(1016, "text", val ? pgTypes2.getTypeParser(1007, "text") : parseBigIntegerArray);
+    });
+  })(defaults$1);
+  return defaults$1.exports;
+}
+var utils$2;
+var hasRequiredUtils$2;
+function requireUtils$2() {
+  if (hasRequiredUtils$2) return utils$2;
+  hasRequiredUtils$2 = 1;
+  const defaults2 = requireDefaults$1();
+  const { isDate } = require$$1$1;
+  function escapeElement(elementRepresentation) {
+    const escaped = elementRepresentation.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    return '"' + escaped + '"';
+  }
+  function arrayString(val) {
+    let result2 = "{";
+    for (let i = 0; i < val.length; i++) {
+      if (i > 0) {
+        result2 += ",";
+      }
+      let item = val[i];
+      if (item == null) {
+        result2 += "NULL";
+      } else if (Array.isArray(item)) {
+        result2 += arrayString(item);
+      } else if (ArrayBuffer.isView(item)) {
+        if (!(item instanceof Buffer)) {
+          item = Buffer.from(item.buffer, item.byteOffset, item.byteLength);
+        }
+        result2 += "\\\\x" + item.toString("hex");
+      } else {
+        result2 += escapeElement(prepareValue(item));
+      }
+    }
+    result2 += "}";
+    return result2;
+  }
+  const prepareValue = function(val, seen) {
+    if (val == null) {
+      return null;
+    }
+    if (typeof val === "object") {
+      if (val instanceof Buffer) {
+        return val;
+      }
+      if (ArrayBuffer.isView(val)) {
+        return Buffer.from(val.buffer, val.byteOffset, val.byteLength);
+      }
+      if (isDate(val)) {
+        if (defaults2.parseInputDatesAsUTC) {
+          return dateToStringUTC(val);
+        } else {
+          return dateToString(val);
+        }
+      }
+      if (Array.isArray(val)) {
+        return arrayString(val);
+      }
+      return prepareObject(val, seen);
+    }
+    return val.toString();
+  };
+  function prepareObject(val, seen) {
+    if (val && typeof val.toPostgres === "function") {
+      seen = seen || [];
+      if (seen.indexOf(val) !== -1) {
+        throw new Error('circular reference detected while preparing "' + val + '" for query');
+      }
+      seen.push(val);
+      return prepareValue(val.toPostgres(prepareValue), seen);
+    }
+    return JSON.stringify(val);
+  }
+  function dateToString(date2) {
+    let offset = -date2.getTimezoneOffset();
+    let year = date2.getFullYear();
+    const isBCYear = year < 1;
+    if (isBCYear) year = Math.abs(year) + 1;
+    let ret = String(year).padStart(4, "0") + "-" + String(date2.getMonth() + 1).padStart(2, "0") + "-" + String(date2.getDate()).padStart(2, "0") + "T" + String(date2.getHours()).padStart(2, "0") + ":" + String(date2.getMinutes()).padStart(2, "0") + ":" + String(date2.getSeconds()).padStart(2, "0") + "." + String(date2.getMilliseconds()).padStart(3, "0");
+    if (offset < 0) {
+      ret += "-";
+      offset *= -1;
+    } else {
+      ret += "+";
+    }
+    ret += String(Math.floor(offset / 60)).padStart(2, "0") + ":" + String(offset % 60).padStart(2, "0");
+    if (isBCYear) ret += " BC";
+    return ret;
+  }
+  function dateToStringUTC(date2) {
+    let year = date2.getUTCFullYear();
+    const isBCYear = year < 1;
+    if (isBCYear) year = Math.abs(year) + 1;
+    let ret = String(year).padStart(4, "0") + "-" + String(date2.getUTCMonth() + 1).padStart(2, "0") + "-" + String(date2.getUTCDate()).padStart(2, "0") + "T" + String(date2.getUTCHours()).padStart(2, "0") + ":" + String(date2.getUTCMinutes()).padStart(2, "0") + ":" + String(date2.getUTCSeconds()).padStart(2, "0") + "." + String(date2.getUTCMilliseconds()).padStart(3, "0");
+    ret += "+00:00";
+    if (isBCYear) ret += " BC";
+    return ret;
+  }
+  function normalizeQueryConfig(config2, values, callback) {
+    config2 = typeof config2 === "string" ? { text: config2 } : config2;
+    if (values) {
+      if (typeof values === "function") {
+        config2.callback = values;
+      } else {
+        config2.values = values;
+      }
+    }
+    if (callback) {
+      config2.callback = callback;
+    }
+    return config2;
+  }
+  const escapeIdentifier = function(str) {
+    return '"' + str.replace(/"/g, '""') + '"';
+  };
+  const escapeLiteral = function(str) {
+    let hasBackslash = false;
+    let escaped = "'";
+    if (str == null) {
+      return "''";
+    }
+    if (typeof str !== "string") {
+      return "''";
+    }
+    for (let i = 0; i < str.length; i++) {
+      const c = str[i];
+      if (c === "'") {
+        escaped += c + c;
+      } else if (c === "\\") {
+        escaped += c + c;
+        hasBackslash = true;
+      } else {
+        escaped += c;
+      }
+    }
+    escaped += "'";
+    if (hasBackslash === true) {
+      escaped = " E" + escaped;
+    }
+    return escaped;
+  };
+  utils$2 = {
+    prepareValue: function prepareValueWrapper(value) {
+      return prepareValue(value);
+    },
+    normalizeQueryConfig,
+    escapeIdentifier,
+    escapeLiteral
+  };
+  return utils$2;
+}
+var utils$1;
+var hasRequiredUtils$1;
+function requireUtils$1() {
+  if (hasRequiredUtils$1) return utils$1;
+  hasRequiredUtils$1 = 1;
+  const nodeCrypto = require$$0;
+  utils$1 = {
+    postgresMd5PasswordHash,
+    randomBytes,
+    deriveKey,
+    sha256,
+    hashByName,
+    hmacSha256,
+    md5
+  };
+  const webCrypto = nodeCrypto.webcrypto || globalThis.crypto;
+  const subtleCrypto = webCrypto.subtle;
+  const textEncoder = new TextEncoder();
+  function randomBytes(length) {
+    return webCrypto.getRandomValues(Buffer.alloc(length));
+  }
+  async function md5(string2) {
+    try {
+      return nodeCrypto.createHash("md5").update(string2, "utf-8").digest("hex");
+    } catch (e) {
+      const data = typeof string2 === "string" ? textEncoder.encode(string2) : string2;
+      const hash = await subtleCrypto.digest("MD5", data);
+      return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+  }
+  async function postgresMd5PasswordHash(user, password, salt) {
+    const inner = await md5(password + user);
+    const outer = await md5(Buffer.concat([Buffer.from(inner), salt]));
+    return "md5" + outer;
+  }
+  async function sha256(text2) {
+    return await subtleCrypto.digest("SHA-256", text2);
+  }
+  async function hashByName(hashName, text2) {
+    return await subtleCrypto.digest(hashName, text2);
+  }
+  async function hmacSha256(keyBuffer, msg) {
+    const key = await subtleCrypto.importKey("raw", keyBuffer, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return await subtleCrypto.sign("HMAC", key, textEncoder.encode(msg));
+  }
+  async function deriveKey(password, salt, iterations) {
+    const key = await subtleCrypto.importKey("raw", textEncoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+    const params = { name: "PBKDF2", hash: "SHA-256", salt, iterations };
+    return await subtleCrypto.deriveBits(params, key, 32 * 8, ["deriveBits"]);
+  }
+  return utils$1;
+}
+var certSignatures;
+var hasRequiredCertSignatures;
+function requireCertSignatures() {
+  if (hasRequiredCertSignatures) return certSignatures;
+  hasRequiredCertSignatures = 1;
+  function x509Error(msg, cert) {
+    return new Error("SASL channel binding: " + msg + " when parsing public certificate " + cert.toString("base64"));
+  }
+  function readASN1Length(data, index) {
+    let length = data[index++];
+    if (length < 128) return { length, index };
+    const lengthBytes = length & 127;
+    if (lengthBytes > 4) throw x509Error("bad length", data);
+    length = 0;
+    for (let i = 0; i < lengthBytes; i++) {
+      length = length << 8 | data[index++];
+    }
+    return { length, index };
+  }
+  function readASN1OID(data, index) {
+    if (data[index++] !== 6) throw x509Error("non-OID data", data);
+    const { length: OIDLength, index: indexAfterOIDLength } = readASN1Length(data, index);
+    index = indexAfterOIDLength;
+    const lastIndex = index + OIDLength;
+    const byte1 = data[index++];
+    let oid = (byte1 / 40 >> 0) + "." + byte1 % 40;
+    while (index < lastIndex) {
+      let value = 0;
+      while (index < lastIndex) {
+        const nextByte = data[index++];
+        value = value << 7 | nextByte & 127;
+        if (nextByte < 128) break;
+      }
+      oid += "." + value;
+    }
+    return { oid, index };
+  }
+  function expectASN1Seq(data, index) {
+    if (data[index++] !== 48) throw x509Error("non-sequence data", data);
+    return readASN1Length(data, index);
+  }
+  function signatureAlgorithmHashFromCertificate(data, index) {
+    if (index === void 0) index = 0;
+    index = expectASN1Seq(data, index).index;
+    const { length: certInfoLength, index: indexAfterCertInfoLength } = expectASN1Seq(data, index);
+    index = indexAfterCertInfoLength + certInfoLength;
+    index = expectASN1Seq(data, index).index;
+    const { oid, index: indexAfterOID } = readASN1OID(data, index);
+    switch (oid) {
+      // RSA
+      case "1.2.840.113549.1.1.4":
+        return "MD5";
+      case "1.2.840.113549.1.1.5":
+        return "SHA-1";
+      case "1.2.840.113549.1.1.11":
+        return "SHA-256";
+      case "1.2.840.113549.1.1.12":
+        return "SHA-384";
+      case "1.2.840.113549.1.1.13":
+        return "SHA-512";
+      case "1.2.840.113549.1.1.14":
+        return "SHA-224";
+      case "1.2.840.113549.1.1.15":
+        return "SHA512-224";
+      case "1.2.840.113549.1.1.16":
+        return "SHA512-256";
+      // ECDSA
+      case "1.2.840.10045.4.1":
+        return "SHA-1";
+      case "1.2.840.10045.4.3.1":
+        return "SHA-224";
+      case "1.2.840.10045.4.3.2":
+        return "SHA-256";
+      case "1.2.840.10045.4.3.3":
+        return "SHA-384";
+      case "1.2.840.10045.4.3.4":
+        return "SHA-512";
+      // RSASSA-PSS: hash is indicated separately
+      case "1.2.840.113549.1.1.10": {
+        index = indexAfterOID;
+        index = expectASN1Seq(data, index).index;
+        if (data[index++] !== 160) throw x509Error("non-tag data", data);
+        index = readASN1Length(data, index).index;
+        index = expectASN1Seq(data, index).index;
+        const { oid: hashOID } = readASN1OID(data, index);
+        switch (hashOID) {
+          // standalone hash OIDs
+          case "1.2.840.113549.2.5":
+            return "MD5";
+          case "1.3.14.3.2.26":
+            return "SHA-1";
+          case "2.16.840.1.101.3.4.2.1":
+            return "SHA-256";
+          case "2.16.840.1.101.3.4.2.2":
+            return "SHA-384";
+          case "2.16.840.1.101.3.4.2.3":
+            return "SHA-512";
+        }
+        throw x509Error("unknown hash OID " + hashOID, data);
+      }
+      // Ed25519 -- see https: return//github.com/openssl/openssl/issues/15477
+      case "1.3.101.110":
+      case "1.3.101.112":
+        return "SHA-512";
+      // Ed448 -- still not in pg 17.2 (if supported, digest would be SHAKE256 x 64 bytes)
+      case "1.3.101.111":
+      case "1.3.101.113":
+        throw x509Error("Ed448 certificate channel binding is not currently supported by Postgres");
+    }
+    throw x509Error("unknown OID " + oid, data);
+  }
+  certSignatures = { signatureAlgorithmHashFromCertificate };
+  return certSignatures;
+}
+var sasl;
+var hasRequiredSasl;
+function requireSasl() {
+  if (hasRequiredSasl) return sasl;
+  hasRequiredSasl = 1;
+  const crypto = requireUtils$1();
+  const { signatureAlgorithmHashFromCertificate } = requireCertSignatures();
+  function saslprep(password) {
+    const nonAsciiSpace = /[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/g;
+    const mappedToNothing = /[\u00AD\u034F\u1806\u180B\u180C\u180D\u200C\u200D\u2060\uFE00-\uFE0F\uFEFF]/g;
+    return password.replace(nonAsciiSpace, " ").replace(mappedToNothing, "").normalize("NFKC");
+  }
+  const DEFAULT_MAX_SCRAM_ITERATIONS = 1e5;
+  function startSession(mechanisms, stream2, scramMaxIterations = DEFAULT_MAX_SCRAM_ITERATIONS) {
+    const candidates = ["SCRAM-SHA-256"];
+    if (stream2) candidates.unshift("SCRAM-SHA-256-PLUS");
+    const mechanism = candidates.find((candidate) => mechanisms.includes(candidate));
+    if (!mechanism) {
+      throw new Error("SASL: Only mechanism(s) " + candidates.join(" and ") + " are supported");
+    }
+    if (mechanism === "SCRAM-SHA-256-PLUS" && typeof stream2.getPeerCertificate !== "function") {
+      throw new Error("SASL: Mechanism SCRAM-SHA-256-PLUS requires a certificate");
+    }
+    const clientNonce = crypto.randomBytes(18).toString("base64");
+    const gs2Header = mechanism === "SCRAM-SHA-256-PLUS" ? "p=tls-server-end-point" : stream2 ? "y" : "n";
+    return {
+      mechanism,
+      clientNonce,
+      response: gs2Header + ",,n=*,r=" + clientNonce,
+      message: "SASLInitialResponse",
+      scramMaxIterations
+    };
+  }
+  async function continueSession(session, password, serverData, stream2) {
+    if (session.message !== "SASLInitialResponse") {
+      throw new Error("SASL: Last message was not SASLInitialResponse");
+    }
+    if (typeof password !== "string") {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string");
+    }
+    if (password === "") {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a non-empty string");
+    }
+    if (typeof serverData !== "string") {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: serverData must be a string");
+    }
+    const sv = parseServerFirstMessage(serverData);
+    if (!sv.nonce.startsWith(session.clientNonce)) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: server nonce does not start with client nonce");
+    } else if (sv.nonce.length === session.clientNonce.length) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: server nonce is too short");
+    }
+    const scramMaxIterations = typeof session.scramMaxIterations === "number" ? session.scramMaxIterations : DEFAULT_MAX_SCRAM_ITERATIONS;
+    if (scramMaxIterations !== 0 && sv.iteration > scramMaxIterations) {
+      throw new Error(
+        "SASL: SCRAM-SERVER-FIRST-MESSAGE: iteration count " + sv.iteration + " exceeds scramMaxIterations of " + scramMaxIterations
+      );
+    }
+    const clientFirstMessageBare = "n=*,r=" + session.clientNonce;
+    const serverFirstMessage = "r=" + sv.nonce + ",s=" + sv.salt + ",i=" + sv.iteration;
+    let channelBinding = stream2 ? "eSws" : "biws";
+    if (session.mechanism === "SCRAM-SHA-256-PLUS") {
+      const peerCert = stream2.getPeerCertificate().raw;
+      let hashName = signatureAlgorithmHashFromCertificate(peerCert);
+      if (hashName === "MD5" || hashName === "SHA-1") hashName = "SHA-256";
+      const certHash = await crypto.hashByName(hashName, peerCert);
+      const bindingData = Buffer.concat([Buffer.from("p=tls-server-end-point,,"), Buffer.from(certHash)]);
+      channelBinding = bindingData.toString("base64");
+    }
+    const clientFinalMessageWithoutProof = "c=" + channelBinding + ",r=" + sv.nonce;
+    const authMessage = clientFirstMessageBare + "," + serverFirstMessage + "," + clientFinalMessageWithoutProof;
+    const saltBytes = Buffer.from(sv.salt, "base64");
+    const saltedPassword = await crypto.deriveKey(saslprep(password), saltBytes, sv.iteration);
+    const clientKey = await crypto.hmacSha256(saltedPassword, "Client Key");
+    const storedKey = await crypto.sha256(clientKey);
+    const clientSignature = await crypto.hmacSha256(storedKey, authMessage);
+    const clientProof = xorBuffers(Buffer.from(clientKey), Buffer.from(clientSignature)).toString("base64");
+    const serverKey = await crypto.hmacSha256(saltedPassword, "Server Key");
+    const serverSignatureBytes = await crypto.hmacSha256(serverKey, authMessage);
+    session.message = "SASLResponse";
+    session.serverSignature = Buffer.from(serverSignatureBytes).toString("base64");
+    session.response = clientFinalMessageWithoutProof + ",p=" + clientProof;
+  }
+  function finalizeSession(session, serverData) {
+    if (session.message !== "SASLResponse") {
+      throw new Error("SASL: Last message was not SASLResponse");
+    }
+    if (typeof serverData !== "string") {
+      throw new Error("SASL: SCRAM-SERVER-FINAL-MESSAGE: serverData must be a string");
+    }
+    const { serverSignature } = parseServerFinalMessage(serverData);
+    if (serverSignature !== session.serverSignature) {
+      throw new Error("SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature does not match");
+    }
+  }
+  function isPrintableChars(text2) {
+    if (typeof text2 !== "string") {
+      throw new TypeError("SASL: text must be a string");
+    }
+    return text2.split("").map((_, i) => text2.charCodeAt(i)).every((c) => c >= 33 && c <= 43 || c >= 45 && c <= 126);
+  }
+  function isBase64(text2) {
+    return /^(?:[a-zA-Z0-9+/]{4})*(?:[a-zA-Z0-9+/]{2}==|[a-zA-Z0-9+/]{3}=)?$/.test(text2);
+  }
+  function parseAttributePairs(text2) {
+    if (typeof text2 !== "string") {
+      throw new TypeError("SASL: attribute pairs text must be a string");
+    }
+    return new Map(
+      text2.split(",").map((attrValue) => {
+        if (!/^.=/.test(attrValue)) {
+          throw new Error("SASL: Invalid attribute pair entry");
+        }
+        const name = attrValue[0];
+        const value = attrValue.substring(2);
+        return [name, value];
+      })
+    );
+  }
+  function parseServerFirstMessage(data) {
+    const attrPairs = parseAttributePairs(data);
+    const nonce = attrPairs.get("r");
+    if (!nonce) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: nonce missing");
+    } else if (!isPrintableChars(nonce)) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: nonce must only contain printable characters");
+    }
+    const salt = attrPairs.get("s");
+    if (!salt) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: salt missing");
+    } else if (!isBase64(salt)) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: salt must be base64");
+    }
+    const iterationText = attrPairs.get("i");
+    if (!iterationText) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: iteration missing");
+    } else if (!/^[1-9][0-9]*$/.test(iterationText)) {
+      throw new Error("SASL: SCRAM-SERVER-FIRST-MESSAGE: invalid iteration count");
+    }
+    const iteration = parseInt(iterationText, 10);
+    return {
+      nonce,
+      salt,
+      iteration
+    };
+  }
+  function parseServerFinalMessage(serverData) {
+    const attrPairs = parseAttributePairs(serverData);
+    const error = attrPairs.get("e");
+    const serverSignature = attrPairs.get("v");
+    if (error) {
+      throw new Error(`SASL: SCRAM-SERVER-FINAL-MESSAGE: server returned error: "${error}"`);
+    }
+    if (!serverSignature) {
+      throw new Error("SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature is missing");
+    } else if (!isBase64(serverSignature)) {
+      throw new Error("SASL: SCRAM-SERVER-FINAL-MESSAGE: server signature must be base64");
+    }
+    return {
+      serverSignature
+    };
+  }
+  function xorBuffers(a, b) {
+    if (!Buffer.isBuffer(a)) {
+      throw new TypeError("first argument must be a Buffer");
+    }
+    if (!Buffer.isBuffer(b)) {
+      throw new TypeError("second argument must be a Buffer");
+    }
+    if (a.length !== b.length) {
+      throw new Error("Buffer lengths must match");
+    }
+    if (a.length === 0) {
+      throw new Error("Buffers cannot be empty");
+    }
+    return Buffer.from(a.map((_, i) => a[i] ^ b[i]));
+  }
+  sasl = {
+    startSession,
+    continueSession,
+    finalizeSession,
+    DEFAULT_MAX_SCRAM_ITERATIONS
+  };
+  return sasl;
+}
+var typeOverrides;
+var hasRequiredTypeOverrides;
+function requireTypeOverrides() {
+  if (hasRequiredTypeOverrides) return typeOverrides;
+  hasRequiredTypeOverrides = 1;
+  const types2 = requirePgTypes();
+  function TypeOverrides(userTypes) {
+    this._types = userTypes || types2;
+    this.text = {};
+    this.binary = {};
+  }
+  TypeOverrides.prototype.getOverrides = function(format2) {
+    switch (format2) {
+      case "text":
+        return this.text;
+      case "binary":
+        return this.binary;
+      default:
+        return {};
+    }
+  };
+  TypeOverrides.prototype.setTypeParser = function(oid, format2, parseFn) {
+    if (typeof format2 === "function") {
+      parseFn = format2;
+      format2 = "text";
+    }
+    this.getOverrides(format2)[oid] = parseFn;
+  };
+  TypeOverrides.prototype.getTypeParser = function(oid, format2) {
+    format2 = format2 || "text";
+    return this.getOverrides(format2)[oid] || this._types.getTypeParser(oid, format2);
+  };
+  typeOverrides = TypeOverrides;
+  return typeOverrides;
+}
+var pgConnectionString;
+var hasRequiredPgConnectionString;
+function requirePgConnectionString() {
+  if (hasRequiredPgConnectionString) return pgConnectionString;
+  hasRequiredPgConnectionString = 1;
+  function parse2(str, options = {}) {
+    if (str.charAt(0) === "/") {
+      const config3 = str.split(" ");
+      return { host: config3[0], database: config3[1] };
+    }
+    const config2 = /* @__PURE__ */ Object.create(null);
+    let result2;
+    let dummyHost = false;
+    if (/ |%[^a-f0-9]|%[a-f0-9][^a-f0-9]/i.test(str)) {
+      str = encodeURI(str).replace(/%25(\d\d)/g, "%$1");
+    }
+    try {
+      try {
+        result2 = new URL(str, "postgres://base");
+      } catch (e) {
+        result2 = new URL(str.replace("@/", "@___DUMMY___/"), "postgres://base");
+        dummyHost = true;
+      }
+    } catch (err) {
+      err.input && (err.input = "*****REDACTED*****");
+      throw err;
+    }
+    for (const entry of result2.searchParams.entries()) {
+      config2[entry[0]] = entry[1];
+    }
+    config2.user = config2.user || decodeURIComponent(result2.username);
+    config2.password = config2.password || decodeURIComponent(result2.password);
+    if (result2.protocol == "socket:") {
+      config2.host = decodeURI(result2.pathname);
+      config2.database = result2.searchParams.get("db");
+      config2.client_encoding = result2.searchParams.get("encoding");
+      return config2;
+    }
+    const hostname2 = dummyHost ? "" : result2.hostname;
+    if (!config2.host) {
+      config2.host = decodeURIComponent(hostname2);
+    } else if (hostname2 && /^%2f/i.test(hostname2)) {
+      result2.pathname = hostname2 + result2.pathname;
+    }
+    if (!config2.port) {
+      config2.port = result2.port;
+    }
+    const pathname = result2.pathname.slice(1) || null;
+    config2.database = pathname ? decodeURI(pathname) : null;
+    if (config2.ssl === "true" || config2.ssl === "1") {
+      config2.ssl = true;
+    }
+    if (config2.ssl === "0") {
+      config2.ssl = false;
+    }
+    if (config2.sslcert || config2.sslkey || config2.sslrootcert || config2.sslmode) {
+      config2.ssl = {};
+    }
+    if (config2.sslnegotiation === "direct" && config2.ssl === void 0) {
+      config2.ssl = true;
+    }
+    const fs = config2.sslcert || config2.sslkey || config2.sslrootcert ? require$$0$1 : null;
+    if (config2.sslcert) {
+      config2.ssl.cert = fs.readFileSync(config2.sslcert).toString();
+    }
+    if (config2.sslkey) {
+      config2.ssl.key = fs.readFileSync(config2.sslkey).toString();
+    }
+    if (config2.sslrootcert) {
+      config2.ssl.ca = fs.readFileSync(config2.sslrootcert).toString();
+    }
+    if (options.useLibpqCompat && config2.uselibpqcompat) {
+      throw new Error("Both useLibpqCompat and uselibpqcompat are set. Please use only one of them.");
+    }
+    if (config2.uselibpqcompat === "true" || options.useLibpqCompat) {
+      switch (config2.sslmode) {
+        case "disable": {
+          config2.ssl = false;
+          break;
+        }
+        case "prefer": {
+          config2.ssl.rejectUnauthorized = false;
+          break;
+        }
+        case "require": {
+          if (config2.sslrootcert) {
+            config2.ssl.checkServerIdentity = function() {
+            };
+          } else {
+            config2.ssl.rejectUnauthorized = false;
+          }
+          break;
+        }
+        case "verify-ca": {
+          if (!config2.ssl.ca) {
+            throw new Error(
+              "SECURITY WARNING: Using sslmode=verify-ca requires specifying a CA with sslrootcert. If a public CA is used, verify-ca allows connections to a server that somebody else may have registered with the CA, making you vulnerable to Man-in-the-Middle attacks. Either specify a custom CA certificate with sslrootcert parameter or use sslmode=verify-full for proper security."
+            );
+          }
+          config2.ssl.checkServerIdentity = function() {
+          };
+          break;
+        }
+      }
+    } else {
+      switch (config2.sslmode) {
+        case "disable": {
+          config2.ssl = false;
+          break;
+        }
+        case "prefer":
+        case "require":
+        case "verify-ca":
+        case "verify-full": {
+          if (config2.sslmode !== "verify-full") {
+            deprecatedSslModeWarning(config2.sslmode);
+          }
+          break;
+        }
+        case "no-verify": {
+          config2.ssl.rejectUnauthorized = false;
+          break;
+        }
+      }
+    }
+    return config2;
+  }
+  function toConnectionOptions(sslConfig) {
+    const connectionOptions = Object.entries(sslConfig).reduce((c, [key, value]) => {
+      if (value !== void 0 && value !== null) {
+        c[key] = value;
+      }
+      return c;
+    }, /* @__PURE__ */ Object.create(null));
+    return connectionOptions;
+  }
+  function toClientConfig(config2) {
+    const poolConfig = Object.entries(config2).reduce((c, [key, value]) => {
+      if (key === "ssl") {
+        const sslConfig = value;
+        if (typeof sslConfig === "boolean") {
+          c[key] = sslConfig;
+        }
+        if (typeof sslConfig === "object") {
+          c[key] = toConnectionOptions(sslConfig);
+        }
+      } else if (value !== void 0 && value !== null) {
+        if (key === "port") {
+          if (value !== "") {
+            const v = parseInt(value, 10);
+            if (isNaN(v)) {
+              throw new Error(`Invalid ${key}: ${value}`);
+            }
+            c[key] = v;
+          }
+        } else {
+          c[key] = value;
+        }
+      }
+      return c;
+    }, /* @__PURE__ */ Object.create(null));
+    return poolConfig;
+  }
+  function parseIntoClientConfig(str) {
+    return toClientConfig(parse2(str));
+  }
+  function deprecatedSslModeWarning(sslmode) {
+    if (!deprecatedSslModeWarning.warned && typeof process !== "undefined" && process.emitWarning) {
+      deprecatedSslModeWarning.warned = true;
+      process.emitWarning(`SECURITY WARNING: The SSL modes 'prefer', 'require', and 'verify-ca' are treated as aliases for 'verify-full'.
+In the next major version (pg-connection-string v3.0.0 and pg v9.0.0), these modes will adopt standard libpq semantics, which have weaker security guarantees.
+
+To prepare for this change:
+- If you want the current behavior, explicitly use 'sslmode=verify-full'
+- If you want libpq compatibility now, use 'uselibpqcompat=true&sslmode=${sslmode}'
+
+See https://www.postgresql.org/docs/current/libpq-ssl.html for libpq SSL mode definitions.`);
+    }
+  }
+  pgConnectionString = parse2;
+  parse2.parse = parse2;
+  parse2.toClientConfig = toClientConfig;
+  parse2.parseIntoClientConfig = parseIntoClientConfig;
+  return pgConnectionString;
+}
+var connectionParameters;
+var hasRequiredConnectionParameters;
+function requireConnectionParameters() {
+  if (hasRequiredConnectionParameters) return connectionParameters;
+  hasRequiredConnectionParameters = 1;
+  const dns = require$$0$2;
+  const defaults2 = requireDefaults$1();
+  const parse2 = requirePgConnectionString().parse;
+  const val = function(key, config2, envVar) {
+    if (config2[key]) {
+      return config2[key];
+    }
+    if (envVar === void 0) {
+      envVar = process.env["PG" + key.toUpperCase()];
+    } else if (envVar === false) ;
+    else {
+      envVar = process.env[envVar];
+    }
+    return envVar || defaults2[key];
+  };
+  const readSSLConfigFromEnvironment = function() {
+    switch (process.env.PGSSLMODE) {
+      case "disable":
+        return false;
+      case "prefer":
+      case "require":
+      case "verify-ca":
+      case "verify-full":
+        return true;
+      case "no-verify":
+        return { rejectUnauthorized: false };
+    }
+    return defaults2.ssl;
+  };
+  const quoteParamValue = function(value) {
+    return "'" + ("" + value).replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+  };
+  const add = function(params, config2, paramName) {
+    const value = config2[paramName];
+    if (value !== void 0 && value !== null) {
+      params.push(paramName + "=" + quoteParamValue(value));
+    }
+  };
+  class ConnectionParameters {
+    constructor(config2) {
+      config2 = typeof config2 === "string" ? parse2(config2) : config2 || {};
+      if (config2.connectionString) {
+        config2 = Object.assign({}, config2, parse2(config2.connectionString));
+      }
+      this.user = val("user", config2);
+      this.database = val("database", config2);
+      if (this.database === void 0) {
+        this.database = this.user;
+      }
+      this.port = parseInt(val("port", config2), 10);
+      this.host = val("host", config2);
+      Object.defineProperty(this, "password", {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: val("password", config2)
+      });
+      this.binary = val("binary", config2);
+      this.options = val("options", config2);
+      this.ssl = typeof config2.ssl === "undefined" ? readSSLConfigFromEnvironment() : config2.ssl;
+      if (typeof this.ssl === "string") {
+        if (this.ssl === "true") {
+          this.ssl = true;
+        }
+      }
+      if (this.ssl === "no-verify") {
+        this.ssl = { rejectUnauthorized: false };
+      }
+      if (this.ssl && this.ssl.key) {
+        Object.defineProperty(this.ssl, "key", {
+          enumerable: false
+        });
+      }
+      this.sslnegotiation = val("sslnegotiation", config2, "PGSSLNEGOTIATION");
+      if (this.sslnegotiation !== void 0 && this.sslnegotiation !== "postgres" && this.sslnegotiation !== "direct") {
+        throw new Error(
+          `Invalid sslnegotiation value: "${this.sslnegotiation}". Valid values are "postgres" and "direct".`
+        );
+      }
+      if (this.sslnegotiation === "direct" && !this.ssl) {
+        throw new Error("sslnegotiation=direct requires SSL to be enabled");
+      }
+      this.client_encoding = val("client_encoding", config2);
+      this.replication = val("replication", config2);
+      this.isDomainSocket = !(this.host || "").indexOf("/");
+      this.application_name = val("application_name", config2, "PGAPPNAME");
+      this.fallback_application_name = val("fallback_application_name", config2, false);
+      this.statement_timeout = val("statement_timeout", config2, false);
+      this.lock_timeout = val("lock_timeout", config2, false);
+      this.idle_in_transaction_session_timeout = val("idle_in_transaction_session_timeout", config2, false);
+      this.query_timeout = val("query_timeout", config2, false);
+      if (config2.connectionTimeoutMillis === void 0) {
+        this.connect_timeout = process.env.PGCONNECT_TIMEOUT || 0;
+      } else {
+        this.connect_timeout = Math.floor(config2.connectionTimeoutMillis / 1e3);
+      }
+      if (config2.keepAlive === false) {
+        this.keepalives = 0;
+      } else if (config2.keepAlive === true) {
+        this.keepalives = 1;
+      }
+      if (typeof config2.keepAliveInitialDelayMillis === "number") {
+        this.keepalives_idle = Math.floor(config2.keepAliveInitialDelayMillis / 1e3);
+      }
+    }
+    getLibpqConnectionString(cb) {
+      const params = [];
+      add(params, this, "user");
+      add(params, this, "password");
+      add(params, this, "port");
+      add(params, this, "application_name");
+      add(params, this, "fallback_application_name");
+      add(params, this, "connect_timeout");
+      add(params, this, "options");
+      const ssl = typeof this.ssl === "object" ? this.ssl : this.ssl ? { sslmode: this.ssl } : {};
+      add(params, ssl, "sslmode");
+      add(params, ssl, "sslca");
+      add(params, ssl, "sslkey");
+      add(params, ssl, "sslcert");
+      add(params, ssl, "sslrootcert");
+      add(params, this, "sslnegotiation");
+      if (this.database) {
+        params.push("dbname=" + quoteParamValue(this.database));
+      }
+      if (this.replication) {
+        params.push("replication=" + quoteParamValue(this.replication));
+      }
+      if (this.host) {
+        params.push("host=" + quoteParamValue(this.host));
+      }
+      if (this.isDomainSocket) {
+        return cb(null, params.join(" "));
+      }
+      if (this.client_encoding) {
+        params.push("client_encoding=" + quoteParamValue(this.client_encoding));
+      }
+      dns.lookup(this.host, function(err, address) {
+        if (err) return cb(err, null);
+        params.push("hostaddr=" + quoteParamValue(address));
+        return cb(null, params.join(" "));
+      });
+    }
+  }
+  connectionParameters = ConnectionParameters;
+  return connectionParameters;
+}
+var result$1;
+var hasRequiredResult;
+function requireResult() {
+  if (hasRequiredResult) return result$1;
+  hasRequiredResult = 1;
+  const types2 = requirePgTypes();
+  const matchRegexp = /^([A-Za-z]+)(?: (\d+))?(?: (\d+))?/;
+  class Result {
+    constructor(rowMode, types3) {
+      this.command = null;
+      this.rowCount = null;
+      this.oid = null;
+      this.rows = [];
+      this.fields = [];
+      this._parsers = void 0;
+      this._types = types3;
+      this.RowCtor = null;
+      this.rowAsArray = rowMode === "array";
+      if (this.rowAsArray) {
+        this.parseRow = this._parseRowAsArray;
+      }
+      this._prebuiltEmptyResultObject = null;
+    }
+    // adds a command complete message
+    addCommandComplete(msg) {
+      let match;
+      if (msg.text) {
+        match = matchRegexp.exec(msg.text);
+      } else {
+        match = matchRegexp.exec(msg.command);
+      }
+      if (match) {
+        this.command = match[1];
+        if (match[3]) {
+          this.oid = parseInt(match[2], 10);
+          this.rowCount = parseInt(match[3], 10);
+        } else if (match[2]) {
+          this.rowCount = parseInt(match[2], 10);
+        }
+      }
+    }
+    _parseRowAsArray(rowData) {
+      const row = new Array(rowData.length);
+      for (let i = 0, len = rowData.length; i < len; i++) {
+        const rawValue = rowData[i];
+        if (rawValue !== null) {
+          row[i] = this._parsers[i](rawValue);
+        } else {
+          row[i] = null;
+        }
+      }
+      return row;
+    }
+    parseRow(rowData) {
+      const row = { ...this._prebuiltEmptyResultObject };
+      for (let i = 0, len = rowData.length; i < len; i++) {
+        const rawValue = rowData[i];
+        const field = this.fields[i].name;
+        if (rawValue !== null) {
+          const v = this.fields[i].format === "binary" ? Buffer.from(rawValue) : rawValue;
+          row[field] = this._parsers[i](v);
+        } else {
+          row[field] = null;
+        }
+      }
+      return row;
+    }
+    addRow(row) {
+      this.rows.push(row);
+    }
+    addFields(fieldDescriptions) {
+      this.fields = fieldDescriptions;
+      if (this.fields.length) {
+        this._parsers = new Array(fieldDescriptions.length);
+      }
+      const row = /* @__PURE__ */ Object.create(null);
+      for (let i = 0; i < fieldDescriptions.length; i++) {
+        const desc = fieldDescriptions[i];
+        row[desc.name] = null;
+        if (this._types) {
+          this._parsers[i] = this._types.getTypeParser(desc.dataTypeID, desc.format || "text");
+        } else {
+          this._parsers[i] = types2.getTypeParser(desc.dataTypeID, desc.format || "text");
+        }
+      }
+      this._prebuiltEmptyResultObject = { ...row };
+    }
+  }
+  result$1 = Result;
+  return result$1;
+}
+var query$1;
+var hasRequiredQuery$1;
+function requireQuery$1() {
+  if (hasRequiredQuery$1) return query$1;
+  hasRequiredQuery$1 = 1;
+  const { EventEmitter } = require$$0$3;
+  const Result = requireResult();
+  const utils2 = requireUtils$2();
+  class Query extends EventEmitter {
+    constructor(config2, values, callback) {
+      super();
+      config2 = utils2.normalizeQueryConfig(config2, values, callback);
+      this.text = config2.text;
+      this.values = config2.values;
+      this.rows = config2.rows;
+      this.types = config2.types;
+      this.name = config2.name;
+      this.queryMode = config2.queryMode;
+      this.binary = config2.binary;
+      this.portal = config2.portal || "";
+      this.callback = config2.callback;
+      this._rowMode = config2.rowMode;
+      if (process.domain && config2.callback) {
+        this.callback = process.domain.bind(config2.callback);
+      }
+      this._result = new Result(this._rowMode, this.types);
+      this._results = this._result;
+      this._canceledDueToError = false;
+    }
+    requiresPreparation() {
+      if (this.queryMode === "extended") {
+        return true;
+      }
+      if (this.name) {
+        return true;
+      }
+      if (this.rows) {
+        return true;
+      }
+      if (!this.text) {
+        return false;
+      }
+      if (!this.values) {
+        return false;
+      }
+      return this.values.length > 0;
+    }
+    _checkForMultirow() {
+      if (this._result.command) {
+        if (!Array.isArray(this._results)) {
+          this._results = [this._result];
+        }
+        this._result = new Result(this._rowMode, this._result._types);
+        this._results.push(this._result);
+      }
+    }
+    // associates row metadata from the supplied
+    // message with this query object
+    // metadata used when parsing row results
+    handleRowDescription(msg) {
+      this._checkForMultirow();
+      this._result.addFields(msg.fields);
+      this._accumulateRows = this.callback || !this.listeners("row").length;
+    }
+    handleDataRow(msg) {
+      let row;
+      if (this._canceledDueToError) {
+        return;
+      }
+      try {
+        row = this._result.parseRow(msg.fields);
+      } catch (err) {
+        this._canceledDueToError = err;
+        return;
+      }
+      this.emit("row", row, this._result);
+      if (this._accumulateRows) {
+        this._result.addRow(row);
+      }
+    }
+    handleCommandComplete(msg, connection2) {
+      this._checkForMultirow();
+      this._result.addCommandComplete(msg);
+      if (this.rows) {
+        connection2.sync();
+      }
+    }
+    // if a named prepared statement is created with empty query text
+    // the backend will send an emptyQuery message but *not* a command complete message
+    // since we pipeline sync immediately after execute we don't need to do anything here
+    // unless we have rows specified, in which case we did not pipeline the initial sync call
+    handleEmptyQuery(connection2) {
+      if (this.rows) {
+        connection2.sync();
+      }
+    }
+    handleError(err, connection2) {
+      if (this._canceledDueToError) {
+        err = this._canceledDueToError;
+        this._canceledDueToError = false;
+      }
+      if (this.callback) {
+        return this.callback(err);
+      }
+      this.emit("error", err);
+    }
+    handleReadyForQuery(con) {
+      if (this._canceledDueToError) {
+        return this.handleError(this._canceledDueToError, con);
+      }
+      if (this.callback) {
+        try {
+          this.callback(null, this._results);
+        } catch (err) {
+          process.nextTick(() => {
+            throw err;
+          });
+        }
+      }
+      this.emit("end", this._results);
+    }
+    submit(connection2) {
+      if (typeof this.text !== "string" && typeof this.name !== "string") {
+        return new Error("A query must have either text or a name. Supplying neither is unsupported.");
+      }
+      const previous = connection2.parsedStatements[this.name];
+      if (this.text && previous && this.text !== previous) {
+        return new Error(`Prepared statements must be unique - '${this.name}' was used for a different statement`);
+      }
+      if (this.values && !Array.isArray(this.values)) {
+        return new Error("Query values must be an array");
+      }
+      if (this.requiresPreparation()) {
+        connection2.stream.cork && connection2.stream.cork();
+        try {
+          this.prepare(connection2);
+        } finally {
+          connection2.stream.uncork && connection2.stream.uncork();
+        }
+      } else {
+        connection2.query(this.text);
+      }
+      return null;
+    }
+    hasBeenParsed(connection2) {
+      return this.name && connection2.parsedStatements[this.name];
+    }
+    handlePortalSuspended(connection2) {
+      this._getRows(connection2, this.rows);
+    }
+    _getRows(connection2, rows) {
+      connection2.execute({
+        portal: this.portal,
+        rows
+      });
+      if (!rows) {
+        connection2.sync();
+      } else {
+        connection2.flush();
+      }
+    }
+    // http://developer.postgresql.org/pgdocs/postgres/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
+    prepare(connection2) {
+      if (!this.hasBeenParsed(connection2)) {
+        connection2.parse({
+          text: this.text,
+          name: this.name,
+          types: this.types
+        });
+      }
+      try {
+        connection2.bind({
+          portal: this.portal,
+          statement: this.name,
+          values: this.values,
+          binary: this.binary,
+          valueMapper: utils2.prepareValue
+        });
+      } catch (err) {
+        connection2.close({ type: "S", name: this.name });
+        connection2.sync();
+        this.handleError(err, connection2);
+        return;
+      }
+      connection2.describe({
+        type: "P",
+        name: this.portal || ""
+      });
+      this._getRows(connection2, this.rows);
+    }
+    handleCopyInResponse(connection2) {
+      connection2.sendCopyFail("No source stream defined");
+    }
+    handleCopyData(msg, connection2) {
+    }
+  }
+  query$1 = Query;
+  return query$1;
+}
+var dist$1 = {};
+var messages = {};
+var hasRequiredMessages;
+function requireMessages() {
+  if (hasRequiredMessages) return messages;
+  hasRequiredMessages = 1;
+  Object.defineProperty(messages, "__esModule", { value: true });
+  messages.NoticeMessage = messages.DataRowMessage = messages.CommandCompleteMessage = messages.ReadyForQueryMessage = messages.NotificationResponseMessage = messages.BackendKeyDataMessage = messages.AuthenticationMD5Password = messages.ParameterStatusMessage = messages.ParameterDescriptionMessage = messages.RowDescriptionMessage = messages.Field = messages.CopyResponse = messages.CopyDataMessage = messages.DatabaseError = messages.copyDone = messages.emptyQuery = messages.replicationStart = messages.portalSuspended = messages.noData = messages.closeComplete = messages.bindComplete = messages.parseComplete = void 0;
+  messages.parseComplete = {
+    name: "parseComplete",
+    length: 5
+  };
+  messages.bindComplete = {
+    name: "bindComplete",
+    length: 5
+  };
+  messages.closeComplete = {
+    name: "closeComplete",
+    length: 5
+  };
+  messages.noData = {
+    name: "noData",
+    length: 5
+  };
+  messages.portalSuspended = {
+    name: "portalSuspended",
+    length: 5
+  };
+  messages.replicationStart = {
+    name: "replicationStart",
+    length: 4
+  };
+  messages.emptyQuery = {
+    name: "emptyQuery",
+    length: 4
+  };
+  messages.copyDone = {
+    name: "copyDone",
+    length: 4
+  };
+  class DatabaseError extends Error {
+    constructor(message, length, name) {
+      super(message);
+      this.length = length;
+      this.name = name;
+    }
+  }
+  messages.DatabaseError = DatabaseError;
+  class CopyDataMessage {
+    constructor(length, chunk) {
+      this.length = length;
+      this.chunk = chunk;
+      this.name = "copyData";
+    }
+  }
+  messages.CopyDataMessage = CopyDataMessage;
+  class CopyResponse {
+    constructor(length, name, binary, columnCount) {
+      this.length = length;
+      this.name = name;
+      this.binary = binary;
+      this.columnTypes = new Array(columnCount);
+    }
+  }
+  messages.CopyResponse = CopyResponse;
+  class Field {
+    constructor(name, tableID, columnID, dataTypeID, dataTypeSize, dataTypeModifier, format2) {
+      this.name = name;
+      this.tableID = tableID;
+      this.columnID = columnID;
+      this.dataTypeID = dataTypeID;
+      this.dataTypeSize = dataTypeSize;
+      this.dataTypeModifier = dataTypeModifier;
+      this.format = format2;
+    }
+  }
+  messages.Field = Field;
+  class RowDescriptionMessage {
+    constructor(length, fieldCount) {
+      this.length = length;
+      this.fieldCount = fieldCount;
+      this.name = "rowDescription";
+      this.fields = new Array(this.fieldCount);
+    }
+  }
+  messages.RowDescriptionMessage = RowDescriptionMessage;
+  class ParameterDescriptionMessage {
+    constructor(length, parameterCount) {
+      this.length = length;
+      this.parameterCount = parameterCount;
+      this.name = "parameterDescription";
+      this.dataTypeIDs = new Array(this.parameterCount);
+    }
+  }
+  messages.ParameterDescriptionMessage = ParameterDescriptionMessage;
+  class ParameterStatusMessage {
+    constructor(length, parameterName, parameterValue) {
+      this.length = length;
+      this.parameterName = parameterName;
+      this.parameterValue = parameterValue;
+      this.name = "parameterStatus";
+    }
+  }
+  messages.ParameterStatusMessage = ParameterStatusMessage;
+  class AuthenticationMD5Password {
+    constructor(length, salt) {
+      this.length = length;
+      this.salt = salt;
+      this.name = "authenticationMD5Password";
+    }
+  }
+  messages.AuthenticationMD5Password = AuthenticationMD5Password;
+  class BackendKeyDataMessage {
+    constructor(length, processID, secretKey) {
+      this.length = length;
+      this.processID = processID;
+      this.secretKey = secretKey;
+      this.name = "backendKeyData";
+    }
+  }
+  messages.BackendKeyDataMessage = BackendKeyDataMessage;
+  class NotificationResponseMessage {
+    constructor(length, processId, channel, payload) {
+      this.length = length;
+      this.processId = processId;
+      this.channel = channel;
+      this.payload = payload;
+      this.name = "notification";
+    }
+  }
+  messages.NotificationResponseMessage = NotificationResponseMessage;
+  class ReadyForQueryMessage {
+    constructor(length, status) {
+      this.length = length;
+      this.status = status;
+      this.name = "readyForQuery";
+    }
+  }
+  messages.ReadyForQueryMessage = ReadyForQueryMessage;
+  class CommandCompleteMessage {
+    constructor(length, text2) {
+      this.length = length;
+      this.text = text2;
+      this.name = "commandComplete";
+    }
+  }
+  messages.CommandCompleteMessage = CommandCompleteMessage;
+  class DataRowMessage {
+    constructor(length, fields) {
+      this.length = length;
+      this.fields = fields;
+      this.name = "dataRow";
+      this.fieldCount = fields.length;
+    }
+  }
+  messages.DataRowMessage = DataRowMessage;
+  class NoticeMessage {
+    constructor(length, message) {
+      this.length = length;
+      this.message = message;
+      this.name = "notice";
+    }
+  }
+  messages.NoticeMessage = NoticeMessage;
+  return messages;
+}
+var serializer = {};
+var bufferWriter = {};
+var hasRequiredBufferWriter;
+function requireBufferWriter() {
+  if (hasRequiredBufferWriter) return bufferWriter;
+  hasRequiredBufferWriter = 1;
+  Object.defineProperty(bufferWriter, "__esModule", { value: true });
+  bufferWriter.Writer = void 0;
+  class Writer {
+    constructor(size = 256) {
+      this.size = size;
+      this.offset = 5;
+      this.headerPosition = 0;
+      this.buffer = Buffer.allocUnsafe(size);
+    }
+    ensure(size) {
+      const remaining = this.buffer.length - this.offset;
+      if (remaining < size) {
+        const oldBuffer = this.buffer;
+        const newSize = oldBuffer.length + (oldBuffer.length >> 1) + size;
+        this.buffer = Buffer.allocUnsafe(newSize);
+        oldBuffer.copy(this.buffer);
+      }
+    }
+    addInt32(num) {
+      this.ensure(4);
+      this.buffer[this.offset++] = num >>> 24 & 255;
+      this.buffer[this.offset++] = num >>> 16 & 255;
+      this.buffer[this.offset++] = num >>> 8 & 255;
+      this.buffer[this.offset++] = num >>> 0 & 255;
+      return this;
+    }
+    addInt16(num) {
+      this.ensure(2);
+      this.buffer[this.offset++] = num >>> 8 & 255;
+      this.buffer[this.offset++] = num >>> 0 & 255;
+      return this;
+    }
+    addCString(string2) {
+      if (!string2) {
+        this.ensure(1);
+      } else {
+        const len = Buffer.byteLength(string2);
+        this.ensure(len + 1);
+        this.buffer.write(string2, this.offset, "utf-8");
+        this.offset += len;
+      }
+      this.buffer[this.offset++] = 0;
+      return this;
+    }
+    addString(string2 = "") {
+      const len = Buffer.byteLength(string2);
+      this.ensure(len);
+      this.buffer.write(string2, this.offset);
+      this.offset += len;
+      return this;
+    }
+    // Write an Int32 byte-length prefix immediately followed by the string's UTF-8
+    // bytes. Postgres' Bind wire format prefixes every parameter with its length,
+    // and doing it in one method computes Buffer.byteLength ONCE — the previous
+    // `addInt32(Buffer.byteLength(s)).addString(s)` pairing scanned the string
+    // three times (byteLength for the prefix, byteLength again inside addString,
+    // then the encode), which is costly for large text parameters.
+    addInt32PrefixedString(string2) {
+      const len = Buffer.byteLength(string2);
+      this.ensure(4 + len);
+      const buffer = this.buffer;
+      let offset = this.offset;
+      buffer[offset++] = len >>> 24 & 255;
+      buffer[offset++] = len >>> 16 & 255;
+      buffer[offset++] = len >>> 8 & 255;
+      buffer[offset++] = len >>> 0 & 255;
+      buffer.write(string2, offset, "utf-8");
+      this.offset = offset + len;
+      return this;
+    }
+    add(otherBuffer) {
+      this.ensure(otherBuffer.length);
+      otherBuffer.copy(this.buffer, this.offset);
+      this.offset += otherBuffer.length;
+      return this;
+    }
+    join(code2) {
+      if (code2) {
+        this.buffer[this.headerPosition] = code2;
+        const length = this.offset - (this.headerPosition + 1);
+        this.buffer.writeInt32BE(length, this.headerPosition + 1);
+      }
+      return this.buffer.slice(code2 ? 0 : 5, this.offset);
+    }
+    flush(code2) {
+      const result2 = this.join(code2);
+      this.offset = 5;
+      this.headerPosition = 0;
+      this.buffer = Buffer.allocUnsafe(this.size);
+      return result2;
+    }
+    clear() {
+      this.offset = 5;
+      this.headerPosition = 0;
+    }
+  }
+  bufferWriter.Writer = Writer;
+  return bufferWriter;
+}
+var hasRequiredSerializer;
+function requireSerializer() {
+  if (hasRequiredSerializer) return serializer;
+  hasRequiredSerializer = 1;
+  Object.defineProperty(serializer, "__esModule", { value: true });
+  serializer.serialize = void 0;
+  const buffer_writer_1 = requireBufferWriter();
+  const writer = new buffer_writer_1.Writer();
+  const startup = (opts) => {
+    writer.addInt16(3).addInt16(0);
+    for (const key of Object.keys(opts)) {
+      writer.addCString(key).addCString(opts[key]);
+    }
+    writer.addCString("client_encoding").addCString("UTF8");
+    const bodyBuffer = writer.addCString("").flush();
+    const length = bodyBuffer.length + 4;
+    return new buffer_writer_1.Writer().addInt32(length).add(bodyBuffer).flush();
+  };
+  const requestSsl = () => {
+    const response = Buffer.allocUnsafe(8);
+    response.writeInt32BE(8, 0);
+    response.writeInt32BE(80877103, 4);
+    return response;
+  };
+  const password = (password2) => {
+    return writer.addCString(password2).flush(
+      112
+      /* code.startup */
+    );
+  };
+  const sendSASLInitialResponseMessage = function(mechanism, initialResponse) {
+    writer.addCString(mechanism).addInt32PrefixedString(initialResponse);
+    return writer.flush(
+      112
+      /* code.startup */
+    );
+  };
+  const sendSCRAMClientFinalMessage = function(additionalData) {
+    return writer.addString(additionalData).flush(
+      112
+      /* code.startup */
+    );
+  };
+  const query2 = (text2) => {
+    return writer.addCString(text2).flush(
+      81
+      /* code.query */
+    );
+  };
+  const emptyArray = [];
+  const parse2 = (query3) => {
+    const name = query3.name || "";
+    if (name.length > 63) {
+      console.error("Warning! Postgres only supports 63 characters for query names.");
+      console.error("You supplied %s (%s)", name, name.length);
+      console.error("This can cause conflicts and silent errors executing queries");
+    }
+    const types2 = query3.types || emptyArray;
+    const len = types2.length;
+    const buffer = writer.addCString(name).addCString(query3.text).addInt16(len);
+    for (let i = 0; i < len; i++) {
+      buffer.addInt32(types2[i]);
+    }
+    return writer.flush(
+      80
+      /* code.parse */
+    );
+  };
+  const paramWriter = new buffer_writer_1.Writer();
+  const writeValues = function(values, valueMapper) {
+    for (let i = 0; i < values.length; i++) {
+      const mappedVal = valueMapper ? valueMapper(values[i], i) : values[i];
+      if (mappedVal == null) {
+        writer.addInt16(
+          0
+          /* ParamType.STRING */
+        );
+        paramWriter.addInt32(-1);
+      } else if (mappedVal instanceof Buffer) {
+        writer.addInt16(
+          1
+          /* ParamType.BINARY */
+        );
+        paramWriter.addInt32(mappedVal.length);
+        paramWriter.add(mappedVal);
+      } else {
+        writer.addInt16(
+          0
+          /* ParamType.STRING */
+        );
+        paramWriter.addInt32PrefixedString(mappedVal);
+      }
+    }
+  };
+  const bind = (config2 = {}) => {
+    const portal = config2.portal || "";
+    const statement = config2.statement || "";
+    const binary = config2.binary || false;
+    const values = config2.values || emptyArray;
+    const len = values.length;
+    writer.addCString(portal).addCString(statement);
+    writer.addInt16(len);
+    try {
+      writeValues(values, config2.valueMapper);
+    } catch (err) {
+      writer.clear();
+      paramWriter.clear();
+      throw err;
+    }
+    writer.addInt16(len);
+    writer.add(paramWriter.flush());
+    writer.addInt16(1);
+    writer.addInt16(
+      binary ? 1 : 0
+      /* ParamType.STRING */
+    );
+    return writer.flush(
+      66
+      /* code.bind */
+    );
+  };
+  const emptyExecute = Buffer.from([69, 0, 0, 0, 9, 0, 0, 0, 0, 0]);
+  const execute = (config2) => {
+    if (!config2 || !config2.portal && !config2.rows) {
+      return emptyExecute;
+    }
+    const portal = config2.portal || "";
+    const rows = config2.rows || 0;
+    const portalLength = Buffer.byteLength(portal);
+    const len = 4 + portalLength + 1 + 4;
+    const buff = Buffer.allocUnsafe(1 + len);
+    buff[0] = 69;
+    buff.writeInt32BE(len, 1);
+    buff.write(portal, 5, "utf-8");
+    buff[portalLength + 5] = 0;
+    buff.writeUInt32BE(rows, buff.length - 4);
+    return buff;
+  };
+  const cancel = (processID, secretKey) => {
+    const buffer = Buffer.allocUnsafe(16);
+    buffer.writeInt32BE(16, 0);
+    buffer.writeInt16BE(1234, 4);
+    buffer.writeInt16BE(5678, 6);
+    buffer.writeInt32BE(processID, 8);
+    buffer.writeInt32BE(secretKey, 12);
+    return buffer;
+  };
+  const cstringMessage = (code2, string2) => {
+    const stringLen = Buffer.byteLength(string2);
+    const len = 4 + stringLen + 1;
+    const buffer = Buffer.allocUnsafe(1 + len);
+    buffer[0] = code2;
+    buffer.writeInt32BE(len, 1);
+    buffer.write(string2, 5, "utf-8");
+    buffer[len] = 0;
+    return buffer;
+  };
+  const emptyDescribePortal = writer.addCString("P").flush(
+    68
+    /* code.describe */
+  );
+  const emptyDescribeStatement = writer.addCString("S").flush(
+    68
+    /* code.describe */
+  );
+  const describe = (msg) => {
+    return msg.name ? cstringMessage(68, `${msg.type}${msg.name || ""}`) : msg.type === "P" ? emptyDescribePortal : emptyDescribeStatement;
+  };
+  const close2 = (msg) => {
+    const text2 = `${msg.type}${msg.name || ""}`;
+    return cstringMessage(67, text2);
+  };
+  const copyData = (chunk) => {
+    return writer.add(chunk).flush(
+      100
+      /* code.copyFromChunk */
+    );
+  };
+  const copyFail = (message) => {
+    return cstringMessage(102, message);
+  };
+  const codeOnlyBuffer = (code2) => Buffer.from([code2, 0, 0, 0, 4]);
+  const flushBuffer = codeOnlyBuffer(
+    72
+    /* code.flush */
+  );
+  const syncBuffer = codeOnlyBuffer(
+    83
+    /* code.sync */
+  );
+  const endBuffer = codeOnlyBuffer(
+    88
+    /* code.end */
+  );
+  const copyDoneBuffer = codeOnlyBuffer(
+    99
+    /* code.copyDone */
+  );
+  const serialize = {
+    startup,
+    password,
+    requestSsl,
+    sendSASLInitialResponseMessage,
+    sendSCRAMClientFinalMessage,
+    query: query2,
+    parse: parse2,
+    bind,
+    execute,
+    describe,
+    close: close2,
+    flush: () => flushBuffer,
+    sync: () => syncBuffer,
+    end: () => endBuffer,
+    copyData,
+    copyDone: () => copyDoneBuffer,
+    copyFail,
+    cancel
+  };
+  serializer.serialize = serialize;
+  return serializer;
+}
+var parser = {};
+var bufferReader = {};
+var hasRequiredBufferReader;
+function requireBufferReader() {
+  if (hasRequiredBufferReader) return bufferReader;
+  hasRequiredBufferReader = 1;
+  Object.defineProperty(bufferReader, "__esModule", { value: true });
+  bufferReader.BufferReader = void 0;
+  class BufferReader {
+    constructor(offset = 0) {
+      this.offset = offset;
+      this.buffer = Buffer.allocUnsafe(0);
+      this.encoding = "utf-8";
+    }
+    setBuffer(offset, buffer) {
+      this.offset = offset;
+      this.buffer = buffer;
+    }
+    int16() {
+      const result2 = this.buffer.readInt16BE(this.offset);
+      this.offset += 2;
+      return result2;
+    }
+    byte() {
+      const result2 = this.buffer[this.offset];
+      this.offset++;
+      return result2;
+    }
+    int32() {
+      const result2 = this.buffer.readInt32BE(this.offset);
+      this.offset += 4;
+      return result2;
+    }
+    uint32() {
+      const result2 = this.buffer.readUInt32BE(this.offset);
+      this.offset += 4;
+      return result2;
+    }
+    string(length) {
+      const result2 = this.buffer.toString(this.encoding, this.offset, this.offset + length);
+      this.offset += length;
+      return result2;
+    }
+    cstring() {
+      const start = this.offset;
+      let end = start;
+      while (this.buffer[end++]) {
+      }
+      this.offset = end;
+      return this.buffer.toString(this.encoding, start, end - 1);
+    }
+    bytes(length) {
+      const result2 = this.buffer.slice(this.offset, this.offset + length);
+      this.offset += length;
+      return result2;
+    }
+  }
+  bufferReader.BufferReader = BufferReader;
+  return bufferReader;
+}
+var hasRequiredParser;
+function requireParser() {
+  if (hasRequiredParser) return parser;
+  hasRequiredParser = 1;
+  Object.defineProperty(parser, "__esModule", { value: true });
+  parser.Parser = void 0;
+  const messages_1 = requireMessages();
+  const buffer_reader_1 = requireBufferReader();
+  const CODE_LENGTH = 1;
+  const LEN_LENGTH = 4;
+  const HEADER_LENGTH = CODE_LENGTH + LEN_LENGTH;
+  const LATEINIT_LENGTH = -1;
+  const emptyBuffer = Buffer.allocUnsafe(0);
+  class Parser {
+    constructor(opts) {
+      this.buffer = emptyBuffer;
+      this.bufferLength = 0;
+      this.bufferOffset = 0;
+      this.reader = new buffer_reader_1.BufferReader();
+      if ((opts === null || opts === void 0 ? void 0 : opts.mode) === "binary") {
+        throw new Error("Binary mode not supported yet");
+      }
+      this.mode = (opts === null || opts === void 0 ? void 0 : opts.mode) || "text";
+    }
+    parse(buffer, callback) {
+      this.mergeBuffer(buffer);
+      const bufferFullLength = this.bufferOffset + this.bufferLength;
+      let offset = this.bufferOffset;
+      while (offset + HEADER_LENGTH <= bufferFullLength) {
+        const code2 = this.buffer[offset];
+        const length = this.buffer.readUInt32BE(offset + CODE_LENGTH);
+        const fullMessageLength = CODE_LENGTH + length;
+        if (fullMessageLength + offset <= bufferFullLength) {
+          const message = this.handlePacket(offset + HEADER_LENGTH, code2, length, this.buffer);
+          callback(message);
+          offset += fullMessageLength;
+        } else {
+          break;
+        }
+      }
+      if (offset === bufferFullLength) {
+        this.buffer = emptyBuffer;
+        this.bufferLength = 0;
+        this.bufferOffset = 0;
+      } else {
+        this.bufferLength = bufferFullLength - offset;
+        this.bufferOffset = offset;
+      }
+    }
+    mergeBuffer(buffer) {
+      if (this.bufferLength > 0) {
+        const newLength = this.bufferLength + buffer.byteLength;
+        const newFullLength = newLength + this.bufferOffset;
+        if (newFullLength > this.buffer.byteLength) {
+          let newBuffer;
+          if (newLength <= this.buffer.byteLength && this.bufferOffset >= this.bufferLength) {
+            newBuffer = this.buffer;
+          } else {
+            let newBufferLength = this.buffer.byteLength * 2;
+            while (newLength >= newBufferLength) {
+              newBufferLength *= 2;
+            }
+            newBuffer = Buffer.allocUnsafe(newBufferLength);
+          }
+          this.buffer.copy(newBuffer, 0, this.bufferOffset, this.bufferOffset + this.bufferLength);
+          this.buffer = newBuffer;
+          this.bufferOffset = 0;
+        }
+        buffer.copy(this.buffer, this.bufferOffset + this.bufferLength);
+        this.bufferLength = newLength;
+      } else {
+        this.buffer = buffer;
+        this.bufferOffset = 0;
+        this.bufferLength = buffer.byteLength;
+      }
+    }
+    handlePacket(offset, code2, length, bytes) {
+      const { reader } = this;
+      reader.setBuffer(offset, bytes);
+      let message;
+      switch (code2) {
+        case 50:
+          message = messages_1.bindComplete;
+          break;
+        case 49:
+          message = messages_1.parseComplete;
+          break;
+        case 51:
+          message = messages_1.closeComplete;
+          break;
+        case 110:
+          message = messages_1.noData;
+          break;
+        case 115:
+          message = messages_1.portalSuspended;
+          break;
+        case 99:
+          message = messages_1.copyDone;
+          break;
+        case 87:
+          message = messages_1.replicationStart;
+          break;
+        case 73:
+          message = messages_1.emptyQuery;
+          break;
+        case 68:
+          message = parseDataRowMessage(reader);
+          break;
+        case 67:
+          message = parseCommandCompleteMessage(reader);
+          break;
+        case 90:
+          message = parseReadyForQueryMessage(reader);
+          break;
+        case 65:
+          message = parseNotificationMessage(reader);
+          break;
+        case 82:
+          message = parseAuthenticationResponse(reader, length);
+          break;
+        case 83:
+          message = parseParameterStatusMessage(reader);
+          break;
+        case 75:
+          message = parseBackendKeyData(reader);
+          break;
+        case 69:
+          message = parseErrorMessage(reader, "error");
+          break;
+        case 78:
+          message = parseErrorMessage(reader, "notice");
+          break;
+        case 84:
+          message = parseRowDescriptionMessage(reader);
+          break;
+        case 116:
+          message = parseParameterDescriptionMessage(reader);
+          break;
+        case 71:
+          message = parseCopyInMessage(reader);
+          break;
+        case 72:
+          message = parseCopyOutMessage(reader);
+          break;
+        case 100:
+          message = parseCopyData(reader, length);
+          break;
+        default:
+          return new messages_1.DatabaseError("received invalid response: " + code2.toString(16), length, "error");
+      }
+      reader.setBuffer(0, emptyBuffer);
+      message.length = length;
+      return message;
+    }
+  }
+  parser.Parser = Parser;
+  const parseReadyForQueryMessage = (reader) => {
+    const status = reader.string(1);
+    return new messages_1.ReadyForQueryMessage(LATEINIT_LENGTH, status);
+  };
+  const parseCommandCompleteMessage = (reader) => {
+    const text2 = reader.cstring();
+    return new messages_1.CommandCompleteMessage(LATEINIT_LENGTH, text2);
+  };
+  const parseCopyData = (reader, length) => {
+    const chunk = reader.bytes(length - 4);
+    return new messages_1.CopyDataMessage(LATEINIT_LENGTH, chunk);
+  };
+  const parseCopyInMessage = (reader) => parseCopyMessage(reader, "copyInResponse");
+  const parseCopyOutMessage = (reader) => parseCopyMessage(reader, "copyOutResponse");
+  const parseCopyMessage = (reader, messageName) => {
+    const isBinary = reader.byte() !== 0;
+    const columnCount = reader.int16();
+    const message = new messages_1.CopyResponse(LATEINIT_LENGTH, messageName, isBinary, columnCount);
+    for (let i = 0; i < columnCount; i++) {
+      message.columnTypes[i] = reader.int16();
+    }
+    return message;
+  };
+  const parseNotificationMessage = (reader) => {
+    const processId = reader.int32();
+    const channel = reader.cstring();
+    const payload = reader.cstring();
+    return new messages_1.NotificationResponseMessage(LATEINIT_LENGTH, processId, channel, payload);
+  };
+  const parseRowDescriptionMessage = (reader) => {
+    const fieldCount = reader.int16();
+    const message = new messages_1.RowDescriptionMessage(LATEINIT_LENGTH, fieldCount);
+    for (let i = 0; i < fieldCount; i++) {
+      message.fields[i] = parseField(reader);
+    }
+    return message;
+  };
+  const parseField = (reader) => {
+    const name = reader.cstring();
+    const tableID = reader.uint32();
+    const columnID = reader.int16();
+    const dataTypeID = reader.uint32();
+    const dataTypeSize = reader.int16();
+    const dataTypeModifier = reader.int32();
+    const mode = reader.int16() === 0 ? "text" : "binary";
+    return new messages_1.Field(name, tableID, columnID, dataTypeID, dataTypeSize, dataTypeModifier, mode);
+  };
+  const parseParameterDescriptionMessage = (reader) => {
+    const parameterCount = reader.int16();
+    const message = new messages_1.ParameterDescriptionMessage(LATEINIT_LENGTH, parameterCount);
+    for (let i = 0; i < parameterCount; i++) {
+      message.dataTypeIDs[i] = reader.int32();
+    }
+    return message;
+  };
+  const parseDataRowMessage = (reader) => {
+    const fieldCount = reader.int16();
+    const fields = new Array(fieldCount);
+    for (let i = 0; i < fieldCount; i++) {
+      const len = reader.int32();
+      fields[i] = len === -1 ? null : reader.string(len);
+    }
+    return new messages_1.DataRowMessage(LATEINIT_LENGTH, fields);
+  };
+  const parseParameterStatusMessage = (reader) => {
+    const name = reader.cstring();
+    const value = reader.cstring();
+    return new messages_1.ParameterStatusMessage(LATEINIT_LENGTH, name, value);
+  };
+  const parseBackendKeyData = (reader) => {
+    const processID = reader.int32();
+    const secretKey = reader.int32();
+    return new messages_1.BackendKeyDataMessage(LATEINIT_LENGTH, processID, secretKey);
+  };
+  const parseAuthenticationResponse = (reader, length) => {
+    const code2 = reader.int32();
+    const message = {
+      name: "authenticationOk",
+      length
+    };
+    switch (code2) {
+      case 0:
+        break;
+      case 3:
+        if (message.length === 8) {
+          message.name = "authenticationCleartextPassword";
+        }
+        break;
+      case 5:
+        if (message.length === 12) {
+          message.name = "authenticationMD5Password";
+          const salt = reader.bytes(4);
+          return new messages_1.AuthenticationMD5Password(LATEINIT_LENGTH, salt);
+        }
+        break;
+      case 10:
+        {
+          message.name = "authenticationSASL";
+          message.mechanisms = [];
+          let mechanism;
+          do {
+            mechanism = reader.cstring();
+            if (mechanism) {
+              message.mechanisms.push(mechanism);
+            }
+          } while (mechanism);
+        }
+        break;
+      case 11:
+        message.name = "authenticationSASLContinue";
+        message.data = reader.string(length - 8);
+        break;
+      case 12:
+        message.name = "authenticationSASLFinal";
+        message.data = reader.string(length - 8);
+        break;
+      default:
+        throw new Error("Unknown authenticationOk message type " + code2);
+    }
+    return message;
+  };
+  const parseErrorMessage = (reader, name) => {
+    const fields = {};
+    let fieldType = reader.string(1);
+    while (fieldType !== "\0") {
+      fields[fieldType] = reader.cstring();
+      fieldType = reader.string(1);
+    }
+    const messageValue = fields.M;
+    const message = name === "notice" ? new messages_1.NoticeMessage(LATEINIT_LENGTH, messageValue) : new messages_1.DatabaseError(messageValue, LATEINIT_LENGTH, name);
+    message.severity = fields.S;
+    message.code = fields.C;
+    message.detail = fields.D;
+    message.hint = fields.H;
+    message.position = fields.P;
+    message.internalPosition = fields.p;
+    message.internalQuery = fields.q;
+    message.where = fields.W;
+    message.schema = fields.s;
+    message.table = fields.t;
+    message.column = fields.c;
+    message.dataType = fields.d;
+    message.constraint = fields.n;
+    message.file = fields.F;
+    message.line = fields.L;
+    message.routine = fields.R;
+    return message;
+  };
+  return parser;
+}
+var hasRequiredDist$1;
+function requireDist$1() {
+  if (hasRequiredDist$1) return dist$1;
+  hasRequiredDist$1 = 1;
+  (function(exports) {
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.DatabaseError = exports.serialize = void 0;
+    exports.parse = parse2;
+    const messages_1 = requireMessages();
+    Object.defineProperty(exports, "DatabaseError", { enumerable: true, get: function() {
+      return messages_1.DatabaseError;
+    } });
+    const serializer_1 = requireSerializer();
+    Object.defineProperty(exports, "serialize", { enumerable: true, get: function() {
+      return serializer_1.serialize;
+    } });
+    const parser_1 = requireParser();
+    function parse2(stream2, callback) {
+      const parser2 = new parser_1.Parser();
+      stream2.on("data", (buffer) => parser2.parse(buffer, callback));
+      return new Promise((resolve2) => stream2.on("end", () => resolve2()));
+    }
+  })(dist$1);
+  return dist$1;
+}
+var empty = {};
+var hasRequiredEmpty;
+function requireEmpty() {
+  if (hasRequiredEmpty) return empty;
+  hasRequiredEmpty = 1;
+  Object.defineProperty(empty, "__esModule", { value: true });
+  empty.default = {};
+  return empty;
+}
+var stream;
+var hasRequiredStream;
+function requireStream() {
+  if (hasRequiredStream) return stream;
+  hasRequiredStream = 1;
+  const { getStream, getSecureStream } = getStreamFuncs();
+  stream = {
+    /**
+     * Get a socket stream compatible with the current runtime environment.
+     * @returns {Duplex}
+     */
+    getStream,
+    /**
+     * Get a TLS secured socket, compatible with the current environment,
+     * using the socket and other settings given in `options`.
+     * @returns {Duplex}
+     */
+    getSecureStream
+  };
+  function getNodejsStreamFuncs() {
+    function getStream2(ssl) {
+      const net = require$$0$4;
+      return new net.Socket();
+    }
+    function getSecureStream2(options) {
+      const tls = require$$1$2;
+      return tls.connect(options);
+    }
+    return {
+      getStream: getStream2,
+      getSecureStream: getSecureStream2
+    };
+  }
+  function getCloudflareStreamFuncs() {
+    function getStream2(ssl) {
+      const { CloudflareSocket } = requireEmpty();
+      return new CloudflareSocket(ssl);
+    }
+    function getSecureStream2(options) {
+      options.socket.startTls(options);
+      return options.socket;
+    }
+    return {
+      getStream: getStream2,
+      getSecureStream: getSecureStream2
+    };
+  }
+  function isCloudflareRuntime() {
+    if (typeof navigator === "object" && navigator !== null && typeof navigator.userAgent === "string") {
+      return navigator.userAgent === "Cloudflare-Workers";
+    }
+    if (typeof Response === "function") {
+      const resp = new Response(null, { cf: { thing: true } });
+      if (typeof resp.cf === "object" && resp.cf !== null && resp.cf.thing) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function getStreamFuncs() {
+    if (isCloudflareRuntime()) {
+      return getCloudflareStreamFuncs();
+    }
+    return getNodejsStreamFuncs();
+  }
+  return stream;
+}
+var connection;
+var hasRequiredConnection;
+function requireConnection() {
+  if (hasRequiredConnection) return connection;
+  hasRequiredConnection = 1;
+  const EventEmitter = require$$0$3.EventEmitter;
+  const { parse: parse2, serialize } = requireDist$1();
+  const stream2 = requireStream();
+  const { getStream } = stream2;
+  const flushBuffer = serialize.flush();
+  const syncBuffer = serialize.sync();
+  const endBuffer = serialize.end();
+  class Connection extends EventEmitter {
+    constructor(config2) {
+      super();
+      config2 = config2 || {};
+      this.stream = config2.stream || getStream(config2.ssl);
+      if (typeof this.stream === "function") {
+        this.stream = this.stream(config2);
+      }
+      this._keepAlive = config2.keepAlive;
+      this._keepAliveInitialDelayMillis = config2.keepAliveInitialDelayMillis;
+      this.parsedStatements = {};
+      this.ssl = config2.ssl || false;
+      this.sslNegotiation = config2.sslNegotiation || "postgres";
+      this._ending = false;
+      this._emitMessage = false;
+      const self2 = this;
+      this.on("newListener", function(eventName) {
+        if (eventName === "message") {
+          self2._emitMessage = true;
+        }
+      });
+    }
+    connect(port, host) {
+      const self2 = this;
+      this._connecting = true;
+      this.stream.setNoDelay(true);
+      this.stream.connect(port, host);
+      this.stream.once("connect", function() {
+        if (self2._keepAlive) {
+          self2.stream.setKeepAlive(true, self2._keepAliveInitialDelayMillis);
+        }
+        self2.emit("connect");
+      });
+      const reportStreamError = function(error) {
+        if (self2._ending && (error.code === "ECONNRESET" || error.code === "EPIPE")) {
+          return;
+        }
+        self2.emit("error", error);
+      };
+      this.stream.on("error", reportStreamError);
+      this.stream.on("close", function() {
+        self2.emit("end");
+      });
+      if (!this.ssl) {
+        return this.attachListeners(this.stream);
+      }
+      if (this.sslNegotiation === "direct") {
+        return this.stream.once("connect", function() {
+          self2.upgradeToSSL(host, reportStreamError);
+        });
+      }
+      this.stream.once("data", function(buffer) {
+        const responseCode = buffer.toString("utf8");
+        switch (responseCode) {
+          case "S":
+            break;
+          case "N":
+            self2.stream.end();
+            return self2.emit("error", new Error("The server does not support SSL connections"));
+          default:
+            self2.stream.end();
+            return self2.emit("error", new Error("There was an error establishing an SSL connection"));
+        }
+        self2.upgradeToSSL(host, reportStreamError);
+      });
+    }
+    upgradeToSSL(host, reportStreamError) {
+      const self2 = this;
+      const options = {
+        socket: self2.stream
+      };
+      if (self2.ssl !== true) {
+        Object.assign(options, self2.ssl);
+        if ("key" in self2.ssl) {
+          options.key = self2.ssl.key;
+        }
+      }
+      if (self2.sslNegotiation === "direct") {
+        options.ALPNProtocols = ["postgresql"];
+      }
+      const net = require$$0$4;
+      if (net.isIP && net.isIP(host) === 0) {
+        options.servername = host;
+      }
+      try {
+        self2.stream = stream2.getSecureStream(options);
+      } catch (err) {
+        return self2.emit("error", err);
+      }
+      self2.attachListeners(self2.stream);
+      self2.stream.on("error", reportStreamError);
+      self2.emit("sslconnect");
+    }
+    attachListeners(stream3) {
+      parse2(stream3, (msg) => {
+        const eventName = msg.name === "error" ? "errorMessage" : msg.name;
+        if (this._emitMessage) {
+          this.emit("message", msg);
+        }
+        this.emit(eventName, msg);
+      });
+    }
+    requestSsl() {
+      this.stream.write(serialize.requestSsl());
+    }
+    startup(config2) {
+      this.stream.write(serialize.startup(config2));
+    }
+    cancel(processID, secretKey) {
+      this._send(serialize.cancel(processID, secretKey));
+    }
+    password(password) {
+      this._send(serialize.password(password));
+    }
+    sendSASLInitialResponseMessage(mechanism, initialResponse) {
+      this._send(serialize.sendSASLInitialResponseMessage(mechanism, initialResponse));
+    }
+    sendSCRAMClientFinalMessage(additionalData) {
+      this._send(serialize.sendSCRAMClientFinalMessage(additionalData));
+    }
+    _send(buffer) {
+      if (!this.stream.writable) {
+        return false;
+      }
+      return this.stream.write(buffer);
+    }
+    query(text2) {
+      this._send(serialize.query(text2));
+    }
+    // send parse message
+    parse(query2) {
+      this._send(serialize.parse(query2));
+    }
+    // send bind message
+    bind(config2) {
+      this._send(serialize.bind(config2));
+    }
+    // send execute message
+    execute(config2) {
+      this._send(serialize.execute(config2));
+    }
+    flush() {
+      if (this.stream.writable) {
+        this.stream.write(flushBuffer);
+      }
+    }
+    sync() {
+      this._ending = true;
+      this._send(syncBuffer);
+    }
+    ref() {
+      this.stream.ref();
+    }
+    unref() {
+      this.stream.unref();
+    }
+    end() {
+      this._ending = true;
+      if (!this._connecting || !this.stream.writable) {
+        this.stream.end();
+        return;
+      }
+      return this.stream.write(endBuffer, () => {
+        this.stream.end();
+      });
+    }
+    close(msg) {
+      this._send(serialize.close(msg));
+    }
+    describe(msg) {
+      this._send(serialize.describe(msg));
+    }
+    sendCopyFromChunk(chunk) {
+      this._send(serialize.copyData(chunk));
+    }
+    endCopyFrom() {
+      this._send(serialize.copyDone());
+    }
+    sendCopyFail(msg) {
+      this._send(serialize.copyFail(msg));
+    }
+  }
+  connection = Connection;
+  return connection;
+}
+var lib = { exports: {} };
+var helper = { exports: {} };
+var split2;
+var hasRequiredSplit2;
+function requireSplit2() {
+  if (hasRequiredSplit2) return split2;
+  hasRequiredSplit2 = 1;
+  const { Transform } = require$$0$5;
+  const { StringDecoder } = require$$1$3;
+  const kLast = /* @__PURE__ */ Symbol("last");
+  const kDecoder = /* @__PURE__ */ Symbol("decoder");
+  function transform2(chunk, enc, cb) {
+    let list;
+    if (this.overflow) {
+      const buf = this[kDecoder].write(chunk);
+      list = buf.split(this.matcher);
+      if (list.length === 1) return cb();
+      list.shift();
+      this.overflow = false;
+    } else {
+      this[kLast] += this[kDecoder].write(chunk);
+      list = this[kLast].split(this.matcher);
+    }
+    this[kLast] = list.pop();
+    for (let i = 0; i < list.length; i++) {
+      try {
+        push(this, this.mapper(list[i]));
+      } catch (error) {
+        return cb(error);
+      }
+    }
+    this.overflow = this[kLast].length > this.maxLength;
+    if (this.overflow && !this.skipOverflow) {
+      cb(new Error("maximum buffer reached"));
+      return;
+    }
+    cb();
+  }
+  function flush(cb) {
+    this[kLast] += this[kDecoder].end();
+    if (this[kLast]) {
+      try {
+        push(this, this.mapper(this[kLast]));
+      } catch (error) {
+        return cb(error);
+      }
+    }
+    cb();
+  }
+  function push(self2, val) {
+    if (val !== void 0) {
+      self2.push(val);
+    }
+  }
+  function noop(incoming) {
+    return incoming;
+  }
+  function split(matcher, mapper, options) {
+    matcher = matcher || /\r?\n/;
+    mapper = mapper || noop;
+    options = options || {};
+    switch (arguments.length) {
+      case 1:
+        if (typeof matcher === "function") {
+          mapper = matcher;
+          matcher = /\r?\n/;
+        } else if (typeof matcher === "object" && !(matcher instanceof RegExp) && !matcher[Symbol.split]) {
+          options = matcher;
+          matcher = /\r?\n/;
+        }
+        break;
+      case 2:
+        if (typeof matcher === "function") {
+          options = mapper;
+          mapper = matcher;
+          matcher = /\r?\n/;
+        } else if (typeof mapper === "object") {
+          options = mapper;
+          mapper = noop;
+        }
+    }
+    options = Object.assign({}, options);
+    options.autoDestroy = true;
+    options.transform = transform2;
+    options.flush = flush;
+    options.readableObjectMode = true;
+    const stream2 = new Transform(options);
+    stream2[kLast] = "";
+    stream2[kDecoder] = new StringDecoder("utf8");
+    stream2.matcher = matcher;
+    stream2.mapper = mapper;
+    stream2.maxLength = options.maxLength;
+    stream2.skipOverflow = options.skipOverflow || false;
+    stream2.overflow = false;
+    stream2._destroy = function(err, cb) {
+      this._writableState.errorEmitted = false;
+      cb(err);
+    };
+    return stream2;
+  }
+  split2 = split;
+  return split2;
+}
+var hasRequiredHelper;
+function requireHelper() {
+  if (hasRequiredHelper) return helper.exports;
+  hasRequiredHelper = 1;
+  (function(module) {
+    var path = require$$0$6, Stream = require$$0$5.Stream, split = requireSplit2(), util2 = require$$0$7, defaultPort = 5432, isWin = process.platform === "win32", warnStream = process.stderr;
+    var S_IRWXG = 56, S_IRWXO = 7, S_IFMT = 61440, S_IFREG = 32768;
+    function isRegFile(mode) {
+      return (mode & S_IFMT) == S_IFREG;
+    }
+    var fieldNames = ["host", "port", "database", "user", "password"];
+    var nrOfFields = fieldNames.length;
+    var passKey = fieldNames[nrOfFields - 1];
+    function warn() {
+      var isWritable = warnStream instanceof Stream && true === warnStream.writable;
+      if (isWritable) {
+        var args = Array.prototype.slice.call(arguments).concat("\n");
+        warnStream.write(util2.format.apply(util2, args));
+      }
+    }
+    Object.defineProperty(module.exports, "isWin", {
+      get: function() {
+        return isWin;
+      },
+      set: function(val) {
+        isWin = val;
+      }
+    });
+    module.exports.warnTo = function(stream2) {
+      var old = warnStream;
+      warnStream = stream2;
+      return old;
+    };
+    module.exports.getFileName = function(rawEnv) {
+      var env = rawEnv || process.env;
+      var file = env.PGPASSFILE || (isWin ? path.join(env.APPDATA || "./", "postgresql", "pgpass.conf") : path.join(env.HOME || "./", ".pgpass"));
+      return file;
+    };
+    module.exports.usePgPass = function(stats, fname) {
+      if (Object.prototype.hasOwnProperty.call(process.env, "PGPASSWORD")) {
+        return false;
+      }
+      if (isWin) {
+        return true;
+      }
+      fname = fname || "<unkn>";
+      if (!isRegFile(stats.mode)) {
+        warn('WARNING: password file "%s" is not a plain file', fname);
+        return false;
+      }
+      if (stats.mode & (S_IRWXG | S_IRWXO)) {
+        warn('WARNING: password file "%s" has group or world access; permissions should be u=rw (0600) or less', fname);
+        return false;
+      }
+      return true;
+    };
+    var matcher = module.exports.match = function(connInfo, entry) {
+      return fieldNames.slice(0, -1).reduce(function(prev, field, idx) {
+        if (idx == 1) {
+          if (Number(connInfo[field] || defaultPort) === Number(entry[field])) {
+            return prev && true;
+          }
+        }
+        return prev && (entry[field] === "*" || entry[field] === connInfo[field]);
+      }, true);
+    };
+    module.exports.getPassword = function(connInfo, stream2, cb) {
+      var pass;
+      var lineStream = stream2.pipe(split());
+      function onLine(line) {
+        var entry = parseLine(line);
+        if (entry && isValidEntry(entry) && matcher(connInfo, entry)) {
+          pass = entry[passKey];
+          lineStream.end();
+        }
+      }
+      var onEnd = function() {
+        stream2.destroy();
+        cb(pass);
+      };
+      var onErr = function(err) {
+        stream2.destroy();
+        warn("WARNING: error on reading file: %s", err);
+        cb(void 0);
+      };
+      stream2.on("error", onErr);
+      lineStream.on("data", onLine).on("end", onEnd).on("error", onErr);
+    };
+    var parseLine = module.exports.parseLine = function(line) {
+      if (line.length < 11 || line.match(/^\s+#/)) {
+        return null;
+      }
+      var curChar = "";
+      var prevChar = "";
+      var fieldIdx = 0;
+      var startIdx = 0;
+      var obj = {};
+      var isLastField = false;
+      var addToObj = function(idx, i0, i1) {
+        var field = line.substring(i0, i1);
+        if (!Object.hasOwnProperty.call(process.env, "PGPASS_NO_DEESCAPE")) {
+          field = field.replace(/\\([:\\])/g, "$1");
+        }
+        obj[fieldNames[idx]] = field;
+      };
+      for (var i = 0; i < line.length - 1; i += 1) {
+        curChar = line.charAt(i + 1);
+        prevChar = line.charAt(i);
+        isLastField = fieldIdx == nrOfFields - 1;
+        if (isLastField) {
+          addToObj(fieldIdx, startIdx);
+          break;
+        }
+        if (i >= 0 && curChar == ":" && prevChar !== "\\") {
+          addToObj(fieldIdx, startIdx, i + 1);
+          startIdx = i + 2;
+          fieldIdx += 1;
+        }
+      }
+      obj = Object.keys(obj).length === nrOfFields ? obj : null;
+      return obj;
+    };
+    var isValidEntry = module.exports.isValidEntry = function(entry) {
+      var rules2 = {
+        // host
+        0: function(x) {
+          return x.length > 0;
+        },
+        // port
+        1: function(x) {
+          if (x === "*") {
+            return true;
+          }
+          x = Number(x);
+          return isFinite(x) && x > 0 && x < 9007199254740992 && Math.floor(x) === x;
+        },
+        // database
+        2: function(x) {
+          return x.length > 0;
+        },
+        // username
+        3: function(x) {
+          return x.length > 0;
+        },
+        // password
+        4: function(x) {
+          return x.length > 0;
+        }
+      };
+      for (var idx = 0; idx < fieldNames.length; idx += 1) {
+        var rule = rules2[idx];
+        var value = entry[fieldNames[idx]] || "";
+        var res = rule(value);
+        if (!res) {
+          return false;
+        }
+      }
+      return true;
+    };
+  })(helper);
+  return helper.exports;
+}
+var hasRequiredLib$1;
+function requireLib$1() {
+  if (hasRequiredLib$1) return lib.exports;
+  hasRequiredLib$1 = 1;
+  var fs = require$$0$1, helper2 = requireHelper();
+  lib.exports = function(connInfo, cb) {
+    var file = helper2.getFileName();
+    fs.stat(file, function(err, stat2) {
+      if (err || !helper2.usePgPass(stat2, file)) {
+        return cb(void 0);
+      }
+      var st = fs.createReadStream(file);
+      helper2.getPassword(connInfo, st, cb);
+    });
+  };
+  lib.exports.warnTo = helper2.warnTo;
+  return lib.exports;
+}
+var client$2;
+var hasRequiredClient$1;
+function requireClient$1() {
+  if (hasRequiredClient$1) return client$2;
+  hasRequiredClient$1 = 1;
+  const EventEmitter = require$$0$3.EventEmitter;
+  const utils2 = requireUtils$2();
+  const nodeUtils = require$$0$7;
+  const sasl2 = requireSasl();
+  const TypeOverrides = requireTypeOverrides();
+  const ConnectionParameters = requireConnectionParameters();
+  const Query = requireQuery$1();
+  const defaults2 = requireDefaults$1();
+  const Connection = requireConnection();
+  const crypto = requireUtils$1();
+  const activeQueryDeprecationNotice = nodeUtils.deprecate(
+    () => {
+    },
+    "Client.activeQuery is deprecated and will be removed in pg@9.0"
+  );
+  const queryQueueDeprecationNotice = nodeUtils.deprecate(
+    () => {
+    },
+    "Client.queryQueue is deprecated and will be removed in pg@9.0."
+  );
+  const pgPassDeprecationNotice = nodeUtils.deprecate(
+    () => {
+    },
+    "pgpass support is deprecated and will be removed in pg@9.0. You can provide an async function as the password property to the Client/Pool constructor that returns a password instead. Within this function you can call the pgpass module in your own code."
+  );
+  const byoPromiseDeprecationNotice = nodeUtils.deprecate(
+    () => {
+    },
+    "Passing a custom Promise implementation to the Client/Pool constructor is deprecated and will be removed in pg@9.0."
+  );
+  const queryQueueLengthDeprecationNotice = nodeUtils.deprecate(
+    () => {
+    },
+    "Calling client.query() when the client is already executing a query is deprecated and will be removed in pg@9.0. Use async/await or an external async flow control mechanism instead."
+  );
+  function coerceNumberOrDefault(value, defaultValue) {
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? value : defaultValue;
+    }
+    if (typeof value === "string" && value.trim() !== "") {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : defaultValue;
+    }
+    return defaultValue;
+  }
+  class Client extends EventEmitter {
+    constructor(config2) {
+      super();
+      this.connectionParameters = new ConnectionParameters(config2);
+      this.user = this.connectionParameters.user;
+      this.database = this.connectionParameters.database;
+      this.port = this.connectionParameters.port;
+      this.host = this.connectionParameters.host;
+      Object.defineProperty(this, "password", {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: this.connectionParameters.password
+      });
+      this.replication = this.connectionParameters.replication;
+      const c = config2 || {};
+      if (c.Promise) {
+        byoPromiseDeprecationNotice();
+      }
+      this._Promise = c.Promise || commonjsGlobal.Promise;
+      this._types = new TypeOverrides(c.types);
+      this._ending = false;
+      this._ended = false;
+      this._connecting = false;
+      this._connected = false;
+      this._connectionError = false;
+      this._queryable = true;
+      this._activeQuery = null;
+      this._txStatus = null;
+      this.enableChannelBinding = Boolean(c.enableChannelBinding);
+      this.scramMaxIterations = coerceNumberOrDefault(c.scramMaxIterations, sasl2.DEFAULT_MAX_SCRAM_ITERATIONS);
+      this.connection = c.connection || new Connection({
+        stream: c.stream,
+        ssl: this.connectionParameters.ssl,
+        sslNegotiation: this.connectionParameters.sslnegotiation,
+        keepAlive: c.keepAlive || false,
+        keepAliveInitialDelayMillis: c.keepAliveInitialDelayMillis || 0,
+        encoding: this.connectionParameters.client_encoding || "utf8"
+      });
+      this._queryQueue = [];
+      this.binary = c.binary || defaults2.binary;
+      this.processID = null;
+      this.secretKey = null;
+      this.ssl = this.connectionParameters.ssl || false;
+      this.sslNegotiation = this.connectionParameters.sslnegotiation || "postgres";
+      if (this.ssl && this.ssl.key) {
+        Object.defineProperty(this.ssl, "key", {
+          enumerable: false
+        });
+      }
+      this._connectionTimeoutMillis = c.connectionTimeoutMillis || 0;
+    }
+    get activeQuery() {
+      activeQueryDeprecationNotice();
+      return this._activeQuery;
+    }
+    set activeQuery(val) {
+      activeQueryDeprecationNotice();
+      this._activeQuery = val;
+    }
+    _getActiveQuery() {
+      return this._activeQuery;
+    }
+    _errorAllQueries(err) {
+      const enqueueError = (query2) => {
+        process.nextTick(() => {
+          query2.handleError(err, this.connection);
+        });
+      };
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery) {
+        enqueueError(activeQuery);
+        this._activeQuery = null;
+      }
+      this._queryQueue.forEach(enqueueError);
+      this._queryQueue.length = 0;
+    }
+    _connect(callback) {
+      const self2 = this;
+      const con = this.connection;
+      this._connectionCallback = callback;
+      if (this._connecting || this._connected) {
+        const err = new Error("Client has already been connected. You cannot reuse a client.");
+        process.nextTick(() => {
+          callback(err);
+        });
+        return;
+      }
+      this._connecting = true;
+      if (this._connectionTimeoutMillis > 0) {
+        this.connectionTimeoutHandle = setTimeout(() => {
+          con._ending = true;
+          con.stream.destroy(new Error("timeout expired"));
+        }, this._connectionTimeoutMillis);
+        if (this.connectionTimeoutHandle.unref) {
+          this.connectionTimeoutHandle.unref();
+        }
+      }
+      if (this.host && this.host.indexOf("/") === 0) {
+        con.connect(this.host + "/.s.PGSQL." + this.port);
+      } else {
+        con.connect(this.port, this.host);
+      }
+      con.on("connect", function() {
+        if (self2.ssl) {
+          if (self2.sslNegotiation !== "direct") {
+            con.requestSsl();
+          }
+        } else {
+          con.startup(self2.getStartupConf());
+        }
+      });
+      con.on("sslconnect", function() {
+        con.startup(self2.getStartupConf());
+      });
+      this._attachListeners(con);
+      con.once("end", () => {
+        const error = this._ending ? new Error("Connection terminated") : new Error("Connection terminated unexpectedly");
+        clearTimeout(this.connectionTimeoutHandle);
+        this._errorAllQueries(error);
+        this._ended = true;
+        if (!this._ending) {
+          if (this._connecting && !this._connectionError) {
+            if (this._connectionCallback) {
+              this._connectionCallback(error);
+            } else {
+              this._handleErrorEvent(error);
+            }
+          } else if (!this._connectionError) {
+            this._handleErrorEvent(error);
+          }
+        }
+        process.nextTick(() => {
+          this.emit("end");
+        });
+      });
+    }
+    connect(callback) {
+      if (callback) {
+        this._connect(callback);
+        return;
+      }
+      return new this._Promise((resolve2, reject) => {
+        this._connect((error) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve2(this);
+          }
+        });
+      });
+    }
+    _attachListeners(con) {
+      con.on("authenticationCleartextPassword", this._handleAuthCleartextPassword.bind(this));
+      con.on("authenticationMD5Password", this._handleAuthMD5Password.bind(this));
+      con.on("authenticationSASL", this._handleAuthSASL.bind(this));
+      con.on("authenticationSASLContinue", this._handleAuthSASLContinue.bind(this));
+      con.on("authenticationSASLFinal", this._handleAuthSASLFinal.bind(this));
+      con.on("backendKeyData", this._handleBackendKeyData.bind(this));
+      con.on("error", this._handleErrorEvent.bind(this));
+      con.on("errorMessage", this._handleErrorMessage.bind(this));
+      con.on("readyForQuery", this._handleReadyForQuery.bind(this));
+      con.on("notice", this._handleNotice.bind(this));
+      con.on("rowDescription", this._handleRowDescription.bind(this));
+      con.on("dataRow", this._handleDataRow.bind(this));
+      con.on("portalSuspended", this._handlePortalSuspended.bind(this));
+      con.on("emptyQuery", this._handleEmptyQuery.bind(this));
+      con.on("commandComplete", this._handleCommandComplete.bind(this));
+      con.on("parseComplete", this._handleParseComplete.bind(this));
+      con.on("copyInResponse", this._handleCopyInResponse.bind(this));
+      con.on("copyData", this._handleCopyData.bind(this));
+      con.on("notification", this._handleNotification.bind(this));
+    }
+    _getPassword(cb) {
+      const con = this.connection;
+      if (typeof this.password === "function") {
+        this._Promise.resolve().then(() => this.password(this.connectionParameters)).then((pass) => {
+          if (pass !== void 0) {
+            if (typeof pass !== "string") {
+              con.emit("error", new TypeError("Password must be a string"));
+              return;
+            }
+            this.connectionParameters.password = this.password = pass;
+          } else {
+            this.connectionParameters.password = this.password = null;
+          }
+          cb();
+        }).catch((err) => {
+          con.emit("error", err);
+        });
+      } else if (this.password !== null) {
+        cb();
+      } else {
+        try {
+          const pgPass = requireLib$1();
+          pgPass(this.connectionParameters, (pass) => {
+            if (void 0 !== pass) {
+              pgPassDeprecationNotice();
+              this.connectionParameters.password = this.password = pass;
+            }
+            cb();
+          });
+        } catch (e) {
+          this.emit("error", e);
+        }
+      }
+    }
+    _handleAuthCleartextPassword(msg) {
+      this._getPassword(() => {
+        this.connection.password(this.password);
+      });
+    }
+    _handleAuthMD5Password(msg) {
+      this._getPassword(async () => {
+        try {
+          const hashedPassword = await crypto.postgresMd5PasswordHash(this.user, this.password, msg.salt);
+          this.connection.password(hashedPassword);
+        } catch (e) {
+          this.emit("error", e);
+        }
+      });
+    }
+    _handleAuthSASL(msg) {
+      this._getPassword(() => {
+        try {
+          this.saslSession = sasl2.startSession(
+            msg.mechanisms,
+            this.enableChannelBinding && this.connection.stream,
+            this.scramMaxIterations
+          );
+          this.connection.sendSASLInitialResponseMessage(this.saslSession.mechanism, this.saslSession.response);
+        } catch (err) {
+          this.connection.emit("error", err);
+        }
+      });
+    }
+    async _handleAuthSASLContinue(msg) {
+      try {
+        await sasl2.continueSession(
+          this.saslSession,
+          this.password,
+          msg.data,
+          this.enableChannelBinding && this.connection.stream
+        );
+        this.connection.sendSCRAMClientFinalMessage(this.saslSession.response);
+      } catch (err) {
+        this.connection.emit("error", err);
+      }
+    }
+    _handleAuthSASLFinal(msg) {
+      try {
+        sasl2.finalizeSession(this.saslSession, msg.data);
+        this.saslSession = null;
+      } catch (err) {
+        this.connection.emit("error", err);
+      }
+    }
+    _handleBackendKeyData(msg) {
+      this.processID = msg.processID;
+      this.secretKey = msg.secretKey;
+    }
+    _handleReadyForQuery(msg) {
+      if (this._connecting) {
+        this._connecting = false;
+        this._connected = true;
+        clearTimeout(this.connectionTimeoutHandle);
+        if (this._connectionCallback) {
+          this._connectionCallback(null, this);
+          this._connectionCallback = null;
+        }
+        this.emit("connect");
+      }
+      const activeQuery = this._getActiveQuery();
+      this._activeQuery = null;
+      this._txStatus = msg?.status ?? null;
+      this.readyForQuery = true;
+      if (activeQuery) {
+        activeQuery.handleReadyForQuery(this.connection);
+      }
+      this._pulseQueryQueue();
+    }
+    // if we receive an error event or error message
+    // during the connection process we handle it here
+    _handleErrorWhileConnecting(err) {
+      if (this._connectionError) {
+        return;
+      }
+      this._connectionError = true;
+      clearTimeout(this.connectionTimeoutHandle);
+      if (this._connectionCallback) {
+        return this._connectionCallback(err);
+      }
+      this.emit("error", err);
+    }
+    // if we're connected and we receive an error event from the connection
+    // this means the socket is dead - do a hard abort of all queries and emit
+    // the socket error on the client as well
+    _handleErrorEvent(err) {
+      if (this._connecting) {
+        return this._handleErrorWhileConnecting(err);
+      }
+      this._queryable = false;
+      this._errorAllQueries(err);
+      this.emit("error", err);
+    }
+    // handle error messages from the postgres backend
+    _handleErrorMessage(msg) {
+      if (this._connecting) {
+        return this._handleErrorWhileConnecting(msg);
+      }
+      const activeQuery = this._getActiveQuery();
+      if (!activeQuery) {
+        this._handleErrorEvent(msg);
+        return;
+      }
+      this._activeQuery = null;
+      activeQuery.handleError(msg, this.connection);
+    }
+    _handleRowDescription(msg) {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected rowDescription message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      activeQuery.handleRowDescription(msg);
+    }
+    _handleDataRow(msg) {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected dataRow message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      activeQuery.handleDataRow(msg);
+    }
+    _handlePortalSuspended(msg) {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected portalSuspended message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      activeQuery.handlePortalSuspended(this.connection);
+    }
+    _handleEmptyQuery(msg) {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected emptyQuery message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      activeQuery.handleEmptyQuery(this.connection);
+    }
+    _handleCommandComplete(msg) {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected commandComplete message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      activeQuery.handleCommandComplete(msg, this.connection);
+    }
+    _handleParseComplete() {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected parseComplete message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      if (activeQuery.name) {
+        this.connection.parsedStatements[activeQuery.name] = activeQuery.text;
+      }
+    }
+    _handleCopyInResponse(msg) {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected copyInResponse message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      activeQuery.handleCopyInResponse(this.connection);
+    }
+    _handleCopyData(msg) {
+      const activeQuery = this._getActiveQuery();
+      if (activeQuery == null) {
+        const error = new Error("Received unexpected copyData message from backend.");
+        this._handleErrorEvent(error);
+        return;
+      }
+      activeQuery.handleCopyData(msg, this.connection);
+    }
+    _handleNotification(msg) {
+      this.emit("notification", msg);
+    }
+    _handleNotice(msg) {
+      this.emit("notice", msg);
+    }
+    getStartupConf() {
+      const params = this.connectionParameters;
+      const data = {
+        user: params.user,
+        database: params.database
+      };
+      const appName = params.application_name || params.fallback_application_name;
+      if (appName) {
+        data.application_name = appName;
+      }
+      if (params.replication) {
+        data.replication = "" + params.replication;
+      }
+      if (params.statement_timeout) {
+        data.statement_timeout = String(parseInt(params.statement_timeout, 10));
+      }
+      if (params.lock_timeout) {
+        data.lock_timeout = String(parseInt(params.lock_timeout, 10));
+      }
+      if (params.idle_in_transaction_session_timeout) {
+        data.idle_in_transaction_session_timeout = String(parseInt(params.idle_in_transaction_session_timeout, 10));
+      }
+      if (params.options) {
+        data.options = params.options;
+      }
+      return data;
+    }
+    cancel(client2, query2) {
+      if (client2.activeQuery === query2) {
+        const con = this.connection;
+        if (this.host && this.host.indexOf("/") === 0) {
+          con.connect(this.host + "/.s.PGSQL." + this.port);
+        } else {
+          con.connect(this.port, this.host);
+        }
+        con.on("connect", function() {
+          con.cancel(client2.processID, client2.secretKey);
+        });
+      } else if (client2._queryQueue.indexOf(query2) !== -1) {
+        client2._queryQueue.splice(client2._queryQueue.indexOf(query2), 1);
+      }
+    }
+    setTypeParser(oid, format2, parseFn) {
+      return this._types.setTypeParser(oid, format2, parseFn);
+    }
+    getTypeParser(oid, format2) {
+      return this._types.getTypeParser(oid, format2);
+    }
+    // escapeIdentifier and escapeLiteral moved to utility functions & exported
+    // on PG
+    // re-exported here for backwards compatibility
+    escapeIdentifier(str) {
+      return utils2.escapeIdentifier(str);
+    }
+    escapeLiteral(str) {
+      return utils2.escapeLiteral(str);
+    }
+    _pulseQueryQueue() {
+      if (this.readyForQuery === true) {
+        this._activeQuery = this._queryQueue.shift();
+        const activeQuery = this._getActiveQuery();
+        if (activeQuery) {
+          this.readyForQuery = false;
+          this.hasExecuted = true;
+          const queryError = activeQuery.submit(this.connection);
+          if (queryError) {
+            process.nextTick(() => {
+              activeQuery.handleError(queryError, this.connection);
+              this.readyForQuery = true;
+              this._pulseQueryQueue();
+            });
+          }
+        } else if (this.hasExecuted) {
+          this._activeQuery = null;
+          this.emit("drain");
+        }
+      }
+    }
+    query(config2, values, callback) {
+      let query2;
+      let result2;
+      if (config2 == null) {
+        throw new TypeError("Client was passed a null or undefined query");
+      }
+      if (typeof config2.submit === "function") {
+        result2 = query2 = config2;
+        if (!query2.callback) {
+          if (typeof values === "function") {
+            query2.callback = values;
+          } else if (callback) {
+            query2.callback = callback;
+          }
+        }
+      } else {
+        query2 = new Query(config2, values, callback);
+        if (!query2.callback) {
+          result2 = new this._Promise((resolve2, reject) => {
+            query2.callback = (err, res) => err ? reject(err) : resolve2(res);
+          }).catch((err) => {
+            Error.captureStackTrace(err);
+            throw err;
+          });
+        } else if (typeof query2.callback !== "function") {
+          throw new TypeError("callback is not a function");
+        }
+      }
+      const readTimeout = config2.query_timeout || this.connectionParameters.query_timeout;
+      if (readTimeout) {
+        const queryCallback = query2.callback || (() => {
+        });
+        const readTimeoutTimer = setTimeout(() => {
+          const error = new Error("Query read timeout");
+          process.nextTick(() => {
+            query2.handleError(error, this.connection);
+          });
+          queryCallback(error);
+          query2.callback = () => {
+          };
+          const index = this._queryQueue.indexOf(query2);
+          if (index > -1) {
+            this._queryQueue.splice(index, 1);
+          }
+          this._pulseQueryQueue();
+        }, readTimeout);
+        query2.callback = (err, res) => {
+          clearTimeout(readTimeoutTimer);
+          queryCallback(err, res);
+        };
+      }
+      if (this.binary && !query2.binary) {
+        query2.binary = true;
+      }
+      if (query2._result && !query2._result._types) {
+        query2._result._types = this._types;
+      }
+      if (!this._queryable) {
+        process.nextTick(() => {
+          query2.handleError(new Error("Client has encountered a connection error and is not queryable"), this.connection);
+        });
+        return result2;
+      }
+      if (this._ending) {
+        process.nextTick(() => {
+          query2.handleError(new Error("Client was closed and is not queryable"), this.connection);
+        });
+        return result2;
+      }
+      if (this._queryQueue.length > 0) {
+        queryQueueLengthDeprecationNotice();
+      }
+      this._queryQueue.push(query2);
+      this._pulseQueryQueue();
+      return result2;
+    }
+    ref() {
+      this.connection.ref();
+    }
+    unref() {
+      this.connection.unref();
+    }
+    getTransactionStatus() {
+      return this._txStatus;
+    }
+    end(cb) {
+      this._ending = true;
+      if (!this.connection._connecting || this._ended) {
+        if (cb) {
+          cb();
+          return;
+        } else {
+          return this._Promise.resolve();
+        }
+      }
+      if (this._getActiveQuery() || !this._queryable) {
+        this.connection.stream.destroy();
+      } else {
+        this.connection.end();
+      }
+      if (cb) {
+        this.connection.once("end", cb);
+      } else {
+        return new this._Promise((resolve2) => {
+          this.connection.once("end", resolve2);
+        });
+      }
+    }
+    get queryQueue() {
+      queryQueueDeprecationNotice();
+      return this._queryQueue;
+    }
+  }
+  Client.Query = Query;
+  client$2 = Client;
+  return client$2;
+}
+var pgPool;
+var hasRequiredPgPool;
+function requirePgPool() {
+  if (hasRequiredPgPool) return pgPool;
+  hasRequiredPgPool = 1;
+  const EventEmitter = require$$0$3.EventEmitter;
+  const NOOP = function() {
+  };
+  const removeWhere = (list, predicate) => {
+    const i = list.findIndex(predicate);
+    return i === -1 ? void 0 : list.splice(i, 1)[0];
+  };
+  class IdleItem {
+    constructor(client2, idleListener, timeoutId) {
+      this.client = client2;
+      this.idleListener = idleListener;
+      this.timeoutId = timeoutId;
+    }
+  }
+  class PendingItem {
+    constructor(callback) {
+      this.callback = callback;
+    }
+  }
+  function throwOnDoubleRelease() {
+    throw new Error("Release called on client which has already been released to the pool.");
+  }
+  function promisify(Promise2, callback) {
+    if (callback) {
+      return { callback, result: void 0 };
+    }
+    let rej;
+    let res;
+    const cb = function(err, client2) {
+      err ? rej(err) : res(client2);
+    };
+    const result2 = new Promise2(function(resolve2, reject) {
+      res = resolve2;
+      rej = reject;
+    }).catch((err) => {
+      Error.captureStackTrace(err);
+      throw err;
+    });
+    return { callback: cb, result: result2 };
+  }
+  function makeIdleListener(pool, client2) {
+    return function idleListener(err) {
+      err.client = client2;
+      client2.removeListener("error", idleListener);
+      client2.on("error", () => {
+        pool.log("additional client error after disconnection due to error", err);
+      });
+      pool._remove(client2);
+      pool.emit("error", err, client2);
+    };
+  }
+  class Pool2 extends EventEmitter {
+    constructor(options, Client) {
+      super();
+      this.options = Object.assign({}, options);
+      if (options != null && "password" in options) {
+        Object.defineProperty(this.options, "password", {
+          configurable: true,
+          enumerable: false,
+          writable: true,
+          value: options.password
+        });
+      }
+      if (options != null && options.ssl && options.ssl.key) {
+        Object.defineProperty(this.options.ssl, "key", {
+          enumerable: false
+        });
+      }
+      this.options.max = this.options.max || this.options.poolSize || 10;
+      this.options.min = this.options.min || 0;
+      this.options.maxUses = this.options.maxUses || Infinity;
+      this.options.allowExitOnIdle = this.options.allowExitOnIdle || false;
+      this.options.maxLifetimeSeconds = this.options.maxLifetimeSeconds || 0;
+      this.log = this.options.log || function() {
+      };
+      this.Client = this.options.Client || Client || requireLib().Client;
+      this.Promise = this.options.Promise || commonjsGlobal.Promise;
+      if (typeof this.options.idleTimeoutMillis === "undefined") {
+        this.options.idleTimeoutMillis = 1e4;
+      }
+      this._clients = [];
+      this._idle = [];
+      this._expired = /* @__PURE__ */ new WeakSet();
+      this._pendingQueue = [];
+      this._endCallback = void 0;
+      this.ending = false;
+      this.ended = false;
+    }
+    _promiseTry(f) {
+      const Promise2 = this.Promise;
+      if (typeof Promise2.try === "function") {
+        return Promise2.try(f);
+      }
+      return new Promise2((resolve2) => resolve2(f()));
+    }
+    _isFull() {
+      return this._clients.length >= this.options.max;
+    }
+    _isAboveMin() {
+      return this._clients.length > this.options.min;
+    }
+    _pulseQueue() {
+      this.log("pulse queue");
+      if (this.ended) {
+        this.log("pulse queue ended");
+        return;
+      }
+      if (this.ending) {
+        this.log("pulse queue on ending");
+        if (this._idle.length) {
+          this._idle.slice().map((item) => {
+            this._remove(item.client);
+          });
+        }
+        if (!this._clients.length) {
+          this.ended = true;
+          this._endCallback();
+        }
+        return;
+      }
+      if (!this._pendingQueue.length) {
+        this.log("no queued requests");
+        return;
+      }
+      if (!this._idle.length && this._isFull()) {
+        return;
+      }
+      const pendingItem = this._pendingQueue.shift();
+      if (this._idle.length) {
+        const idleItem = this._idle.pop();
+        clearTimeout(idleItem.timeoutId);
+        const client2 = idleItem.client;
+        client2.ref && client2.ref();
+        const idleListener = idleItem.idleListener;
+        return this._acquireClient(client2, pendingItem, idleListener, false);
+      }
+      if (!this._isFull()) {
+        return this.newClient(pendingItem);
+      }
+      throw new Error("unexpected condition");
+    }
+    _remove(client2, callback) {
+      const removed = removeWhere(this._idle, (item) => item.client === client2);
+      if (removed !== void 0) {
+        clearTimeout(removed.timeoutId);
+      }
+      this._clients = this._clients.filter((c) => c !== client2);
+      const context = this;
+      client2.end(() => {
+        context.emit("remove", client2);
+        if (typeof callback === "function") {
+          callback();
+        }
+      });
+    }
+    connect(cb) {
+      if (this.ending) {
+        const err = new Error("Cannot use a pool after calling end on the pool");
+        return cb ? cb(err) : this.Promise.reject(err);
+      }
+      const response = promisify(this.Promise, cb);
+      const result2 = response.result;
+      if (this._isFull() || this._idle.length) {
+        if (this._idle.length) {
+          process.nextTick(() => this._pulseQueue());
+        }
+        if (!this.options.connectionTimeoutMillis) {
+          this._pendingQueue.push(new PendingItem(response.callback));
+          return result2;
+        }
+        const queueCallback = (err, res, done) => {
+          clearTimeout(tid);
+          response.callback(err, res, done);
+        };
+        const pendingItem = new PendingItem(queueCallback);
+        const tid = setTimeout(() => {
+          removeWhere(this._pendingQueue, (i) => i.callback === queueCallback);
+          pendingItem.timedOut = true;
+          response.callback(new Error("timeout exceeded when trying to connect"));
+        }, this.options.connectionTimeoutMillis);
+        if (tid.unref) {
+          tid.unref();
+        }
+        this._pendingQueue.push(pendingItem);
+        return result2;
+      }
+      this.newClient(new PendingItem(response.callback));
+      return result2;
+    }
+    newClient(pendingItem) {
+      const client2 = new this.Client(this.options);
+      this._clients.push(client2);
+      const idleListener = makeIdleListener(this, client2);
+      this.log("checking client timeout");
+      let tid;
+      let timeoutHit = false;
+      if (this.options.connectionTimeoutMillis) {
+        tid = setTimeout(() => {
+          if (client2.connection) {
+            this.log("ending client due to timeout");
+            timeoutHit = true;
+            client2.connection.stream.destroy();
+          } else if (!client2.isConnected()) {
+            this.log("ending client due to timeout");
+            timeoutHit = true;
+            client2.end();
+          }
+        }, this.options.connectionTimeoutMillis);
+      }
+      this.log("connecting new client");
+      client2.connect((err) => {
+        if (tid) {
+          clearTimeout(tid);
+        }
+        client2.on("error", idleListener);
+        if (err) {
+          this.log("client failed to connect", err);
+          this._clients = this._clients.filter((c) => c !== client2);
+          if (timeoutHit) {
+            err = new Error("Connection terminated due to connection timeout", { cause: err });
+          }
+          this._pulseQueue();
+          if (!pendingItem.timedOut) {
+            pendingItem.callback(err, void 0, NOOP);
+          }
+        } else {
+          this.log("new client connected");
+          if (this.options.onConnect) {
+            this._promiseTry(() => this.options.onConnect(client2)).then(
+              () => {
+                this._afterConnect(client2, pendingItem, idleListener);
+              },
+              (hookErr) => {
+                this._clients = this._clients.filter((c) => c !== client2);
+                client2.end(() => {
+                  this._pulseQueue();
+                  if (!pendingItem.timedOut) {
+                    pendingItem.callback(hookErr, void 0, NOOP);
+                  }
+                });
+              }
+            );
+            return;
+          }
+          return this._afterConnect(client2, pendingItem, idleListener);
+        }
+      });
+    }
+    _afterConnect(client2, pendingItem, idleListener) {
+      if (this.options.maxLifetimeSeconds !== 0) {
+        const maxLifetimeTimeout = setTimeout(() => {
+          this.log("ending client due to expired lifetime");
+          this._expired.add(client2);
+          const idleIndex = this._idle.findIndex((idleItem) => idleItem.client === client2);
+          if (idleIndex !== -1) {
+            this._acquireClient(
+              client2,
+              new PendingItem((err, client3, clientRelease) => clientRelease()),
+              idleListener,
+              false
+            );
+          }
+        }, this.options.maxLifetimeSeconds * 1e3);
+        maxLifetimeTimeout.unref();
+        client2.once("end", () => clearTimeout(maxLifetimeTimeout));
+      }
+      return this._acquireClient(client2, pendingItem, idleListener, true);
+    }
+    // acquire a client for a pending work item
+    _acquireClient(client2, pendingItem, idleListener, isNew) {
+      if (isNew) {
+        this.emit("connect", client2);
+      }
+      this.emit("acquire", client2);
+      client2.release = this._releaseOnce(client2, idleListener);
+      client2.removeListener("error", idleListener);
+      if (!pendingItem.timedOut) {
+        if (isNew && this.options.verify) {
+          this.options.verify(client2, (err) => {
+            if (err) {
+              client2.release(err);
+              return pendingItem.callback(err, void 0, NOOP);
+            }
+            pendingItem.callback(void 0, client2, client2.release);
+          });
+        } else {
+          pendingItem.callback(void 0, client2, client2.release);
+        }
+      } else {
+        if (isNew && this.options.verify) {
+          this.options.verify(client2, client2.release);
+        } else {
+          client2.release();
+        }
+      }
+    }
+    // returns a function that wraps _release and throws if called more than once
+    _releaseOnce(client2, idleListener) {
+      let released = false;
+      return (err) => {
+        if (released) {
+          throwOnDoubleRelease();
+        }
+        released = true;
+        this._release(client2, idleListener, err);
+      };
+    }
+    // release a client back to the poll, include an error
+    // to remove it from the pool
+    _release(client2, idleListener, err) {
+      client2.on("error", idleListener);
+      client2._poolUseCount = (client2._poolUseCount || 0) + 1;
+      this.emit("release", err, client2);
+      if (err || this.ending || !client2._queryable || client2._ending || client2._poolUseCount >= this.options.maxUses) {
+        if (client2._poolUseCount >= this.options.maxUses) {
+          this.log("remove expended client");
+        }
+        return this._remove(client2, this._pulseQueue.bind(this));
+      }
+      const isExpired = this._expired.has(client2);
+      if (isExpired) {
+        this.log("remove expired client");
+        this._expired.delete(client2);
+        return this._remove(client2, this._pulseQueue.bind(this));
+      }
+      let tid;
+      if (this.options.idleTimeoutMillis && this._isAboveMin()) {
+        tid = setTimeout(() => {
+          if (this._isAboveMin()) {
+            this.log("remove idle client");
+            this._remove(client2, this._pulseQueue.bind(this));
+          }
+        }, this.options.idleTimeoutMillis);
+        if (this.options.allowExitOnIdle) {
+          tid.unref();
+        }
+      }
+      if (this.options.allowExitOnIdle) {
+        client2.unref();
+      }
+      this._idle.push(new IdleItem(client2, idleListener, tid));
+      this._pulseQueue();
+    }
+    query(text2, values, cb) {
+      if (typeof text2 === "function") {
+        const response2 = promisify(this.Promise, text2);
+        setImmediate(function() {
+          return response2.callback(new Error("Passing a function as the first parameter to pool.query is not supported"));
+        });
+        return response2.result;
+      }
+      if (typeof values === "function") {
+        cb = values;
+        values = void 0;
+      }
+      const response = promisify(this.Promise, cb);
+      cb = response.callback;
+      this.connect((err, client2) => {
+        if (err) {
+          return cb(err);
+        }
+        let clientReleased = false;
+        const onError = (err2) => {
+          if (clientReleased) {
+            return;
+          }
+          clientReleased = true;
+          client2.release(err2);
+          cb(err2);
+        };
+        client2.once("error", onError);
+        this.log("dispatching query");
+        try {
+          client2.query(text2, values, (err2, res) => {
+            this.log("query dispatched");
+            client2.removeListener("error", onError);
+            if (clientReleased) {
+              return;
+            }
+            clientReleased = true;
+            client2.release(err2);
+            if (err2) {
+              return cb(err2);
+            }
+            return cb(void 0, res);
+          });
+        } catch (err2) {
+          client2.release(err2);
+          return cb(err2);
+        }
+      });
+      return response.result;
+    }
+    end(cb) {
+      this.log("ending");
+      if (this.ending) {
+        const err = new Error("Called end on pool more than once");
+        return cb ? cb(err) : this.Promise.reject(err);
+      }
+      this.ending = true;
+      const promised = promisify(this.Promise, cb);
+      this._endCallback = promised.callback;
+      this._pulseQueue();
+      return promised.result;
+    }
+    get waitingCount() {
+      return this._pendingQueue.length;
+    }
+    get idleCount() {
+      return this._idle.length;
+    }
+    get expiredCount() {
+      return this._clients.reduce((acc, client2) => acc + (this._expired.has(client2) ? 1 : 0), 0);
+    }
+    get totalCount() {
+      return this._clients.length;
+    }
+  }
+  pgPool = Pool2;
+  return pgPool;
+}
+var client$1 = { exports: {} };
+const __viteOptionalPeerDep_pgNative_pg_true = {};
+const __viteOptionalPeerDep_pgNative_pg_true$1 = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  default: __viteOptionalPeerDep_pgNative_pg_true
+}, Symbol.toStringTag, { value: "Module" }));
+const require$$1 = /* @__PURE__ */ getAugmentedNamespace(__viteOptionalPeerDep_pgNative_pg_true$1);
+var query = { exports: {} };
+var hasRequiredQuery;
+function requireQuery() {
+  if (hasRequiredQuery) return query.exports;
+  hasRequiredQuery = 1;
+  const EventEmitter = require$$0$3.EventEmitter;
+  const util2 = require$$0$7;
+  const utils2 = requireUtils$2();
+  const NativeQuery = query.exports = function(config2, values, callback) {
+    EventEmitter.call(this);
+    config2 = utils2.normalizeQueryConfig(config2, values, callback);
+    this.text = config2.text;
+    this.values = config2.values;
+    this.name = config2.name;
+    this.queryMode = config2.queryMode;
+    this.callback = config2.callback;
+    this.state = "new";
+    this._arrayMode = config2.rowMode === "array";
+    this._emitRowEvents = false;
+    this.on(
+      "newListener",
+      function(event) {
+        if (event === "row") this._emitRowEvents = true;
+      }.bind(this)
+    );
+  };
+  util2.inherits(NativeQuery, EventEmitter);
+  const errorFieldMap = {
+    sqlState: "code",
+    statementPosition: "position",
+    messagePrimary: "message",
+    context: "where",
+    schemaName: "schema",
+    tableName: "table",
+    columnName: "column",
+    dataTypeName: "dataType",
+    constraintName: "constraint",
+    sourceFile: "file",
+    sourceLine: "line",
+    sourceFunction: "routine"
+  };
+  NativeQuery.prototype.handleError = function(err) {
+    const fields = this.native.pq.resultErrorFields();
+    if (fields) {
+      for (const key in fields) {
+        const normalizedFieldName = errorFieldMap[key] || key;
+        err[normalizedFieldName] = fields[key];
+      }
+    }
+    if (this.callback) {
+      this.callback(err);
+    } else {
+      this.emit("error", err);
+    }
+    this.state = "error";
+  };
+  NativeQuery.prototype.then = function(onSuccess, onFailure) {
+    return this._getPromise().then(onSuccess, onFailure);
+  };
+  NativeQuery.prototype.catch = function(callback) {
+    return this._getPromise().catch(callback);
+  };
+  NativeQuery.prototype._getPromise = function() {
+    if (this._promise) return this._promise;
+    this._promise = new Promise(
+      function(resolve2, reject) {
+        this._once("end", resolve2);
+        this._once("error", reject);
+      }.bind(this)
+    );
+    return this._promise;
+  };
+  NativeQuery.prototype.submit = function(client2) {
+    this.state = "running";
+    const self2 = this;
+    this.native = client2.native;
+    client2.native.arrayMode = this._arrayMode;
+    let after = function(err, rows, results) {
+      client2.native.arrayMode = false;
+      setImmediate(function() {
+        self2.emit("_done");
+      });
+      if (err) {
+        return self2.handleError(err);
+      }
+      if (self2._emitRowEvents) {
+        if (results.length > 1) {
+          rows.forEach((rowOfRows, i) => {
+            rowOfRows.forEach((row) => {
+              self2.emit("row", row, results[i]);
+            });
+          });
+        } else {
+          rows.forEach(function(row) {
+            self2.emit("row", row, results);
+          });
+        }
+      }
+      self2.state = "end";
+      self2.emit("end", results);
+      if (self2.callback) {
+        self2.callback(null, results);
+      }
+    };
+    if (process.domain) {
+      after = process.domain.bind(after);
+    }
+    if (this.name) {
+      if (this.name.length > 63) {
+        console.error("Warning! Postgres only supports 63 characters for query names.");
+        console.error("You supplied %s (%s)", this.name, this.name.length);
+        console.error("This can cause conflicts and silent errors executing queries");
+      }
+      const values = (this.values || []).map(utils2.prepareValue);
+      if (client2.namedQueries[this.name]) {
+        if (this.text && client2.namedQueries[this.name] !== this.text) {
+          const err = new Error(`Prepared statements must be unique - '${this.name}' was used for a different statement`);
+          return after(err);
+        }
+        return client2.native.execute(this.name, values, after);
+      }
+      return client2.native.prepare(this.name, this.text, values.length, function(err) {
+        if (err) return after(err);
+        client2.namedQueries[self2.name] = self2.text;
+        return self2.native.execute(self2.name, values, after);
+      });
+    } else if (this.values) {
+      if (!Array.isArray(this.values)) {
+        const err = new Error("Query values must be an array");
+        return after(err);
+      }
+      const vals = this.values.map(utils2.prepareValue);
+      client2.native.query(this.text, vals, after);
+    } else if (this.queryMode === "extended") {
+      client2.native.query(this.text, [], after);
+    } else {
+      client2.native.query(this.text, after);
+    }
+  };
+  return query.exports;
+}
+var hasRequiredClient;
+function requireClient() {
+  if (hasRequiredClient) return client$1.exports;
+  hasRequiredClient = 1;
+  const nodeUtils = require$$0$7;
+  var Native;
+  try {
+    Native = require$$1;
+  } catch (e) {
+    throw e;
+  }
+  const TypeOverrides = requireTypeOverrides();
+  const EventEmitter = require$$0$3.EventEmitter;
+  const util2 = require$$0$7;
+  const ConnectionParameters = requireConnectionParameters();
+  const NativeQuery = requireQuery();
+  const queryQueueLengthDeprecationNotice = nodeUtils.deprecate(
+    () => {
+    },
+    "Calling client.query() when the client is already executing a query is deprecated and will be removed in pg@9.0. Use async/await or an external async flow control mechanism instead."
+  );
+  const Client = client$1.exports = function(config2) {
+    EventEmitter.call(this);
+    config2 = config2 || {};
+    this._Promise = config2.Promise || commonjsGlobal.Promise;
+    this._types = new TypeOverrides(config2.types);
+    this.native = new Native({
+      types: this._types
+    });
+    this._queryQueue = [];
+    this._ending = false;
+    this._connecting = false;
+    this._connected = false;
+    this._queryable = true;
+    const cp = this.connectionParameters = new ConnectionParameters(config2);
+    if (config2.nativeConnectionString) cp.nativeConnectionString = config2.nativeConnectionString;
+    this.user = cp.user;
+    Object.defineProperty(this, "password", {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: cp.password
+    });
+    this.database = cp.database;
+    this.host = cp.host;
+    this.port = cp.port;
+    this.namedQueries = {};
+  };
+  Client.Query = NativeQuery;
+  util2.inherits(Client, EventEmitter);
+  Client.prototype._errorAllQueries = function(err) {
+    const enqueueError = (query2) => {
+      process.nextTick(() => {
+        query2.native = this.native;
+        query2.handleError(err);
+      });
+    };
+    if (this._hasActiveQuery()) {
+      enqueueError(this._activeQuery);
+      this._activeQuery = null;
+    }
+    this._queryQueue.forEach(enqueueError);
+    this._queryQueue.length = 0;
+  };
+  Client.prototype._connect = function(cb) {
+    const self2 = this;
+    if (this._connecting) {
+      process.nextTick(() => cb(new Error("Client has already been connected. You cannot reuse a client.")));
+      return;
+    }
+    this._connecting = true;
+    this.connectionParameters.getLibpqConnectionString(function(err, conString) {
+      if (self2.connectionParameters.nativeConnectionString) conString = self2.connectionParameters.nativeConnectionString;
+      if (err) return cb(err);
+      self2.native.connect(conString, function(err2) {
+        if (err2) {
+          self2.native.end();
+          return cb(err2);
+        }
+        self2._connected = true;
+        self2.native.on("error", function(err3) {
+          self2._queryable = false;
+          self2._errorAllQueries(err3);
+          self2.emit("error", err3);
+        });
+        self2.native.on("notification", function(msg) {
+          self2.emit("notification", {
+            channel: msg.relname,
+            payload: msg.extra
+          });
+        });
+        self2.emit("connect");
+        self2._pulseQueryQueue(true);
+        cb(null, this);
+      });
+    });
+  };
+  Client.prototype.connect = function(callback) {
+    if (callback) {
+      this._connect(callback);
+      return;
+    }
+    return new this._Promise((resolve2, reject) => {
+      this._connect((error) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve2(this);
+        }
+      });
+    });
+  };
+  Client.prototype.query = function(config2, values, callback) {
+    let query2;
+    let result2;
+    let readTimeout;
+    let readTimeoutTimer;
+    let queryCallback;
+    if (config2 === null || config2 === void 0) {
+      throw new TypeError("Client was passed a null or undefined query");
+    } else if (typeof config2.submit === "function") {
+      readTimeout = config2.query_timeout || this.connectionParameters.query_timeout;
+      result2 = query2 = config2;
+      if (typeof values === "function") {
+        config2.callback = values;
+      }
+    } else {
+      readTimeout = config2.query_timeout || this.connectionParameters.query_timeout;
+      query2 = new NativeQuery(config2, values, callback);
+      if (!query2.callback) {
+        let resolveOut, rejectOut;
+        result2 = new this._Promise((resolve2, reject) => {
+          resolveOut = resolve2;
+          rejectOut = reject;
+        }).catch((err) => {
+          Error.captureStackTrace(err);
+          throw err;
+        });
+        query2.callback = (err, res) => err ? rejectOut(err) : resolveOut(res);
+      }
+    }
+    if (readTimeout) {
+      queryCallback = query2.callback || (() => {
+      });
+      readTimeoutTimer = setTimeout(() => {
+        const error = new Error("Query read timeout");
+        process.nextTick(() => {
+          query2.handleError(error, this.connection);
+        });
+        queryCallback(error);
+        query2.callback = () => {
+        };
+        const index = this._queryQueue.indexOf(query2);
+        if (index > -1) {
+          this._queryQueue.splice(index, 1);
+        }
+        this._pulseQueryQueue();
+      }, readTimeout);
+      query2.callback = (err, res) => {
+        clearTimeout(readTimeoutTimer);
+        queryCallback(err, res);
+      };
+    }
+    if (!this._queryable) {
+      query2.native = this.native;
+      process.nextTick(() => {
+        query2.handleError(new Error("Client has encountered a connection error and is not queryable"));
+      });
+      return result2;
+    }
+    if (this._ending) {
+      query2.native = this.native;
+      process.nextTick(() => {
+        query2.handleError(new Error("Client was closed and is not queryable"));
+      });
+      return result2;
+    }
+    if (this._queryQueue.length > 0) {
+      queryQueueLengthDeprecationNotice();
+    }
+    this._queryQueue.push(query2);
+    this._pulseQueryQueue();
+    return result2;
+  };
+  Client.prototype.end = function(cb) {
+    const self2 = this;
+    this._ending = true;
+    if (this._connecting && !this._connected) {
+      this.once("connect", () => {
+        this.end(() => {
+        });
+      });
+    }
+    let result2;
+    if (!cb) {
+      result2 = new this._Promise(function(resolve2, reject) {
+        cb = (err) => err ? reject(err) : resolve2();
+      });
+    }
+    this.native.end(function() {
+      self2._connected = false;
+      self2._errorAllQueries(new Error("Connection terminated"));
+      process.nextTick(() => {
+        self2.emit("end");
+        if (cb) cb();
+      });
+    });
+    return result2;
+  };
+  Client.prototype._hasActiveQuery = function() {
+    return this._activeQuery && this._activeQuery.state !== "error" && this._activeQuery.state !== "end";
+  };
+  Client.prototype._pulseQueryQueue = function(initialConnection) {
+    if (!this._connected) {
+      return;
+    }
+    if (this._hasActiveQuery()) {
+      return;
+    }
+    const query2 = this._queryQueue.shift();
+    if (!query2) {
+      if (!initialConnection) {
+        this.emit("drain");
+      }
+      return;
+    }
+    this._activeQuery = query2;
+    query2.submit(this);
+    const self2 = this;
+    query2.once("_done", function() {
+      self2._pulseQueryQueue();
+    });
+  };
+  Client.prototype.cancel = function(query2) {
+    if (this._activeQuery === query2) {
+      this.native.cancel(function() {
+      });
+    } else if (this._queryQueue.indexOf(query2) !== -1) {
+      this._queryQueue.splice(this._queryQueue.indexOf(query2), 1);
+    }
+  };
+  Client.prototype.ref = function() {
+  };
+  Client.prototype.unref = function() {
+  };
+  Client.prototype.setTypeParser = function(oid, format2, parseFn) {
+    return this._types.setTypeParser(oid, format2, parseFn);
+  };
+  Client.prototype.getTypeParser = function(oid, format2) {
+    return this._types.getTypeParser(oid, format2);
+  };
+  Client.prototype.isConnected = function() {
+    return this._connected;
+  };
+  Client.prototype.getTransactionStatus = function() {
+    return this.native.getTransactionStatus();
+  };
+  return client$1.exports;
+}
+var native;
+var hasRequiredNative;
+function requireNative() {
+  if (hasRequiredNative) return native;
+  hasRequiredNative = 1;
+  native = requireClient();
+  return native;
+}
+var hasRequiredLib;
+function requireLib() {
+  if (hasRequiredLib) return lib$1.exports;
+  hasRequiredLib = 1;
+  (function(module) {
+    const Client = requireClient$1();
+    const defaults2 = requireDefaults$1();
+    const Connection = requireConnection();
+    const Result = requireResult();
+    const utils2 = requireUtils$2();
+    const Pool2 = requirePgPool();
+    const TypeOverrides = requireTypeOverrides();
+    const { DatabaseError } = requireDist$1();
+    const { escapeIdentifier, escapeLiteral } = requireUtils$2();
+    const poolFactory = (Client2) => {
+      return class BoundPool extends Pool2 {
+        constructor(options) {
+          super(options, Client2);
+        }
+      };
+    };
+    const PG = function(clientConstructor2) {
+      this.defaults = defaults2;
+      this.Client = clientConstructor2;
+      this.Query = this.Client.Query;
+      this.Pool = poolFactory(this.Client);
+      this._pools = [];
+      this.Connection = Connection;
+      this.types = requirePgTypes();
+      this.DatabaseError = DatabaseError;
+      this.TypeOverrides = TypeOverrides;
+      this.escapeIdentifier = escapeIdentifier;
+      this.escapeLiteral = escapeLiteral;
+      this.Result = Result;
+      this.utils = utils2;
+    };
+    let clientConstructor = Client;
+    let forceNative = false;
+    try {
+      forceNative = !!process.env.NODE_PG_FORCE_NATIVE;
+    } catch {
+    }
+    if (forceNative) {
+      clientConstructor = requireNative();
+    }
+    module.exports = new PG(clientConstructor);
+    Object.defineProperty(module.exports, "native", {
+      configurable: true,
+      enumerable: false,
+      get() {
+        let native2 = null;
+        try {
+          native2 = new PG(requireNative());
+        } catch (err) {
+          if (err.code !== "MODULE_NOT_FOUND") {
+            throw err;
+          }
+        }
+        Object.defineProperty(module.exports, "native", {
+          value: native2
+        });
+        return native2;
+      }
+    });
+  })(lib$1);
+  return lib$1.exports;
+}
+var libExports = requireLib();
+const pg = /* @__PURE__ */ getDefaultExportFromCjs(libExports);
+pg.Client;
+const Pool = pg.Pool;
+pg.Connection;
+pg.types;
+pg.Query;
+pg.DatabaseError;
+pg.escapeIdentifier;
+pg.escapeLiteral;
+pg.Result;
+pg.TypeOverrides;
+pg.defaults;
+const postgresMigrations = [{
+  version: 1,
+  name: "authoritative_ledger",
+  sql: `
+    CREATE TABLE projects (
+      id UUID PRIMARY KEY,
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      intent TEXT,
+      deadline TIMESTAMPTZ,
+      completion_criteria TEXT,
+      state TEXT NOT NULL CHECK(state IN ('active','paused','dormant','completed')),
+      current_focus TEXT,
+      next_action TEXT,
+      blockers_json JSONB NOT NULL DEFAULT '[]'::jsonb CHECK(jsonb_typeof(blockers_json) = 'array'),
+      current_checkpoint_id UUID,
+      archived_at TIMESTAMPTZ,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE phases (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      description TEXT,
+      status TEXT NOT NULL CHECK(status IN ('planned','active','completed','abandoned')),
+      position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
+      archived_at TIMESTAMPTZ,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      UNIQUE(id, project_id)
+    );
+    CREATE INDEX phases_project_position ON phases(project_id, position, created_at);
+
+    CREATE TABLE work_items (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      phase_id UUID,
+      stable_key TEXT,
+      parent_id UUID,
+      kind TEXT NOT NULL CHECK(kind IN ('issue','task','idea','question','risk')),
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      status TEXT NOT NULL CHECK(status IN ('open','in_progress','blocked','resolved','dropped')),
+      priority TEXT CHECK(priority IS NULL OR priority IN ('low','medium','high','critical')),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      UNIQUE(id, project_id),
+      FOREIGN KEY(phase_id, project_id) REFERENCES phases(id, project_id) ON DELETE SET NULL (phase_id),
+      FOREIGN KEY(parent_id, project_id) REFERENCES work_items(id, project_id) ON DELETE SET NULL (parent_id)
+    );
+    CREATE INDEX work_items_project_status ON work_items(project_id, status, updated_at DESC);
+    CREATE INDEX work_items_phase ON work_items(phase_id, project_id);
+    CREATE INDEX work_items_parent ON work_items(parent_id, project_id);
+    CREATE UNIQUE INDEX work_items_project_stable_key ON work_items(project_id, lower(stable_key)) WHERE stable_key IS NOT NULL;
+
+    CREATE TABLE labels (
+      id UUID PRIMARY KEY,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      colour TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE UNIQUE INDEX labels_name_nocase ON labels(lower(name));
+
+    CREATE TABLE work_item_labels (
+      work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      label_id UUID NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(work_item_id, label_id)
+    );
+    CREATE INDEX work_item_labels_label ON work_item_labels(label_id);
+
+    CREATE TABLE updates (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('note','progress','decision','discovery','checkpoint')),
+      current_revision_id UUID NOT NULL,
+      deleted_at TIMESTAMPTZ,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX updates_project_created ON updates(project_id, created_at DESC);
+
+    CREATE TABLE update_revisions (
+      id UUID PRIMARY KEY,
+      update_id UUID NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL CHECK(revision > 0),
+      content TEXT NOT NULL,
+      snapshot_json JSONB,
+      source TEXT NOT NULL,
+      client TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      UNIQUE(id, update_id),
+      UNIQUE(update_id, revision)
+    );
+    ALTER TABLE updates ADD CONSTRAINT updates_current_revision_fkey
+      FOREIGN KEY(current_revision_id, id) REFERENCES update_revisions(id, update_id)
+      DEFERRABLE INITIALLY DEFERRED;
+    ALTER TABLE projects ADD CONSTRAINT projects_current_checkpoint_fkey
+      FOREIGN KEY(current_checkpoint_id) REFERENCES updates(id)
+      DEFERRABLE INITIALLY DEFERRED;
+    CREATE INDEX projects_current_checkpoint ON projects(current_checkpoint_id);
+    CREATE INDEX updates_current_revision ON updates(current_revision_id, id);
+    CREATE INDEX update_revisions_update ON update_revisions(update_id, revision DESC);
+
+    CREATE TABLE activity_events (
+      id UUID PRIMARY KEY,
+      project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+      entity_type TEXT NOT NULL,
+      entity_id UUID NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json JSONB NOT NULL,
+      source TEXT NOT NULL,
+      client TEXT,
+      actor TEXT NOT NULL,
+      idempotency_key TEXT,
+      created_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX activity_project_created ON activity_events(project_id, created_at DESC, id DESC);
+    CREATE INDEX activity_global_created ON activity_events(created_at DESC, id DESC);
+    CREATE INDEX activity_entity_created ON activity_events(entity_type, entity_id, created_at DESC, id DESC);
+
+    CREATE TABLE search_index (
+      entity_type TEXT NOT NULL CHECK(entity_type IN ('project','phase','work_item','update','requirement','run','evidence')),
+      entity_id UUID NOT NULL,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      search_vector TSVECTOR GENERATED ALWAYS AS (
+        setweight(to_tsvector('simple'::regconfig, coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('simple'::regconfig, coalesce(body, '')), 'B')
+      ) STORED,
+      PRIMARY KEY(entity_type, entity_id)
+    );
+    CREATE INDEX search_index_vector ON search_index USING GIN(search_vector);
+    CREATE INDEX search_index_project_type ON search_index(project_id, entity_type);
+
+    CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+    CREATE TABLE requirement_states (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      semantic TEXT NOT NULL CHECK(semantic IN ('open','partial','proven','defect')),
+      position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
+      colour TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      UNIQUE(id, project_id)
+    );
+    CREATE UNIQUE INDEX requirement_states_project_name ON requirement_states(project_id, lower(name));
+    CREATE INDEX requirement_states_project_position ON requirement_states(project_id, position, created_at);
+
+    CREATE TABLE requirements (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      stable_key TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('goal','capability','requirement')),
+      parent_id UUID,
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      state_id UUID NOT NULL,
+      responsible_phase_id UUID,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      UNIQUE(id, project_id),
+      FOREIGN KEY(parent_id, project_id) REFERENCES requirements(id, project_id) ON DELETE SET NULL (parent_id),
+      FOREIGN KEY(state_id, project_id) REFERENCES requirement_states(id, project_id),
+      FOREIGN KEY(responsible_phase_id, project_id) REFERENCES phases(id, project_id) ON DELETE SET NULL (responsible_phase_id)
+    );
+    CREATE UNIQUE INDEX requirements_project_stable_key ON requirements(project_id, lower(stable_key));
+    CREATE INDEX requirements_project_updated ON requirements(project_id, updated_at DESC, id);
+    CREATE INDEX requirements_parent ON requirements(parent_id, project_id);
+    CREATE INDEX requirements_state ON requirements(state_id, project_id);
+    CREATE INDEX requirements_responsible_phase ON requirements(responsible_phase_id, project_id);
+
+    CREATE TABLE requirement_key_aliases (
+      requirement_id UUID NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      alias TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(requirement_id, alias)
+    );
+    CREATE UNIQUE INDEX requirement_key_aliases_alias ON requirement_key_aliases(lower(alias));
+
+    CREATE TABLE acceptance_criteria (
+      id UUID PRIMARY KEY,
+      requirement_id UUID NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description TEXT,
+      position INTEGER NOT NULL DEFAULT 0 CHECK(position >= 0),
+      required BOOLEAN NOT NULL DEFAULT true,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      archived_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX acceptance_criteria_requirement ON acceptance_criteria(requirement_id, archived_at, position, id);
+
+    CREATE TABLE requirement_phase_links (
+      requirement_id UUID NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      phase_id UUID NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('responsible','related')),
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(requirement_id, phase_id)
+    );
+    CREATE INDEX requirement_phase_links_phase ON requirement_phase_links(phase_id);
+
+    CREATE TABLE work_queues (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      description TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE UNIQUE INDEX work_queues_project_name ON work_queues(project_id, lower(name));
+
+    CREATE TABLE work_queue_items (
+      queue_id UUID NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+      work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      rank TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(queue_id, work_item_id),
+      UNIQUE(queue_id, rank)
+    );
+    CREATE INDEX work_queue_items_order ON work_queue_items(queue_id, rank, work_item_id);
+    CREATE INDEX work_queue_items_work_item ON work_queue_items(work_item_id);
+
+    CREATE TABLE requirement_work_links (
+      requirement_id UUID NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(requirement_id, work_item_id)
+    );
+    CREATE INDEX requirement_work_links_work_item ON requirement_work_links(work_item_id);
+
+    CREATE TABLE work_phase_links (
+      work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      phase_id UUID NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('responsible','related')),
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(work_item_id, phase_id)
+    );
+    CREATE INDEX work_phase_links_phase ON work_phase_links(phase_id);
+
+    CREATE TABLE work_relations (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      from_work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      to_work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('depends_on','blocks','relates_to')),
+      created_at TIMESTAMPTZ NOT NULL,
+      CHECK(from_work_item_id <> to_work_item_id),
+      UNIQUE(from_work_item_id, to_work_item_id, kind)
+    );
+    CREATE INDEX work_relations_from ON work_relations(from_work_item_id, kind);
+    CREATE INDEX work_relations_to ON work_relations(to_work_item_id, kind);
+    CREATE INDEX work_relations_project ON work_relations(project_id, created_at, id);
+
+    CREATE TABLE external_blockers (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      work_item_id UUID REFERENCES work_items(id) ON DELETE CASCADE,
+      content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+      resolved_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX external_blockers_open ON external_blockers(project_id, resolved_at, created_at DESC);
+    CREATE INDEX external_blockers_work_item ON external_blockers(work_item_id, resolved_at);
+
+    CREATE TABLE workspaces (
+      id UUID PRIMARY KEY,
+      name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+      canonical_root TEXT NOT NULL UNIQUE,
+      remote TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE TABLE workspace_aliases (
+      workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      alias TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(workspace_id, alias)
+    );
+
+    CREATE TABLE project_workspaces (
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(project_id, workspace_id)
+    );
+    CREATE INDEX project_workspaces_workspace ON project_workspaces(workspace_id);
+
+    CREATE TABLE workspace_revisions (
+      id UUID PRIMARY KEY,
+      workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      branch TEXT,
+      "commit" TEXT,
+      dirty BOOLEAN NOT NULL DEFAULT false,
+      diff_hash TEXT,
+      captured_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX workspace_revisions_captured ON workspace_revisions(workspace_id, captured_at DESC, id);
+
+    CREATE TABLE project_secret_names (
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(project_id, name)
+    );
+    CREATE UNIQUE INDEX project_secret_names_nocase ON project_secret_names(project_id, lower(name));
+
+    CREATE TABLE runs (
+      id UUID PRIMARY KEY,
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      workspace_revision_id UUID REFERENCES workspace_revisions(id) ON DELETE SET NULL,
+      command TEXT NOT NULL CHECK(length(trim(command)) > 0),
+      working_directory TEXT,
+      started_at TIMESTAMPTZ NOT NULL,
+      ended_at TIMESTAMPTZ,
+      duration_ms BIGINT CHECK(duration_ms IS NULL OR duration_ms >= 0),
+      outcome TEXT NOT NULL CHECK(outcome IN ('recorded','verified','failed','interrupted')),
+      exit_code INTEGER,
+      toolchain_json JSONB NOT NULL DEFAULT '{}'::jsonb CHECK(jsonb_typeof(toolchain_json) = 'object'),
+      stdout_excerpt TEXT,
+      stderr_excerpt TEXT,
+      stdout_truncated BOOLEAN NOT NULL DEFAULT false,
+      stderr_truncated BOOLEAN NOT NULL DEFAULT false,
+      validation_status TEXT NOT NULL CHECK(validation_status = 'validated'),
+      redaction_json JSONB NOT NULL DEFAULT '{"count":0,"fields":[]}'::jsonb CHECK(jsonb_typeof(redaction_json) = 'object'),
+      created_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX runs_project_started ON runs(project_id, started_at DESC, id);
+    CREATE INDEX runs_workspace_revision ON runs(workspace_revision_id);
+
+    CREATE TABLE test_summaries (
+      id UUID PRIMARY KEY,
+      run_id UUID NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL,
+      passed INTEGER NOT NULL CHECK(passed >= 0),
+      failed INTEGER NOT NULL CHECK(failed >= 0),
+      skipped INTEGER NOT NULL CHECK(skipped >= 0),
+      target_count INTEGER NOT NULL CHECK(target_count >= 0 AND target_count = passed + failed + skipped),
+      created_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE TABLE artifact_references (
+      id UUID PRIMARY KEY,
+      run_id UUID REFERENCES runs(id) ON DELETE SET NULL,
+      uri TEXT NOT NULL,
+      media_type TEXT,
+      byte_count BIGINT CHECK(byte_count IS NULL OR byte_count >= 0),
+      digest TEXT,
+      created_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX artifact_references_run ON artifact_references(run_id, created_at, id);
+
+    CREATE TABLE evidence (
+      id UUID PRIMARY KEY,
+      ordinal BIGINT GENERATED BY DEFAULT AS IDENTITY UNIQUE CHECK(ordinal > 0),
+      project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      run_id UUID REFERENCES runs(id) ON DELETE SET NULL,
+      result TEXT NOT NULL CHECK(result IN ('recorded','verified','failed','interrupted')),
+      summary TEXT NOT NULL,
+      target_version INTEGER,
+      stale BOOLEAN NOT NULL DEFAULT false,
+      stale_reason TEXT,
+      validation_status TEXT NOT NULL CHECK(validation_status IN ('validated','overridden')),
+      redaction_json JSONB NOT NULL DEFAULT '{"count":0,"fields":[]}'::jsonb CHECK(jsonb_typeof(redaction_json) = 'object'),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX evidence_project_created ON evidence(project_id, ordinal DESC);
+    CREATE INDEX evidence_run ON evidence(run_id);
+
+    CREATE TABLE evidence_requirement_links (
+      evidence_id UUID NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      requirement_id UUID NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+      PRIMARY KEY(evidence_id, requirement_id)
+    );
+    CREATE INDEX evidence_requirement_links_requirement ON evidence_requirement_links(requirement_id);
+
+    CREATE TABLE evidence_criterion_links (
+      evidence_id UUID NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      criterion_id UUID NOT NULL REFERENCES acceptance_criteria(id) ON DELETE CASCADE,
+      criterion_version INTEGER NOT NULL CHECK(criterion_version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(evidence_id, criterion_id)
+    );
+    CREATE INDEX evidence_criterion_lookup ON evidence_criterion_links(criterion_id, created_at DESC, evidence_id DESC);
+
+    CREATE TABLE evidence_work_links (
+      evidence_id UUID NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      PRIMARY KEY(evidence_id, work_item_id)
+    );
+    CREATE INDEX evidence_work_links_work_item ON evidence_work_links(work_item_id);
+
+    CREATE TABLE evidence_update_links (
+      evidence_id UUID NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      update_id UUID NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
+      PRIMARY KEY(evidence_id, update_id)
+    );
+    CREATE INDEX evidence_update_links_update ON evidence_update_links(update_id);
+
+    CREATE TABLE evidence_checkpoint_links (
+      evidence_id UUID NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      checkpoint_id UUID NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
+      PRIMARY KEY(evidence_id, checkpoint_id)
+    );
+    CREATE INDEX evidence_checkpoint_links_checkpoint ON evidence_checkpoint_links(checkpoint_id);
+
+    CREATE TABLE evidence_artifact_links (
+      evidence_id UUID NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+      artifact_id UUID NOT NULL REFERENCES artifact_references(id) ON DELETE CASCADE,
+      PRIMARY KEY(evidence_id, artifact_id)
+    );
+    CREATE INDEX evidence_artifact_links_artifact ON evidence_artifact_links(artifact_id);
+
+    CREATE TABLE evidence_overrides (
+      evidence_id UUID PRIMARY KEY REFERENCES evidence(id) ON DELETE CASCADE,
+      reason TEXT NOT NULL CHECK(length(trim(reason)) >= 20),
+      actor TEXT NOT NULL,
+      source TEXT NOT NULL CHECK(source IN ('ui','import','system')),
+      client TEXT,
+      created_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE TABLE checkpoint_snapshots (
+      id UUID PRIMARY KEY,
+      checkpoint_id UUID NOT NULL UNIQUE REFERENCES updates(id) ON DELETE CASCADE,
+      schema_version INTEGER NOT NULL DEFAULT 3 CHECK(schema_version = 3),
+      captured_at TIMESTAMPTZ NOT NULL,
+      document_json JSONB NOT NULL CHECK(jsonb_typeof(document_json) = 'object'),
+      digest TEXT NOT NULL
+    );
+
+    CREATE TABLE idempotency_records (
+      client TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      result_json JSONB NOT NULL DEFAULT 'null'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY(client, idempotency_key)
+    );
+
+    CREATE FUNCTION istra_validate_current_checkpoint() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.current_checkpoint_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM updates
+        WHERE id = NEW.current_checkpoint_id
+          AND project_id = NEW.id
+          AND kind = 'checkpoint'
+          AND deleted_at IS NULL
+      ) THEN
+        RAISE EXCEPTION 'invalid current checkpoint' USING ERRCODE = '23514';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE CONSTRAINT TRIGGER projects_current_checkpoint_guard
+      AFTER INSERT OR UPDATE OF current_checkpoint_id ON projects
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW EXECUTE FUNCTION istra_validate_current_checkpoint();
+
+    CREATE FUNCTION istra_cleanup_evidence_artifact() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      DELETE FROM artifact_references artifact
+      WHERE artifact.id = OLD.artifact_id
+        AND artifact.run_id IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM evidence_artifact_links link
+          WHERE link.artifact_id = OLD.artifact_id
+        );
+      RETURN OLD;
+    END;
+    $$;
+    CREATE TRIGGER cleanup_evidence_artifact
+      AFTER DELETE ON evidence_artifact_links
+      FOR EACH ROW EXECUTE FUNCTION istra_cleanup_evidence_artifact();
+
+    CREATE FUNCTION istra_cleanup_detached_run_artifact() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.run_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM evidence_artifact_links link WHERE link.artifact_id = NEW.id
+      ) THEN
+        DELETE FROM artifact_references WHERE id = NEW.id;
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER cleanup_run_artifacts
+      AFTER UPDATE OF run_id ON artifact_references
+      FOR EACH ROW
+      WHEN (OLD.run_id IS NOT NULL AND NEW.run_id IS NULL)
+      EXECUTE FUNCTION istra_cleanup_detached_run_artifact();
+  `
+}, {
+  version: 2,
+  name: "global_error_reports",
+  sql: `
+    CREATE TABLE error_reports (
+      id UUID PRIMARY KEY,
+      kind TEXT NOT NULL CHECK(kind IN ('bug','design')),
+      component TEXT NOT NULL CHECK(length(trim(component)) > 0 AND length(component) <= 200),
+      summary TEXT NOT NULL CHECK(length(trim(summary)) > 0 AND length(summary) <= 500),
+      observation TEXT NOT NULL CHECK(length(trim(observation)) > 0 AND length(observation) <= 20000),
+      expected_behaviour TEXT CHECK(expected_behaviour IS NULL OR (length(trim(expected_behaviour)) > 0 AND length(expected_behaviour) <= 20000)),
+      actual_behaviour TEXT CHECK(actual_behaviour IS NULL OR (length(trim(actual_behaviour)) > 0 AND length(actual_behaviour) <= 20000)),
+      reproduction_steps_json JSONB NOT NULL DEFAULT '[]'::jsonb CHECK(
+        jsonb_typeof(reproduction_steps_json) = 'array' AND jsonb_array_length(reproduction_steps_json) <= 20
+      ),
+      impact TEXT CHECK(impact IS NULL OR (length(trim(impact)) > 0 AND length(impact) <= 20000)),
+      project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+      workspace_path TEXT CHECK(workspace_path IS NULL OR (length(trim(workspace_path)) > 0 AND length(workspace_path) <= 4000)),
+      status TEXT NOT NULL CHECK(status IN ('open','acknowledged','resolved','dismissed')),
+      triage_note TEXT CHECK(triage_note IS NULL OR (length(trim(triage_note)) > 0 AND length(triage_note) <= 20000)),
+      source TEXT NOT NULL CHECK(source IN ('ui','mcp','import','system')),
+      client TEXT,
+      actor TEXT NOT NULL,
+      redaction_json JSONB NOT NULL DEFAULT '{"count":0,"fields":[]}'::jsonb CHECK(jsonb_typeof(redaction_json) = 'object'),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX error_reports_status_created ON error_reports(status, created_at DESC, id DESC);
+    CREATE INDEX error_reports_component_created ON error_reports(component, created_at DESC, id DESC);
+    CREATE INDEX error_reports_project_created ON error_reports(project_id, created_at DESC, id DESC);
+  `
+}, {
+  version: 3,
+  name: "accent_insensitive_search",
+  sql: `
+    CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;
+
+    CREATE FUNCTION istra_unaccent(input TEXT) RETURNS TEXT
+    LANGUAGE SQL
+    IMMUTABLE
+    PARALLEL SAFE
+    STRICT
+    AS $$ SELECT public.unaccent('public.unaccent', input) $$;
+
+    DROP INDEX search_index_vector;
+    ALTER TABLE search_index DROP COLUMN search_vector;
+    ALTER TABLE search_index ADD COLUMN search_vector TSVECTOR GENERATED ALWAYS AS (
+      setweight(to_tsvector('simple'::regconfig, istra_unaccent(coalesce(title, ''))), 'A') ||
+      setweight(to_tsvector('simple'::regconfig, istra_unaccent(coalesce(body, ''))), 'B')
+    ) STORED;
+    CREATE INDEX search_index_vector ON search_index USING GIN(search_vector);
+  `
+}];
+const latestPostgresSchemaVersion = postgresMigrations.at(-1)?.version ?? 0;
+const migrationLockId = "5283936332345650";
+function parsePostgresUrl(connectionString) {
+  let parsed;
+  try {
+    parsed = new URL(connectionString);
+  } catch {
+    throw new Error("ISTRA_DATABASE_URL must be a valid PostgreSQL URL");
+  }
+  if (!["postgres:", "postgresql:"].includes(parsed.protocol) || !parsed.hostname) {
+    throw new Error("ISTRA_DATABASE_URL must be a valid PostgreSQL URL");
+  }
+  return parsed;
+}
+function redactPostgresTarget(connectionString) {
+  const parsed = parsePostgresUrl(connectionString);
+  const database = parsed.pathname === "/" ? "" : parsed.pathname;
+  return `${parsed.protocol}//${parsed.host}${database}`;
+}
+function beginStatement(options) {
+  if (options.deferrable && (!options.readOnly || options.isolationLevel !== "serializable")) {
+    throw new Error("Deferrable PostgreSQL transactions must be serializable and read-only");
+  }
+  const isolation = options.isolationLevel?.toUpperCase() ?? "READ COMMITTED";
+  return [
+    `BEGIN ISOLATION LEVEL ${isolation}`,
+    options.readOnly ? "READ ONLY" : "READ WRITE",
+    options.deferrable ? "DEFERRABLE" : "NOT DEFERRABLE"
+  ].join(" ");
+}
+class PostgresExecutor {
+  constructor(pool) {
+    this.pool = pool;
+  }
+  pool;
+  transactions = new AsyncLocalStorage();
+  get inTransaction() {
+    return this.transactions.getStore() !== void 0;
+  }
+  get transactionClient() {
+    return this.transactions.getStore()?.client ?? null;
+  }
+  async query(text2, values = []) {
+    const transaction = this.transactions.getStore();
+    if (!transaction) return this.pool.query(text2, [...values]);
+    const result2 = transaction.queryTail.then(() => transaction.client.query(text2, [...values]));
+    transaction.queryTail = result2.then(() => void 0, () => void 0);
+    return result2;
+  }
+  async many(text2, values = []) {
+    return (await this.query(text2, values)).rows;
+  }
+  async maybeOne(text2, values = []) {
+    const result2 = await this.query(text2, values);
+    if (result2.rows.length > 1) throw new Error("Expected at most one PostgreSQL row");
+    return result2.rows[0] ?? null;
+  }
+  async one(text2, values = []) {
+    const result2 = await this.query(text2, values);
+    if (result2.rows.length !== 1) throw new Error("Expected exactly one PostgreSQL row");
+    return result2.rows[0];
+  }
+  async execute(text2, values = []) {
+    const result2 = await this.query(text2, values);
+    return result2.rowCount ?? result2.rows.length;
+  }
+  async withConnection(work) {
+    const active = this.transactions.getStore()?.client;
+    if (active) return work(active);
+    const client2 = await this.pool.connect();
+    try {
+      return await work(client2);
+    } finally {
+      client2.release();
+    }
+  }
+  async transaction(work, options = {}) {
+    const active = this.transactions.getStore();
+    if (active) {
+      const savepoint = `istra_${++active.nextSavepoint}`;
+      await this.query(`SAVEPOINT ${savepoint}`);
+      try {
+        const result2 = await work(this);
+        await this.query(`RELEASE SAVEPOINT ${savepoint}`);
+        return result2;
+      } catch (error) {
+        await this.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await this.query(`RELEASE SAVEPOINT ${savepoint}`);
+        throw error;
+      }
+    }
+    const client2 = await this.pool.connect();
+    try {
+      await client2.query(beginStatement(options));
+      return await this.transactions.run({ client: client2, nextSavepoint: 0, queryTail: Promise.resolve() }, async () => {
+        try {
+          const result2 = await work(this);
+          await this.query("COMMIT");
+          return result2;
+        } catch (error) {
+          await this.query("ROLLBACK");
+          throw error;
+        }
+      });
+    } finally {
+      client2.release();
+    }
+  }
+}
+function assertCompatibleMigrationHistory$1(applied) {
+  for (const [index, migration] of applied.entries()) {
+    const expected = postgresMigrations[index];
+    if (!expected || migration.version !== expected.version || migration.name !== expected.name) {
+      throw new Error("PostgreSQL database uses an incompatible Istra migration history");
+    }
+  }
+}
+async function migratePostgres(executor) {
+  return executor.withConnection(async (client2) => {
+    await client2.query("BEGIN");
+    try {
+      await client2.query("SELECT pg_advisory_xact_lock($1::bigint)", [migrationLockId]);
+      await client2.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TIMESTAMPTZ NOT NULL
+        )
+      `);
+      const applied = (await client2.query("SELECT version,name FROM schema_migrations ORDER BY version")).rows;
+      assertCompatibleMigrationHistory$1(applied);
+      for (const migration of postgresMigrations.slice(applied.length)) {
+        await client2.query(migration.sql);
+        await client2.query(
+          "INSERT INTO schema_migrations(version,name,applied_at) VALUES ($1,$2,$3)",
+          [migration.version, migration.name, (/* @__PURE__ */ new Date()).toISOString()]
+        );
+      }
+      await client2.query("COMMIT");
+      return latestPostgresSchemaVersion;
+    } catch (error) {
+      await client2.query("ROLLBACK");
+      throw error;
+    }
+  });
+}
+class PostgresDatabase {
+  constructor(pool, target) {
+    this.pool = pool;
+    this.executor = new PostgresExecutor(pool);
+    this.target = target;
+  }
+  pool;
+  executor;
+  target;
+  closed = false;
+  async healthCheck() {
+    try {
+      const row = await this.executor.one(
+        "SELECT COALESCE(MAX(version),0)::integer AS version FROM schema_migrations"
+      );
+      return { ready: true, schemaVersion: Number(row.version) };
+    } catch {
+      return { ready: false, schemaVersion: 0 };
+    }
+  }
+  async schemaVersion() {
+    const row = await this.executor.one(
+      "SELECT COALESCE(MAX(version),0)::integer AS version FROM schema_migrations"
+    );
+    return Number(row.version);
+  }
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    await this.pool.end();
+  }
+}
+async function openPostgresDatabase(options) {
+  parsePostgresUrl(options.connectionString);
+  const pool = new Pool({
+    connectionString: options.connectionString,
+    max: options.max ?? 4,
+    idleTimeoutMillis: options.idleTimeoutMillis ?? 3e4,
+    connectionTimeoutMillis: options.connectionTimeoutMillis ?? 5e3,
+    statement_timeout: options.statementTimeoutMillis ?? 3e4,
+    application_name: options.applicationName ?? "istra",
+    ssl: options.ssl
+  });
+  pool.on("error", () => void 0);
+  const database = new PostgresDatabase(pool, redactPostgresTarget(options.connectionString));
+  try {
+    if (options.migrate !== false) await migratePostgres(database.executor);
+    return database;
+  } catch (error) {
+    await database.close();
+    throw error;
+  }
+}
+function decodeCursor(cursor) {
+  if (!cursor) return 0;
+  try {
+    const value = Number(Buffer.from(cursor, "base64url").toString("utf8"));
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+function encodeCursor(offset) {
+  return Buffer.from(String(offset), "utf8").toString("base64url");
+}
+function pageOf(items2, limit2, cursor) {
+  const start = decodeCursor(cursor);
+  const boundedLimit = Math.min(Math.max(limit2, 1), 200);
+  const pageItems = items2.slice(start, start + boundedLimit);
+  const nextOffset = start + pageItems.length;
+  const hasMore = nextOffset < items2.length;
+  return { items: pageItems, nextCursor: hasMore ? encodeCursor(nextOffset) : null, hasMore };
+}
+function canonicaliseJson(value) {
+  if (Array.isArray(value)) {
+    return value.map(canonicaliseJson).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonicaliseJson(entry)])
+    );
+  }
+  return value;
+}
+function canonicalJson(value) {
+  return JSON.stringify(canonicaliseJson(value));
+}
+const exportTables = {
+  projects: ["id", "title", "description", "intent", "deadline", "completion_criteria", "state", "current_focus", "next_action", "blockers_json", "current_checkpoint_id", "archived_at", "version", "created_at", "updated_at", "last_activity_at"],
+  error_reports: ["id", "kind", "component", "summary", "observation", "expected_behaviour", "actual_behaviour", "reproduction_steps_json", "impact", "project_id", "workspace_path", "status", "triage_note", "source", "client", "actor", "redaction_json", "version", "created_at", "updated_at"],
+  phases: ["id", "project_id", "name", "description", "status", "position", "archived_at", "version", "created_at", "updated_at"],
+  work_items: ["id", "project_id", "phase_id", "stable_key", "parent_id", "kind", "title", "description", "status", "priority", "version", "created_at", "updated_at"],
+  labels: ["id", "name", "colour", "version", "created_at", "updated_at"],
+  work_item_labels: ["work_item_id", "label_id", "created_at"],
+  updates: ["id", "project_id", "kind", "current_revision_id", "deleted_at", "version", "created_at", "updated_at"],
+  update_revisions: ["id", "update_id", "revision", "content", "snapshot_json", "source", "client", "created_at"],
+  activity_events: ["id", "project_id", "entity_type", "entity_id", "event_type", "payload_json", "source", "client", "actor", "idempotency_key", "created_at"],
+  requirement_states: ["id", "project_id", "name", "semantic", "position", "colour", "created_at", "updated_at"],
+  requirements: ["id", "project_id", "stable_key", "kind", "parent_id", "title", "description", "state_id", "responsible_phase_id", "version", "created_at", "updated_at"],
+  requirement_key_aliases: ["requirement_id", "alias", "created_at"],
+  acceptance_criteria: ["id", "requirement_id", "title", "description", "position", "required", "version", "archived_at", "created_at", "updated_at"],
+  requirement_phase_links: ["requirement_id", "phase_id", "role", "created_at"],
+  work_queues: ["id", "project_id", "name", "description", "version", "created_at", "updated_at"],
+  work_queue_items: ["queue_id", "work_item_id", "rank", "created_at"],
+  requirement_work_links: ["requirement_id", "work_item_id", "created_at"],
+  work_phase_links: ["work_item_id", "phase_id", "role", "created_at"],
+  work_relations: ["id", "project_id", "from_work_item_id", "to_work_item_id", "kind", "created_at"],
+  external_blockers: ["id", "project_id", "work_item_id", "content", "resolved_at", "created_at", "updated_at"],
+  workspaces: ["id", "name", "canonical_root", "remote", "created_at", "updated_at"],
+  workspace_aliases: ["workspace_id", "alias", "created_at"],
+  project_workspaces: ["project_id", "workspace_id", "created_at"],
+  workspace_revisions: ["id", "workspace_id", "branch", '"commit"', "dirty", "diff_hash", "captured_at"],
+  project_secret_names: ["project_id", "name", "created_at"],
+  runs: ["id", "project_id", "workspace_revision_id", "command", "working_directory", "started_at", "ended_at", "duration_ms", "outcome", "exit_code", "toolchain_json", "stdout_excerpt", "stderr_excerpt", "stdout_truncated", "stderr_truncated", "validation_status", "redaction_json", "created_at"],
+  test_summaries: ["id", "run_id", "scope", "passed", "failed", "skipped", "target_count", "created_at"],
+  artifact_references: ["id", "run_id", "uri", "media_type", "byte_count", "digest", "created_at"],
+  evidence: ["id", "ordinal", "project_id", "run_id", "result", "summary", "target_version", "stale", "stale_reason", "validation_status", "redaction_json", "created_at", "updated_at"],
+  evidence_artifact_links: ["evidence_id", "artifact_id"],
+  evidence_requirement_links: ["evidence_id", "requirement_id"],
+  evidence_criterion_links: ["evidence_id", "criterion_id", "criterion_version", "created_at"],
+  evidence_work_links: ["evidence_id", "work_item_id"],
+  evidence_update_links: ["evidence_id", "update_id"],
+  evidence_checkpoint_links: ["evidence_id", "checkpoint_id"],
+  evidence_overrides: ["evidence_id", "reason", "actor", "source", "client", "created_at"],
+  checkpoint_snapshots: ["id", "checkpoint_id", "schema_version", "captured_at", "document_json", "digest"],
+  idempotency_records: ["client", "idempotency_key", "operation", "request_hash", "result_json", "created_at"]
+};
+const jsonColumns = /* @__PURE__ */ new Set([
+  "projects.blockers_json",
+  "error_reports.reproduction_steps_json",
+  "error_reports.redaction_json",
+  "update_revisions.snapshot_json",
+  "activity_events.payload_json",
+  "runs.toolchain_json",
+  "runs.redaction_json",
+  "evidence.redaction_json",
+  "checkpoint_snapshots.document_json",
+  "idempotency_records.result_json"
+]);
+function isJsonExportColumn(table, column) {
+  return jsonColumns.has(`${table}.${column.replaceAll('"', "")}`);
+}
+const booleanColumns$1 = /* @__PURE__ */ new Set([
+  "acceptance_criteria.required",
+  "workspace_revisions.dirty",
+  "runs.stdout_truncated",
+  "runs.stderr_truncated",
+  "evidence.stale"
+]);
+const integer64Columns = /* @__PURE__ */ new Set(["runs.duration_ms", "artifact_references.byte_count", "evidence.ordinal"]);
+function normaliseJson(table, column, value) {
+  if (typeof value !== "string") return canonicalJson(value);
+  try {
+    return canonicalJson(JSON.parse(value));
+  } catch {
+    throw new Error(`${table}.${column} contains invalid JSON`);
+  }
+}
+function normaliseTimestamp(table, column, value) {
+  const date2 = value instanceof Date ? value : new Date(String(value));
+  if (Number.isNaN(date2.getTime())) throw new Error(`${table}.${column} contains an invalid timestamp`);
+  return date2.toISOString();
+}
+function normaliseExportRow(table, row) {
+  const columns = exportTables[table];
+  if (!columns) throw new Error(`Unknown export table ${table}`);
+  return Object.fromEntries(columns.map((quotedColumn) => {
+    const column = quotedColumn.replaceAll('"', "");
+    const value = row[column];
+    if (value === null || value === void 0) return [column, null];
+    if (jsonColumns.has(`${table}.${column}`)) return [column, normaliseJson(table, column, value)];
+    if (booleanColumns$1.has(`${table}.${column}`)) return [column, value === true || value === 1 || value === "1" ? 1 : 0];
+    if (integer64Columns.has(`${table}.${column}`)) {
+      const number2 = Number(value);
+      if (!Number.isSafeInteger(number2)) throw new Error(`${table}.${column} exceeds JavaScript's safe integer range`);
+      return [column, number2];
+    }
+    if (column === "deadline" || column.endsWith("_at")) return [column, normaliseTimestamp(table, column, value)];
+    return [column, value];
+  }));
+}
+function deterministicRows(table, rows) {
+  return rows.map((row) => normaliseExportRow(table, row)).sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+}
+async function lockProjectGraph(executor, projectId) {
+  if (!executor.inTransaction) throw new Error("Project graph locks require an active PostgreSQL transaction");
+  await executor.query(
+    `SELECT pg_advisory_xact_lock(hashtextextended('istra-project-graph:' || $1::text, 0))`,
+    [projectId]
+  );
+}
+const now$3 = () => (/* @__PURE__ */ new Date()).toISOString();
+const textOrNull$2 = (value) => value == null ? null : String(value);
+const iso$1 = (value) => value instanceof Date ? value.toISOString() : String(value);
+function json$2(value, fallback) {
+  if (value === null || value === void 0) return fallback;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+function isUniqueViolation(error) {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "23505");
+}
+function beforeAfter$1(before, after, keys) {
+  return Object.fromEntries(keys.filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key])).map((key) => [key, { before: before[key], after: after[key] }]));
+}
+function projectFromRow$2(row) {
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    description: textOrNull$2(row.description),
+    intent: textOrNull$2(row.intent),
+    deadline: row.deadline == null ? null : iso$1(row.deadline),
+    completionCriteria: textOrNull$2(row.completion_criteria),
+    state: String(row.state),
+    currentFocus: textOrNull$2(row.current_focus),
+    nextAction: textOrNull$2(row.next_action),
+    blockers: json$2(row.blockers_json, []),
+    currentCheckpointId: textOrNull$2(row.current_checkpoint_id),
+    archivedAt: row.archived_at == null ? null : iso$1(row.archived_at),
+    version: Number(row.version),
+    createdAt: iso$1(row.created_at),
+    updatedAt: iso$1(row.updated_at),
+    lastActivityAt: iso$1(row.last_activity_at)
+  };
+}
+function phaseFromRow$1(row) {
+  return {
+    id: String(row.id),
+    projectId: String(row.project_id),
+    name: String(row.name),
+    description: textOrNull$2(row.description),
+    status: String(row.status),
+    position: Number(row.position),
+    archivedAt: row.archived_at == null ? null : iso$1(row.archived_at),
+    version: Number(row.version),
+    createdAt: iso$1(row.created_at),
+    updatedAt: iso$1(row.updated_at)
+  };
+}
+function labelFromRow$1(row) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    colour: textOrNull$2(row.colour),
+    version: Number(row.version),
+    createdAt: iso$1(row.created_at),
+    updatedAt: iso$1(row.updated_at)
+  };
+}
+function revisionFromRow$1(row) {
+  return {
+    id: String(row.id),
+    updateId: String(row.update_id),
+    revision: Number(row.revision),
+    content: String(row.content),
+    snapshot: json$2(row.snapshot_json, null),
+    source: String(row.source),
+    client: textOrNull$2(row.client),
+    createdAt: iso$1(row.created_at)
+  };
+}
+function activityFromRow(row) {
+  return {
+    id: String(row.id),
+    projectId: textOrNull$2(row.project_id),
+    entityType: String(row.entity_type),
+    entityId: String(row.entity_id),
+    eventType: String(row.event_type),
+    payload: json$2(row.payload_json, {}),
+    source: String(row.source),
+    client: textOrNull$2(row.client),
+    actor: String(row.actor),
+    idempotencyKey: textOrNull$2(row.idempotency_key),
+    createdAt: iso$1(row.created_at)
+  };
+}
+const booleanColumns = /* @__PURE__ */ new Set([
+  "acceptance_criteria.required",
+  "workspace_revisions.dirty",
+  "runs.stdout_truncated",
+  "runs.stderr_truncated",
+  "evidence.stale"
+]);
+function parentFirst(table, rows) {
+  const parentColumn = table === "work_items" || table === "requirements" ? "parent_id" : null;
+  if (!parentColumn) return rows;
+  const pending = new Map(rows.map((row) => [String(row.id), row]));
+  const ordered = [];
+  while (pending.size) {
+    let progressed = false;
+    for (const [id2, row] of pending) {
+      const parentId = row[parentColumn];
+      if (parentId != null && pending.has(String(parentId))) continue;
+      ordered.push(row);
+      pending.delete(id2);
+      progressed = true;
+    }
+    if (!progressed) throw new ValidationError(`Migration bundle contains a ${table} parent cycle`);
+  }
+  return ordered;
+}
+class PostgresIstraRepository {
+  constructor(executor) {
+    this.executor = executor;
+  }
+  executor;
+  async transaction(work) {
+    return this.executor.transaction(async () => work());
+  }
+  async seedOperationalDefaults(projectId, timestamp = now$3()) {
+    const defaults2 = [
+      ["Missing", "open", 0, "#7A8594"],
+      ["Partial", "partial", 1, "#C18401"],
+      ["Proven", "proven", 2, "#2D7A4B"],
+      ["Defect", "defect", 3, "#B64D3A"]
+    ];
+    for (const [name, semantic, position, colour] of defaults2) {
+      await this.executor.execute(`
+        INSERT INTO requirement_states(id,project_id,name,semantic,position,colour,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
+        ON CONFLICT DO NOTHING
+      `, [randomUUID(), projectId, name, semantic, position, colour, timestamp]);
+    }
+    const existing = await this.executor.maybeOne("SELECT id FROM work_queues WHERE project_id=$1 ORDER BY created_at,id LIMIT 1", [projectId]);
+    if (!existing) {
+      await this.executor.execute(`
+        INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$5)
+        ON CONFLICT DO NOTHING
+      `, [randomUUID(), projectId, "Main queue", "Default ordered work queue", timestamp]);
+    }
+  }
+  async event(projectId, entityType, entityId, eventType, payload, provenance) {
+    const occurredAt = provenance.occurredAt ?? now$3();
+    await this.executor.execute(`
+      INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11)
+    `, [randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), provenance.source, provenance.client ?? null, provenance.actor ?? provenance.client ?? provenance.source, provenance.idempotencyKey ?? null, occurredAt]);
+    if (projectId) await this.executor.execute("UPDATE projects SET last_activity_at=$1 WHERE id=$2", [occurredAt, projectId]);
+  }
+  async replaceSearch(type2, id2, projectId, title2, body) {
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT(entity_type,entity_id)
+      DO UPDATE SET project_id=EXCLUDED.project_id,title=EXCLUDED.title,body=EXCLUDED.body
+    `, [type2, id2, projectId, title2, body]);
+  }
+  async workItemFromRow(row) {
+    const id2 = String(row.id);
+    const [labels, queue, dependencies2, externalBlockers] = await Promise.all([
+      this.executor.many(`SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=$1 ORDER BY lower(l.name),l.id`, [id2]),
+      row.queue_id === void 0 ? this.executor.maybeOne("SELECT queue_id,rank FROM work_queue_items WHERE work_item_id=$1 ORDER BY rank,queue_id LIMIT 1", [id2]) : Promise.resolve(row),
+      this.executor.many(`
+        SELECT wi.title,wr.kind FROM work_relations wr
+        JOIN work_items wi ON ((wr.kind='depends_on' AND wi.id=wr.to_work_item_id) OR (wr.kind='blocks' AND wi.id=wr.from_work_item_id))
+        WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=$1) OR (wr.kind='blocks' AND wr.to_work_item_id=$1))
+          AND wi.status NOT IN ('resolved','dropped')
+      `, [id2]),
+      this.executor.many("SELECT content FROM external_blockers WHERE work_item_id=$1 AND resolved_at IS NULL ORDER BY created_at,id", [id2])
+    ]);
+    const reasons = [
+      ...dependencies2.map((dependency) => `${String(dependency.kind) === "blocks" ? "Blocked by" : "Depends on"} ${String(dependency.title)}`),
+      ...externalBlockers.map((blocker) => String(blocker.content))
+    ];
+    return {
+      id: id2,
+      projectId: String(row.project_id),
+      phaseId: textOrNull$2(row.phase_id),
+      kind: String(row.kind),
+      title: String(row.title),
+      description: textOrNull$2(row.description),
+      status: String(row.status),
+      priority: textOrNull$2(row.priority),
+      labels: labels.map(labelFromRow$1),
+      version: Number(row.version),
+      createdAt: iso$1(row.created_at),
+      updatedAt: iso$1(row.updated_at),
+      stableKey: textOrNull$2(row.stable_key),
+      parentId: textOrNull$2(row.parent_id),
+      queueId: textOrNull$2(queue?.queue_id),
+      rank: textOrNull$2(queue?.rank),
+      effectiveBlocked: String(row.status) === "blocked" || reasons.length > 0,
+      blockerReasons: reasons
+    };
+  }
+  async updateFromRow(row) {
+    const revision = await this.executor.maybeOne("SELECT * FROM update_revisions WHERE id=$1", [String(row.current_revision_id)]);
+    if (!revision) throw new Error(`Update ${String(row.id)} has no current revision`);
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      kind: String(row.kind),
+      currentRevision: revisionFromRow$1(revision),
+      deletedAt: row.deleted_at == null ? null : iso$1(row.deleted_at),
+      version: Number(row.version),
+      createdAt: iso$1(row.created_at),
+      updatedAt: iso$1(row.updated_at)
+    };
+  }
+  async listProjects(filters = {}) {
+    const clauses = [];
+    const values = [];
+    const parameter = (value) => {
+      values.push(value);
+      return `$${values.length}`;
+    };
+    if (!filters.includeArchived) clauses.push("archived_at IS NULL");
+    if (filters.state) clauses.push(`state=${parameter(filters.state)}`);
+    if (filters.q?.trim()) {
+      const q = parameter(filters.q.trim());
+      clauses.push(`(position(lower(${q}) in lower(title))>0 OR position(lower(${q}) in lower(COALESCE(description,'')))>0)`);
+    }
+    const rows = await this.executor.many(`SELECT * FROM projects ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY last_activity_at DESC,id`, values);
+    return rows.map(projectFromRow$2);
+  }
+  async getProject(id2) {
+    const row = await this.executor.maybeOne("SELECT * FROM projects WHERE id=$1", [id2]);
+    return row ? projectFromRow$2(row) : null;
+  }
+  async getProjectDetail(id2) {
+    const project = await this.getProject(id2);
+    if (!project) return null;
+    const [phases, workItems, updates, labels, activity] = await Promise.all([
+      this.listPhases(id2, true),
+      this.listWorkItems(id2),
+      this.listUpdates(id2),
+      this.executor.many(`
+        SELECT * FROM (
+          SELECT DISTINCT l.* FROM labels l
+          JOIN work_item_labels wil ON wil.label_id=l.id
+          JOIN work_items wi ON wi.id=wil.work_item_id
+          WHERE wi.project_id=$1
+        ) project_labels
+        ORDER BY lower(name),id
+      `, [id2]),
+      this.listActivity(id2)
+    ]);
+    const currentCheckpoint = project.currentCheckpointId ? updates.find((entry) => entry.id === project.currentCheckpointId) ?? null : null;
+    return {
+      project,
+      pulse: {
+        state: project.state,
+        currentFocus: project.currentFocus,
+        nextAction: project.nextAction,
+        blockers: project.blockers,
+        currentCheckpoint,
+        activePhases: phases.filter((phase) => phase.status === "active" && !phase.archivedAt),
+        unresolvedWorkItems: workItems.filter((item) => !["resolved", "dropped"].includes(item.status))
+      },
+      phases,
+      workItems,
+      updates,
+      labels: labels.map(labelFromRow$1),
+      activity
+    };
+  }
+  async createProject(input, provenance) {
+    const id2 = randomUUID();
+    const timestamp = now$3();
+    return this.transaction(async () => {
+      await this.executor.execute(`
+        INSERT INTO projects(id,title,description,intent,deadline,completion_criteria,state,created_at,updated_at,last_activity_at)
+        VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$7,$7)
+      `, [id2, input.title, input.description ?? null, input.intent ?? null, input.deadline ?? null, input.completionCriteria ?? null, timestamp]);
+      await this.seedOperationalDefaults(id2, timestamp);
+      await this.replaceSearch("project", id2, id2, input.title, [input.description, input.intent, input.completionCriteria].filter(Boolean).join("\n"));
+      await this.event(id2, "project", id2, "project.created", { title: input.title }, provenance);
+      return await this.getProject(id2);
+    });
+  }
+  async updateProject(id2, input, provenance) {
+    const current = await this.getProject(id2);
+    if (!current) throw new NotFoundError("Project", id2);
+    const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([key, value]) => key !== "expectedVersion" && value !== void 0)) };
+    return this.transaction(async () => {
+      const result2 = await this.executor.query(`
+        UPDATE projects SET title=$1,description=$2,intent=$3,deadline=$4,completion_criteria=$5,state=$6,current_focus=$7,next_action=$8,
+          blockers_json=$9::jsonb,version=version+1,updated_at=$10
+        WHERE id=$11 AND version=$12 RETURNING *
+      `, [next.title, next.description, next.intent, next.deadline, next.completionCriteria, next.state, next.currentFocus, next.nextAction, JSON.stringify(next.blockers), now$3(), id2, input.expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Project", id2);
+      await this.replaceSearch("project", id2, id2, next.title, [next.description, next.intent, next.completionCriteria].filter(Boolean).join("\n"));
+      const changes = beforeAfter$1(current, next, ["title", "description", "intent", "deadline", "completionCriteria", "state", "currentFocus", "nextAction", "blockers"]);
+      await this.event(id2, "project", id2, "project.updated", { changed: Object.keys(changes), changes }, provenance);
+      return await this.getProject(id2);
+    });
+  }
+  async archiveProject(id2, expectedVersion, archived, provenance) {
+    const current = await this.getProject(id2);
+    if (!current) throw new NotFoundError("Project", id2);
+    return this.transaction(async () => {
+      const result2 = await this.executor.query("UPDATE projects SET archived_at=$1,version=version+1,updated_at=$2 WHERE id=$3 AND version=$4 RETURNING *", [archived ? now$3() : null, now$3(), id2, expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Project", id2);
+      const updated = projectFromRow$2(result2.rows[0]);
+      await this.event(id2, "project", id2, archived ? "project.archived" : "project.unarchived", { changes: { archivedAt: { before: current.archivedAt, after: updated.archivedAt } } }, provenance);
+      return await this.getProject(id2);
+    });
+  }
+  async listPhases(projectId, includeArchived = false) {
+    const rows = await this.executor.many(`SELECT * FROM phases WHERE project_id=$1 ${includeArchived ? "" : "AND archived_at IS NULL"} ORDER BY position,created_at,id`, [projectId]);
+    return rows.map(phaseFromRow$1);
+  }
+  async createPhase(projectId, input, provenance) {
+    if (!await this.getProject(projectId)) throw new NotFoundError("Project", projectId);
+    const id2 = randomUUID();
+    const timestamp = now$3();
+    return this.transaction(async () => {
+      const positionRow = await this.executor.one("SELECT COALESCE(MAX(position),-1)+1 AS position FROM phases WHERE project_id=$1", [projectId]);
+      const row = await this.executor.one(`
+        INSERT INTO phases(id,project_id,name,description,status,position,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$7) RETURNING *
+      `, [id2, projectId, input.name, input.description ?? null, input.status, input.position ?? Number(positionRow.position), timestamp]);
+      await this.replaceSearch("phase", id2, projectId, input.name, input.description ?? "");
+      await this.event(projectId, "phase", id2, "phase.created", { name: input.name }, provenance);
+      return phaseFromRow$1(row);
+    });
+  }
+  async updatePhase(id2, input, provenance) {
+    const existing = await this.executor.maybeOne("SELECT * FROM phases WHERE id=$1", [id2]);
+    if (!existing) throw new NotFoundError("Phase", id2);
+    const current = phaseFromRow$1(existing);
+    const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([key, value]) => !["expectedVersion", "archived"].includes(key) && value !== void 0)) };
+    return this.transaction(async () => {
+      const result2 = await this.executor.query(`
+        UPDATE phases SET name=$1,description=$2,status=$3,position=$4,archived_at=$5,version=version+1,updated_at=$6
+        WHERE id=$7 AND version=$8 RETURNING *
+      `, [next.name, next.description, next.status, next.position, input.archived === void 0 ? current.archivedAt : input.archived ? now$3() : null, now$3(), id2, input.expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Phase", id2);
+      const updated = phaseFromRow$1(result2.rows[0]);
+      await this.replaceSearch("phase", id2, current.projectId, updated.name, updated.description ?? "");
+      const changes = beforeAfter$1(current, updated, ["name", "description", "status", "position", "archivedAt"]);
+      await this.event(current.projectId, "phase", id2, "phase.updated", { changed: Object.keys(changes), changes }, provenance);
+      return updated;
+    });
+  }
+  async listWorkItems(projectId, statuses) {
+    const rows = await this.executor.many(`
+      SELECT * FROM work_items WHERE project_id=$1${statuses?.length ? " AND status=ANY($2::text[])" : ""}
+      ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,updated_at DESC,id
+    `, statuses?.length ? [projectId, statuses] : [projectId]);
+    return Promise.all(rows.map((row) => this.workItemFromRow(row)));
+  }
+  async listWorkItemsPage(projectId, limit2, cursor, statuses) {
+    return pageOf(await this.listWorkItems(projectId, statuses), limit2, cursor);
+  }
+  async assertPhaseInProject(phaseId, projectId) {
+    const row = await this.executor.maybeOne("SELECT project_id FROM phases WHERE id=$1", [phaseId]);
+    if (!row || String(row.project_id) !== projectId) throw new ValidationError("phaseId must refer to a phase in the same project");
+  }
+  async assertProjectEntity(table, id2, projectId) {
+    const row = await this.executor.maybeOne(`SELECT project_id FROM ${table} WHERE id=$1`, [id2]);
+    if (!row) throw new NotFoundError(table === "requirements" ? "Requirement" : "Work item", id2);
+    if (String(row.project_id) !== projectId) throw new ValidationError(`${table === "requirements" ? "requirementId" : "workItemId"} must refer to an entity in the same project`);
+  }
+  async assertParentInProject(parentId, projectId, childId) {
+    await this.assertProjectEntity("work_items", parentId, projectId);
+    if (parentId === childId) throw new ValidationError("A work item cannot be its own parent");
+    if (!childId) return;
+    const cycle = await this.executor.maybeOne(`
+      WITH RECURSIVE ancestors(id) AS (
+        SELECT parent_id FROM work_items WHERE id=$1 AND parent_id IS NOT NULL
+        UNION
+        SELECT wi.parent_id FROM work_items wi JOIN ancestors a ON wi.id=a.id WHERE wi.parent_id IS NOT NULL
+      ) SELECT 1 FROM ancestors WHERE id=$2 LIMIT 1
+    `, [parentId, childId]);
+    if (cycle) throw new ValidationError("Parent relationship would create a cycle");
+  }
+  async assertQueueInProject(queueId, projectId) {
+    const row = await this.executor.maybeOne("SELECT project_id FROM work_queues WHERE id=$1", [queueId]);
+    if (!row) throw new NotFoundError("Work queue", queueId);
+    if (String(row.project_id) !== projectId) throw new ValidationError("queueId must refer to a queue in the same project");
+  }
+  async ensureDefaultQueue(projectId) {
+    const existing = await this.executor.maybeOne("SELECT id FROM work_queues WHERE project_id=$1 ORDER BY created_at,id LIMIT 1", [projectId]);
+    if (existing) return String(existing.id);
+    const id2 = randomUUID();
+    const timestamp = now$3();
+    const inserted = await this.executor.maybeOne(`
+      INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at)
+      VALUES ($1,$2,$3,$4,$5,$5) ON CONFLICT DO NOTHING RETURNING id
+    `, [id2, projectId, "Main queue", "Default ordered work queue", timestamp]);
+    if (inserted) return String(inserted.id);
+    const winner = await this.executor.one("SELECT id FROM work_queues WHERE project_id=$1 ORDER BY created_at,id LIMIT 1", [projectId]);
+    return String(winner.id);
+  }
+  async insertQueueItem(queueId, workItemId, rank) {
+    try {
+      await this.executor.execute("INSERT INTO work_queue_items(queue_id,work_item_id,rank,created_at) VALUES ($1,$2,$3,$4)", [queueId, workItemId, rank, now$3()]);
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : "Could not add work item to queue");
+    }
+  }
+  async insertWorkPhaseLink(workItemId, phaseId, role, projectId) {
+    await this.assertPhaseInProject(phaseId, projectId);
+    await this.executor.execute(`
+      INSERT INTO work_phase_links(work_item_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)
+      ON CONFLICT(work_item_id,phase_id) DO UPDATE SET role=EXCLUDED.role,created_at=EXCLUDED.created_at
+    `, [workItemId, phaseId, role, now$3()]);
+  }
+  async insertWorkItemLabel(workItemId, labelId) {
+    if (!await this.executor.maybeOne("SELECT 1 FROM labels WHERE id=$1", [labelId])) throw new NotFoundError("Label", labelId);
+    await this.executor.execute("INSERT INTO work_item_labels(work_item_id,label_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [workItemId, labelId, now$3()]);
+  }
+  async createWorkItem(projectId, input, provenance) {
+    const id2 = randomUUID();
+    const timestamp = now$3();
+    const labelIds = [...new Set(input.labelIds ?? [])];
+    return this.transaction(async () => {
+      if (input.parentId) await lockProjectGraph(this.executor, projectId);
+      if (!await this.getProject(projectId)) throw new NotFoundError("Project", projectId);
+      if (input.phaseId) await this.assertPhaseInProject(input.phaseId, projectId);
+      if (input.parentId) await this.assertParentInProject(input.parentId, projectId);
+      const queueId = input.queueId === void 0 ? await this.ensureDefaultQueue(projectId) : input.queueId;
+      if (queueId) await this.assertQueueInProject(queueId, projectId);
+      for (const phaseId of new Set(input.relatedPhaseIds ?? [])) await this.assertPhaseInProject(phaseId, projectId);
+      for (const requirementId of new Set(input.requirementIds ?? [])) await this.assertProjectEntity("requirements", requirementId, projectId);
+      const row = await this.executor.one(`
+        INSERT INTO work_items(id,project_id,phase_id,stable_key,parent_id,kind,title,description,status,priority,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) RETURNING *
+      `, [id2, projectId, input.phaseId ?? null, input.stableKey ?? null, input.parentId ?? null, input.kind, input.title, input.description ?? null, input.status ?? "open", input.priority ?? null, timestamp]);
+      for (const labelId of labelIds) await this.insertWorkItemLabel(id2, labelId);
+      if (queueId) await this.insertQueueItem(queueId, id2, input.rank ?? `${timestamp}-${id2}`);
+      if (input.phaseId) await this.insertWorkPhaseLink(id2, input.phaseId, "responsible", projectId);
+      for (const phaseId of new Set(input.relatedPhaseIds ?? [])) if (phaseId !== input.phaseId) await this.insertWorkPhaseLink(id2, phaseId, "related", projectId);
+      for (const requirementId of new Set(input.requirementIds ?? [])) {
+        await this.executor.execute("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [requirementId, id2, timestamp]);
+      }
+      await this.replaceSearch("work_item", id2, projectId, input.title, input.description ?? "");
+      await this.event(projectId, "work_item", id2, "work_item.created", { title: input.title, kind: input.kind, status: input.status ?? "open", phaseId: input.phaseId ?? null, stableKey: input.stableKey ?? null, parentId: input.parentId ?? null, queueId, rank: input.rank ?? null, labelIds }, provenance);
+      for (const labelId of labelIds) await this.event(projectId, "work_item", id2, "work_item.label_attached", { labelId }, provenance);
+      return this.workItemFromRow(row);
+    });
+  }
+  async updateWorkItem(id2, input, provenance) {
+    return this.transaction(async () => {
+      const initial = await this.executor.maybeOne("SELECT * FROM work_items WHERE id=$1", [id2]);
+      if (!initial) throw new NotFoundError("Work item", id2);
+      if (input.parentId !== void 0) await lockProjectGraph(this.executor, String(initial.project_id));
+      const existing = input.parentId === void 0 ? initial : await this.executor.maybeOne("SELECT * FROM work_items WHERE id=$1", [id2]);
+      if (!existing) throw new NotFoundError("Work item", id2);
+      const current = await this.workItemFromRow(existing);
+      if (input.phaseId) await this.assertPhaseInProject(input.phaseId, current.projectId);
+      const parentId = input.parentId === void 0 ? current.parentId ?? null : input.parentId;
+      if (parentId) await this.assertParentInProject(parentId, current.projectId, id2);
+      const queueId = input.queueId === void 0 ? current.queueId ?? null : input.queueId;
+      if (queueId) await this.assertQueueInProject(queueId, current.projectId);
+      const relatedPhaseIds = input.relatedPhaseIds ?? (await this.executor.many("SELECT phase_id FROM work_phase_links WHERE work_item_id=$1 AND role='related'", [id2])).map((entry) => String(entry.phase_id));
+      for (const phaseId of new Set(relatedPhaseIds)) await this.assertPhaseInProject(phaseId, current.projectId);
+      for (const requirementId of new Set(input.requirementIds ?? [])) await this.assertProjectEntity("requirements", requirementId, current.projectId);
+      const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([key, value]) => !["expectedVersion", "labelIds", "requirementIds", "relatedPhaseIds", "queueId", "rank"].includes(key) && value !== void 0)), rank: input.rank === void 0 ? current.rank ?? null : input.rank };
+      const result2 = await this.executor.query(`
+        UPDATE work_items SET phase_id=$1,stable_key=$2,parent_id=$3,kind=$4,title=$5,description=$6,status=$7,priority=$8,version=version+1,updated_at=$9
+        WHERE id=$10 AND version=$11 RETURNING *
+      `, [next.phaseId, next.stableKey ?? null, parentId, next.kind, next.title, next.description, next.status, next.priority, now$3(), id2, input.expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Work item", id2);
+      const previousLabelIds = current.labels.map((label) => label.id);
+      if (input.labelIds) {
+        await this.executor.execute("DELETE FROM work_item_labels WHERE work_item_id=$1", [id2]);
+        for (const labelId of new Set(input.labelIds)) await this.insertWorkItemLabel(id2, labelId);
+      }
+      if (input.queueId !== void 0 || input.rank !== void 0) {
+        await this.executor.execute("DELETE FROM work_queue_items WHERE work_item_id=$1", [id2]);
+        if (queueId) await this.insertQueueItem(queueId, id2, input.rank ?? current.rank ?? `${now$3()}-${id2}`);
+      }
+      if (input.relatedPhaseIds !== void 0 || input.phaseId !== void 0) {
+        await this.executor.execute("DELETE FROM work_phase_links WHERE work_item_id=$1", [id2]);
+        if (next.phaseId) await this.insertWorkPhaseLink(id2, next.phaseId, "responsible", current.projectId);
+        for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== next.phaseId) await this.insertWorkPhaseLink(id2, phaseId, "related", current.projectId);
+      }
+      if (input.requirementIds !== void 0) {
+        await this.executor.execute("DELETE FROM requirement_work_links WHERE work_item_id=$1", [id2]);
+        for (const requirementId of new Set(input.requirementIds)) {
+          await this.executor.execute("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES ($1,$2,$3)", [requirementId, id2, now$3()]);
+        }
+      }
+      await this.replaceSearch("work_item", id2, current.projectId, next.title, next.description ?? "");
+      const updated = await this.workItemFromRow(result2.rows[0]);
+      const currentEventState = { ...current, labelIds: previousLabelIds };
+      const updatedEventState = { ...updated, labelIds: updated.labels.map((label) => label.id) };
+      const changes = beforeAfter$1(currentEventState, updatedEventState, ["title", "description", "kind", "status", "priority", "phaseId", "stableKey", "parentId", "queueId", "rank", "labelIds"]);
+      await this.event(current.projectId, "work_item", id2, "work_item.updated", { changed: Object.keys(changes), changes }, provenance);
+      for (const labelId of updated.labels.map((label) => label.id).filter((labelId2) => !previousLabelIds.includes(labelId2))) await this.event(current.projectId, "work_item", id2, "work_item.label_attached", { labelId }, provenance);
+      for (const labelId of previousLabelIds.filter((labelId2) => !updated.labels.some((label) => label.id === labelId2))) await this.event(current.projectId, "work_item", id2, "work_item.label_detached", { labelId }, provenance);
+      return updated;
+    });
+  }
+  async listUpdates(projectId, includeDeleted = false) {
+    const rows = await this.executor.many(`SELECT * FROM updates WHERE project_id=$1 ${includeDeleted ? "" : "AND deleted_at IS NULL"} ORDER BY created_at DESC,id`, [projectId]);
+    return Promise.all(rows.map((row) => this.updateFromRow(row)));
+  }
+  async listUpdatesPage(projectId, limit2, cursor, includeDeleted = false) {
+    return pageOf(await this.listUpdates(projectId, includeDeleted), limit2, cursor);
+  }
+  async getUpdateRevisions(updateId) {
+    if (!await this.executor.maybeOne("SELECT 1 FROM updates WHERE id=$1", [updateId])) throw new NotFoundError("Update", updateId);
+    return (await this.executor.many("SELECT * FROM update_revisions WHERE update_id=$1 ORDER BY revision DESC,id", [updateId])).map(revisionFromRow$1);
+  }
+  async createUpdate(projectId, input, provenance) {
+    return this.transaction(() => this.insertUpdate(projectId, input.kind, input.content, null, provenance));
+  }
+  async insertUpdate(projectId, kind, content, snapshot, provenance) {
+    if (!await this.getProject(projectId)) throw new NotFoundError("Project", projectId);
+    const id2 = randomUUID();
+    const revisionId = randomUUID();
+    const timestamp = now$3();
+    const row = await this.executor.one(`
+      INSERT INTO updates(id,project_id,kind,current_revision_id,created_at,updated_at)
+      VALUES ($1,$2,$3,$4,$5,$5) RETURNING *
+    `, [id2, projectId, kind, revisionId, timestamp]);
+    await this.executor.execute(`
+      INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at)
+      VALUES ($1,$2,1,$3,$4::jsonb,$5,$6,$7)
+    `, [revisionId, id2, content, snapshot ? JSON.stringify(snapshot) : null, provenance.source, provenance.client ?? null, timestamp]);
+    await this.replaceSearch("update", id2, projectId, kind, content);
+    await this.event(projectId, "update", id2, kind === "checkpoint" ? "checkpoint.created" : "update.created", { kind, content }, provenance);
+    return this.updateFromRow(row);
+  }
+  async reviseUpdate(updateId, input, provenance) {
+    return this.transaction(async () => {
+      const existing = await this.executor.maybeOne("SELECT * FROM updates WHERE id=$1", [updateId]);
+      if (!existing) throw new NotFoundError("Update", updateId);
+      if (existing.deleted_at) throw new ValidationError("Deleted updates cannot be revised");
+      const result2 = await this.executor.query("UPDATE updates SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$3(), updateId, input.expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Update", updateId);
+      const revisionRow = await this.executor.one("SELECT COALESCE(MAX(revision),0)+1 AS revision FROM update_revisions WHERE update_id=$1", [updateId]);
+      const revision = Number(revisionRow.revision);
+      const revisionId = randomUUID();
+      const timestamp = now$3();
+      const currentRevision = await this.executor.one("SELECT snapshot_json FROM update_revisions WHERE id=$1", [String(existing.current_revision_id)]);
+      await this.executor.execute(`
+        INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at)
+        VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8)
+      `, [revisionId, updateId, revision, input.content, currentRevision.snapshot_json == null ? null : JSON.stringify(currentRevision.snapshot_json), provenance.source, provenance.client ?? null, timestamp]);
+      const updatedRow = await this.executor.one("UPDATE updates SET current_revision_id=$1 WHERE id=$2 RETURNING *", [revisionId, updateId]);
+      await this.replaceSearch("update", updateId, String(existing.project_id), String(existing.kind), input.content);
+      await this.event(String(existing.project_id), "update", updateId, "update.revised", { revision, content: input.content }, provenance);
+      return this.updateFromRow(updatedRow);
+    });
+  }
+  async softDeleteUpdate(updateId, expectedVersion, provenance) {
+    return this.transaction(async () => {
+      const existing = await this.executor.maybeOne("SELECT * FROM updates WHERE id=$1", [updateId]);
+      if (!existing) throw new NotFoundError("Update", updateId);
+      if (existing.kind === "checkpoint" && await this.executor.maybeOne("SELECT 1 FROM projects WHERE current_checkpoint_id=$1", [updateId])) {
+        throw new ValidationError("The current checkpoint cannot be deleted until another checkpoint is saved");
+      }
+      const timestamp = now$3();
+      const result2 = await this.executor.query("UPDATE updates SET deleted_at=$1,version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [timestamp, updateId, expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Update", updateId);
+      await this.executor.execute("DELETE FROM search_index WHERE entity_type='update' AND entity_id=$1", [updateId]);
+      await this.event(String(existing.project_id), "update", updateId, "update.deleted", {}, provenance);
+      return this.updateFromRow(result2.rows[0]);
+    });
+  }
+  async saveCheckpoint(projectId, input, provenance) {
+    return this.transaction(async () => {
+      const project = await this.getProject(projectId);
+      if (!project) throw new NotFoundError("Project", projectId);
+      if (project.version !== input.expectedVersion) throw new ConflictError("Project", projectId);
+      const currentFocus = input.currentFocus === void 0 ? project.currentFocus : input.currentFocus;
+      const nextAction = input.nextAction === void 0 ? project.nextAction : input.nextAction;
+      const blockers = input.blockers ?? project.blockers;
+      const [phases, workItems] = await Promise.all([this.listPhases(projectId), this.listWorkItems(projectId)]);
+      const snapshot = {
+        state: project.state,
+        currentFocus,
+        nextAction,
+        blockers,
+        activePhaseIds: phases.filter((phase) => phase.status === "active").map((phase) => phase.id),
+        unresolvedWorkItemIds: workItems.filter((item) => !["resolved", "dropped"].includes(item.status)).map((item) => item.id),
+        capturedAt: now$3()
+      };
+      const checkpoint = await this.insertUpdate(projectId, "checkpoint", input.content, snapshot, provenance);
+      const result2 = await this.executor.query(`
+        UPDATE projects SET current_focus=$1,next_action=$2,blockers_json=$3::jsonb,current_checkpoint_id=$4,version=version+1,updated_at=$5
+        WHERE id=$6 AND version=$7 RETURNING *
+      `, [currentFocus, nextAction, JSON.stringify(blockers), checkpoint.id, now$3(), projectId, input.expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Project", projectId);
+      await this.event(projectId, "project", projectId, "project.checkpoint_selected", { checkpointId: checkpoint.id }, provenance);
+      return checkpoint;
+    });
+  }
+  async listLabels() {
+    return (await this.executor.many("SELECT * FROM labels ORDER BY lower(name),id")).map(labelFromRow$1);
+  }
+  async createLabel(input, provenance) {
+    const id2 = randomUUID();
+    const timestamp = now$3();
+    return this.transaction(async () => {
+      let row;
+      try {
+        row = await this.executor.one("INSERT INTO labels(id,name,colour,created_at,updated_at) VALUES ($1,$2,$3,$4,$4) RETURNING *", [id2, input.name, input.colour ?? null, timestamp]);
+      } catch (error) {
+        if (isUniqueViolation(error)) throw new ValidationError(`A label named “${input.name}” already exists`);
+        throw error;
+      }
+      await this.event(null, "label", id2, "label.created", { name: input.name }, provenance);
+      return labelFromRow$1(row);
+    });
+  }
+  async attachLabel(workItemId, labelId, expectedVersion, provenance) {
+    return this.transaction(async () => {
+      const existing = await this.executor.maybeOne("SELECT * FROM work_items WHERE id=$1", [workItemId]);
+      if (!existing) throw new NotFoundError("Work item", workItemId);
+      if (Number(existing.version) !== expectedVersion) throw new ConflictError("Work item", workItemId);
+      if (!await this.executor.maybeOne("SELECT 1 FROM labels WHERE id=$1", [labelId])) throw new NotFoundError("Label", labelId);
+      if (await this.executor.maybeOne("SELECT 1 FROM work_item_labels WHERE work_item_id=$1 AND label_id=$2", [workItemId, labelId])) return this.workItemFromRow(existing);
+      const result2 = await this.executor.query("UPDATE work_items SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$3(), workItemId, expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Work item", workItemId);
+      await this.insertWorkItemLabel(workItemId, labelId);
+      await this.event(String(existing.project_id), "work_item", workItemId, "work_item.label_attached", { labelId }, provenance);
+      return this.workItemFromRow(result2.rows[0]);
+    });
+  }
+  async detachLabel(workItemId, labelId, expectedVersion, provenance) {
+    return this.transaction(async () => {
+      const existing = await this.executor.maybeOne("SELECT * FROM work_items WHERE id=$1", [workItemId]);
+      if (!existing) throw new NotFoundError("Work item", workItemId);
+      if (Number(existing.version) !== expectedVersion) throw new ConflictError("Work item", workItemId);
+      if (!await this.executor.maybeOne("SELECT 1 FROM work_item_labels WHERE work_item_id=$1 AND label_id=$2", [workItemId, labelId])) return this.workItemFromRow(existing);
+      const result2 = await this.executor.query("UPDATE work_items SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$3(), workItemId, expectedVersion]);
+      if (!result2.rows[0]) throw new ConflictError("Work item", workItemId);
+      await this.executor.execute("DELETE FROM work_item_labels WHERE work_item_id=$1 AND label_id=$2", [workItemId, labelId]);
+      await this.event(String(existing.project_id), "work_item", workItemId, "work_item.label_detached", { labelId }, provenance);
+      return this.workItemFromRow(result2.rows[0]);
+    });
+  }
+  async listActivity(projectId, limit2 = 200) {
+    const rows = await this.executor.many("SELECT * FROM activity_events WHERE project_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2", [projectId, Math.min(Math.max(limit2, 1), 1e3)]);
+    return rows.map(activityFromRow);
+  }
+  async listActivityPage(projectId, limit2, cursor) {
+    const start = decodeCursor(cursor);
+    const boundedLimit = Math.min(Math.max(limit2, 1), 200);
+    const rows = await this.executor.many("SELECT * FROM activity_events WHERE project_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2 OFFSET $3", [projectId, boundedLimit + 1, start]);
+    const hasMore = rows.length > boundedLimit;
+    const items2 = rows.slice(0, boundedLimit).map(activityFromRow);
+    return { items: items2, nextCursor: hasMore ? encodeCursor(start + items2.length) : null, hasMore };
+  }
+  async listRecentActivity(limit2 = 50) {
+    const rows = await this.executor.many(`
+      SELECT ae.*,p.title AS project_title FROM activity_events ae
+      JOIN projects p ON p.id=ae.project_id WHERE p.archived_at IS NULL
+      ORDER BY ae.created_at DESC,ae.id DESC LIMIT $1
+    `, [Math.min(Math.max(limit2, 1), 200)]);
+    return rows.map((row) => ({ ...activityFromRow(row), projectId: String(row.project_id), projectTitle: String(row.project_title) }));
+  }
+  async search(query2, limit2 = 50, filters = {}) {
+    const tokens = query2.toLocaleLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+    if (!tokens.length) return [];
+    const values = [];
+    const parameter = (value) => {
+      values.push(value);
+      return `$${values.length}`;
+    };
+    const tsQuery = parameter(tokens.map((token) => `${token}:*`).join(" & "));
+    const clauses = [`search_index.search_vector @@ to_tsquery('simple',istra_unaccent(${tsQuery}))`];
+    if (filters.projectId) clauses.push(`search_index.project_id=${parameter(filters.projectId)}`);
+    if (filters.entityTypes) {
+      if (!filters.entityTypes.length) clauses.push("FALSE");
+      else clauses.push(`search_index.entity_type=ANY(${parameter(filters.entityTypes)}::text[])`);
+    }
+    if (filters.state) clauses.push(`COALESCE(p.state,ph.status,wi.status)=${parameter(filters.state)}`);
+    if (filters.phaseId) {
+      const phase = parameter(filters.phaseId);
+      clauses.push(`(ph.id=${phase} OR (search_index.entity_type='work_item' AND (wi.phase_id=${phase} OR EXISTS (SELECT 1 FROM work_phase_links wpl WHERE wpl.work_item_id=search_index.entity_id AND wpl.phase_id=${phase}))))`);
+    }
+    if (filters.requirementId) clauses.push(`search_index.entity_type='work_item' AND EXISTS (SELECT 1 FROM requirement_work_links rwl WHERE rwl.work_item_id=search_index.entity_id AND rwl.requirement_id=${parameter(filters.requirementId)})`);
+    if (filters.evidenceResult) clauses.push("FALSE");
+    if (filters.from) clauses.push(`COALESCE(p.created_at,ph.created_at,wi.created_at,u.created_at)>=${parameter(filters.from)}`);
+    if (filters.to) clauses.push(`COALESCE(p.created_at,ph.created_at,wi.created_at,u.created_at)<=${parameter(filters.to)}`);
+    const boundedLimit = parameter(Math.min(Math.max(limit2, 1), 200));
+    const rows = await this.executor.many(`
+      SELECT search_index.entity_type,search_index.entity_id,search_index.project_id,search_index.title,
+        ts_headline('simple',search_index.title || ' ' || search_index.body,to_tsquery('simple',istra_unaccent(${tsQuery})),'MaxWords=24,MinWords=1') AS excerpt,
+        ts_rank_cd(search_index.search_vector,to_tsquery('simple',istra_unaccent(${tsQuery}))) AS score
+      FROM search_index
+      LEFT JOIN projects p ON search_index.entity_type='project' AND p.id=search_index.entity_id
+      LEFT JOIN phases ph ON search_index.entity_type='phase' AND ph.id=search_index.entity_id
+      LEFT JOIN work_items wi ON search_index.entity_type='work_item' AND wi.id=search_index.entity_id
+      LEFT JOIN updates u ON search_index.entity_type='update' AND u.id=search_index.entity_id
+      WHERE ${clauses.join(" AND ")} ORDER BY score DESC,search_index.entity_type,search_index.entity_id LIMIT ${boundedLimit}
+    `, values);
+    return rows.map((row) => ({
+      type: String(row.entity_type),
+      id: String(row.entity_id),
+      projectId: String(row.project_id),
+      title: String(row.title),
+      excerpt: String(row.excerpt),
+      score: Number(row.score)
+    }));
+  }
+  async exportAll() {
+    const tables = {};
+    await this.executor.transaction(async () => {
+      for (const [table, columns] of Object.entries(exportTables)) {
+        const selectColumns = columns.map((column) => isJsonExportColumn(table, column) ? `${column}::text AS ${column}` : column);
+        const rows = await this.executor.many(`SELECT ${selectColumns.join(",")} FROM ${table}`);
+        tables[table] = deterministicRows(table, rows);
+      }
+    }, { isolationLevel: "repeatable read", readOnly: true });
+    return { format: "istra-export", formatVersion: 4, exportedAt: now$3(), tables };
+  }
+  async isEmpty() {
+    for (const table of Object.keys(exportTables)) {
+      if (await this.executor.maybeOne(`SELECT 1 FROM ${table} LIMIT 1`)) return false;
+    }
+    return true;
+  }
+  async importForMigration(bundle) {
+    if (bundle.format !== "istra-export" || bundle.formatVersion !== 4) {
+      throw new ValidationError("PostgreSQL migration requires an Istra export format v4 bundle");
+    }
+    return this.transaction(async () => {
+      if (!await this.isEmpty()) throw new ValidationError("PostgreSQL migration target is not empty");
+      await this.executor.execute("SET CONSTRAINTS ALL DEFERRED");
+      const tableCounts = {};
+      for (const [table, columns] of Object.entries(exportTables)) {
+        const suppliedRows = bundle.tables[table];
+        if (!Array.isArray(suppliedRows)) throw new ValidationError(`Migration bundle is missing table ${table}`);
+        const rows = parentFirst(table, deterministicRows(table, suppliedRows));
+        const placeholders = columns.map((_, index) => `$${index + 1}`).join(",");
+        for (const row of rows) {
+          const values = columns.map((quotedColumn) => {
+            const column = quotedColumn.replaceAll('"', "");
+            const value = row[column];
+            return booleanColumns.has(`${table}.${column}`) && value != null ? Boolean(value) : value;
+          });
+          await this.executor.execute(`INSERT INTO ${table}(${columns.join(",")}) VALUES (${placeholders})`, values);
+        }
+        tableCounts[table] = rows.length;
+      }
+      await this.rebuildSearchForMigration();
+      await this.executor.execute(`
+        SELECT setval(
+          pg_get_serial_sequence('evidence','ordinal'),
+          COALESCE((SELECT MAX(ordinal) FROM evidence),1),
+          EXISTS(SELECT 1 FROM evidence)
+        )
+      `);
+      const imported = await this.exportAll();
+      for (const table of Object.keys(exportTables)) {
+        const expected = deterministicRows(table, bundle.tables[table]);
+        if (canonicalJson(imported.tables[table]) !== canonicalJson(expected)) {
+          throw new ValidationError(`PostgreSQL migration verification failed for table ${table}`);
+        }
+      }
+      return { tableCounts };
+    });
+  }
+  async clearForFailedActivation() {
+    await this.transaction(async () => {
+      await this.executor.execute("SET CONSTRAINTS ALL DEFERRED");
+      await this.executor.execute("DELETE FROM search_index");
+      for (const table of Object.keys(exportTables).reverse()) await this.executor.execute(`DELETE FROM ${table}`);
+      await this.executor.execute(`SELECT setval(pg_get_serial_sequence('evidence','ordinal'),1,false)`);
+    });
+  }
+  async rebuildSearchForMigration() {
+    await this.executor.execute("DELETE FROM search_index");
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      SELECT 'project',id,id,title,concat_ws(E'\\n',description,intent,completion_criteria) FROM projects
+    `);
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      SELECT 'phase',id,project_id,name,COALESCE(description,'') FROM phases
+    `);
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      SELECT 'work_item',id,project_id,title,COALESCE(description,'') FROM work_items
+    `);
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      SELECT 'update',u.id,u.project_id,u.kind,r.content FROM updates u
+      JOIN update_revisions r ON r.id=u.current_revision_id WHERE u.deleted_at IS NULL
+    `);
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      SELECT 'requirement',id,project_id,stable_key || ' ' || title,COALESCE(description,'') FROM requirements
+    `);
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      SELECT 'run',id,project_id,command,concat_ws(E'\\n',stdout_excerpt,stderr_excerpt) FROM runs
+    `);
+    await this.executor.execute(`
+      INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      SELECT 'evidence',id,project_id,result,summary FROM evidence
+    `);
+  }
+  async validateImport(_bundle) {
+    throw new UnsupportedOperationError("PostgreSQL full-replacement import is unavailable until PostgreSQL backup and restore support is implemented");
+  }
+  async importAll(_bundle) {
+    throw new UnsupportedOperationError("PostgreSQL full-replacement import is unavailable until PostgreSQL backup and restore support is implemented");
+  }
+}
+function newestFirst(left, right) {
+  return right.ordinal - left.ordinal;
+}
+function evaluateCriterionProof(input) {
+  const current = input.evidence.filter((entry) => !entry.stale && entry.validationStatus !== "legacy_unvalidated").sort(newestFirst);
+  const decisive = current.find((entry) => entry.result === "verified" || entry.result === "failed");
+  if (decisive?.result === "verified") return { status: "proven", evidenceId: decisive.id, reason: "Latest decisive evidence is verified" };
+  if (decisive?.result === "failed") return { status: "defect", evidenceId: decisive.id, reason: "Latest decisive evidence failed" };
+  const partial2 = current.find((entry) => entry.result === "recorded" || entry.result === "interrupted");
+  if (partial2) return { status: "partial", evidenceId: partial2.id, reason: `Latest current evidence is ${partial2.result}` };
+  return { status: "open", evidenceId: null, reason: "No current validated evidence" };
+}
+function explainRequirementProof(criteria) {
+  const activeRequired = criteria.filter((criterion) => criterion.required && !criterion.archivedAt);
+  const count = (status2) => activeRequired.filter((criterion) => criterion.status === status2).length;
+  const defectiveCriteria = count("defect");
+  const provenCriteria = count("proven");
+  const partialCriteria = count("partial");
+  const openCriteria = count("open");
+  const status = activeRequired.length === 0 ? "open" : defectiveCriteria > 0 ? "defect" : provenCriteria === activeRequired.length ? "proven" : provenCriteria + partialCriteria > 0 ? "partial" : "open";
+  return {
+    status,
+    requiredCriteria: activeRequired.length,
+    provenCriteria,
+    defectiveCriteria,
+    partialCriteria,
+    openCriteria,
+    criteria: criteria.map((criterion) => ({
+      id: criterion.id,
+      title: criterion.title,
+      required: criterion.required,
+      archivedAt: criterion.archivedAt ?? null,
+      proofStatus: criterion.status,
+      proofEvidenceId: criterion.evidenceId,
+      proofReason: criterion.reason
+    }))
+  };
+}
+const DEFAULT_REPLACEMENT = "[REDACTED]";
+const DEFAULT_SECRET_NAMES = [
+  "access_token",
+  "api_key",
+  "authorization",
+  "bearer_token",
+  "client_secret",
+  "client_token",
+  "connection_string",
+  "cookie",
+  "database_url",
+  "id_token",
+  "password",
+  "passwd",
+  "private_key",
+  "refresh_token",
+  "secret",
+  "session",
+  "session_id",
+  "session_token",
+  "token"
+];
+const normaliseName = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+const DEFAULT_SECRET_SUFFIXES = DEFAULT_SECRET_NAMES.map(normaliseName).filter((name) => name.length >= 5);
+const SENSITIVE_NAME_SEGMENTS = /* @__PURE__ */ new Set(["authorization", "cookie", "credential", "credentials", "passwd", "password", "secret", "session", "token"]);
+function hasSensitiveNameSegment(value) {
+  const separated = value.replace(/([a-z\d])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return separated.some((segment) => SENSITIVE_NAME_SEGMENTS.has(segment));
+}
+function displayName(value) {
+  try {
+    return decodeURIComponent(value).toLowerCase();
+  } catch {
+    return value.toLowerCase();
+  }
+}
+function findJsonStringEnd(value, start) {
+  if (value[start] !== '"') return null;
+  for (let index = start + 1; index < value.length; index += 1) {
+    if (value[index] === "\\") index += 1;
+    else if (value[index] === '"') return index + 1;
+  }
+  return null;
+}
+function findJsonCompositeEnd(value, start) {
+  const opening = value[start];
+  if (opening !== "{" && opening !== "[") return null;
+  const closings = [opening === "{" ? "}" : "]"];
+  for (let index = start + 1; index < value.length; index += 1) {
+    if (value[index] === '"') {
+      const end = findJsonStringEnd(value, index);
+      if (end === null) return null;
+      index = end - 1;
+      continue;
+    }
+    if (value[index] === "{") closings.push("}");
+    else if (value[index] === "[") closings.push("]");
+    else if (value[index] === closings.at(-1)) {
+      closings.pop();
+      if (closings.length === 0) return index + 1;
+    }
+  }
+  return null;
+}
+function findJsonValueEnd(value, start) {
+  if (value[start] === '"') return findJsonStringEnd(value, start);
+  if (value[start] === "{" || value[start] === "[") return findJsonCompositeEnd(value, start);
+  const primitive = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:e[+-]?\d+)?)/i.exec(value.slice(start));
+  return primitive ? start + primitive[0].length : null;
+}
+function unquote(value) {
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && value.at(-1) === quote ? value.slice(1, -1) : value;
+}
+function replacePreservingQuote(value, replacement) {
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && value.at(-1) === quote ? `${quote}${replacement}${quote}` : replacement;
+}
+class SecretRedactor {
+  replacement;
+  sensitiveNames;
+  sensitiveSuffixes;
+  constructor(options = {}) {
+    this.replacement = options.replacement ?? DEFAULT_REPLACEMENT;
+    if (!this.replacement) throw new Error("Secret redaction replacement must not be empty");
+    const configured = options.secretNames ?? [];
+    const names2 = options.includeDefaultSecretNames === false ? configured : [...DEFAULT_SECRET_NAMES, ...configured];
+    this.sensitiveNames = new Set(names2.map(normaliseName).filter(Boolean));
+    this.sensitiveSuffixes = options.includeDefaultSecretNames === false ? [] : DEFAULT_SECRET_SUFFIXES;
+  }
+  redact(input) {
+    let value = input;
+    let count = 0;
+    const metadata2 = /* @__PURE__ */ new Map();
+    const isSensitive = (name) => {
+      const normalised = normaliseName(name);
+      return this.sensitiveNames.has(normalised) || this.sensitiveSuffixes.some((suffix) => normalised.length > suffix.length && normalised.endsWith(suffix)) || this.sensitiveSuffixes.length > 0 && hasSensitiveNameSegment(name);
+    };
+    const record2 = (kind, name) => {
+      count += 1;
+      const displayed = displayName(name);
+      const key = `${kind}:${normaliseName(displayed)}`;
+      const existing = metadata2.get(key);
+      if (existing) existing.count += 1;
+      else metadata2.set(key, { kind, name: displayed, count: 1 });
+    };
+    const isReplacement = (candidate) => unquote(candidate).trim() === this.replacement;
+    let output = "";
+    let copiedUntil = 0;
+    for (let index = 0; index < value.length; ) {
+      if (value[index] !== '"') {
+        index += 1;
+        continue;
+      }
+      const keyEnd = findJsonStringEnd(value, index);
+      if (keyEnd === null) break;
+      let separator = keyEnd;
+      while (/\s/.test(value[separator] ?? "")) separator += 1;
+      if (value[separator] !== ":") {
+        index = keyEnd;
+        continue;
+      }
+      let key = null;
+      try {
+        const parsed = JSON.parse(value.slice(index, keyEnd));
+        if (typeof parsed === "string") key = parsed;
+      } catch {
+        key = null;
+      }
+      let valueStart = separator + 1;
+      while (/\s/.test(value[valueStart] ?? "")) valueStart += 1;
+      const valueEnd = key && isSensitive(key) ? findJsonValueEnd(value, valueStart) : null;
+      if (key && valueEnd !== null && !isReplacement(value.slice(valueStart, valueEnd))) {
+        output += value.slice(copiedUntil, valueStart) + JSON.stringify(this.replacement);
+        copiedUntil = valueEnd;
+        record2("json-key", key);
+        index = valueEnd;
+      } else {
+        index = keyEnd;
+      }
+    }
+    if (copiedUntil > 0) value = output + value.slice(copiedUntil);
+    value = value.replace(/\b([a-z][a-z\d+.-]*:\/\/)([^/\s?#@]+)@/gi, (match, scheme, userinfo) => {
+      if (userinfo === this.replacement) return match;
+      record2("url-userinfo", "userinfo");
+      return `${scheme}${this.replacement}@`;
+    });
+    value = value.replace(/\b((?:proxy-)?authorization|cookie|set-cookie)(\s*:\s*)([^\r\n"']+)/gi, (match, name, separator, secret) => {
+      if (isReplacement(secret)) return match;
+      record2("header", name);
+      return `${name}${separator}${this.replacement}`;
+    });
+    value = value.replace(/([?&])([a-z0-9_.%~-]+)(=)([^&#\s"'`]*)/gi, (match, prefix, name, equals, secret) => {
+      let decodedName = name;
+      try {
+        decodedName = decodeURIComponent(name.replaceAll("+", " "));
+      } catch {
+      }
+      if (!secret || !isSensitive(decodedName) || isReplacement(secret)) return match;
+      record2("query-parameter", decodedName);
+      return `${prefix}${name}${equals}${this.replacement}`;
+    });
+    value = value.replace(/(^|[\s;(])(--?)([a-z][a-z0-9_.-]*)(?:(\s*=\s*)|(\s+))("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,&|)]+)/gim, (match, boundary, dashes, name, equals, spacing, secret) => {
+      if (!isSensitive(name) || isReplacement(secret)) return match;
+      record2("shell-flag", name);
+      return `${boundary}${dashes}${name}${equals ?? spacing ?? ""}${replacePreservingQuote(secret, this.replacement)}`;
+    });
+    value = value.replace(/(^|[\s;,(])((?:export\s+)?)([a-z_][a-z0-9_.-]*)(\s*=\s*)("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,&|)]+)/gim, (match, boundary, declaration, name, equals, secret) => {
+      if (!isSensitive(name) || isReplacement(secret)) return match;
+      record2("environment", name);
+      return `${boundary}${declaration}${name}${equals}${replacePreservingQuote(secret, this.replacement)}`;
+    });
+    return { value, redacted: count > 0, count, redactions: [...metadata2.values()] };
+  }
+}
+const now$2 = () => (/* @__PURE__ */ new Date()).toISOString();
+const text = (value) => value == null ? null : String(value);
+const iso = (value) => value instanceof Date ? value.toISOString() : String(value);
+const bool$1 = (value) => value === true || value === 1 || value === "1";
+const json$1 = (value, fallback) => {
+  if (value == null) return fallback;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+const stripAnsi$1 = (value) => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+const redactionMetadata$1 = (entries) => ({
+  count: entries.reduce((total, entry) => total + entry.result.count, 0),
+  fields: [...new Set(entries.flatMap((entry) => entry.result.redactions.map((redaction) => `${entry.field}:${redaction.kind}:${redaction.name}`)))]
+});
+const allowedProjectTables = /* @__PURE__ */ new Set(["requirements", "work_items", "phases"]);
+async function serialMap(values, map) {
+  const results = [];
+  for (const value of values) results.push(await map(value));
+  return results;
+}
+function projectFromRow$1(row) {
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    description: text(row.description),
+    intent: text(row.intent),
+    deadline: text(row.deadline),
+    completionCriteria: text(row.completion_criteria),
+    state: String(row.state),
+    currentFocus: text(row.current_focus),
+    nextAction: text(row.next_action),
+    blockers: json$1(row.blockers_json, []),
+    currentCheckpointId: text(row.current_checkpoint_id),
+    archivedAt: text(row.archived_at) ? iso(row.archived_at) : null,
+    version: Number(row.version),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+    lastActivityAt: iso(row.last_activity_at)
+  };
+}
+class PostgresOperationalRepository {
+  constructor(executor) {
+    this.executor = executor;
+  }
+  executor;
+  contexts = new AsyncLocalStorage();
+  async runIdempotent(client2, key, operation, payload, work) {
+    return this.runMutation({ source: "system", actor: client2, client: client2, idempotencyKey: key, occurredAt: now$2() }, operation, payload, work);
+  }
+  async runMutation(context, operation, payload, work) {
+    const requestHash = createHash("sha256").update(canonicalJson(payload)).digest("hex");
+    return this.executor.transaction(async () => this.contexts.run(context, async () => {
+      const client2 = context.client ?? context.actor;
+      if (context.idempotencyKey) {
+        const claimed = await this.executor.execute(`INSERT INTO idempotency_records(client,idempotency_key,operation,request_hash,result_json,created_at)
+          VALUES ($1,$2,$3,$4,'null'::jsonb,$5) ON CONFLICT DO NOTHING`, [client2, context.idempotencyKey, operation, requestHash, context.occurredAt]);
+        if (!claimed) {
+          const existing = await this.executor.one("SELECT operation,request_hash,result_json FROM idempotency_records WHERE client=$1 AND idempotency_key=$2 FOR UPDATE", [client2, context.idempotencyKey]);
+          if (String(existing.operation) !== operation || String(existing.request_hash) !== requestHash) throw new IdempotencyConflictError(context.idempotencyKey);
+          return json$1(existing.result_json, void 0);
+        }
+      }
+      const result2 = await work();
+      if (context.idempotencyKey) await this.executor.execute("UPDATE idempotency_records SET result_json=$3::jsonb WHERE client=$1 AND idempotency_key=$2", [client2, context.idempotencyKey, JSON.stringify(result2) ?? "null"]);
+      return result2;
+    }));
+  }
+  context() {
+    return this.contexts.getStore() ?? { source: "system", actor: "internal", client: "internal", idempotencyKey: null, occurredAt: now$2() };
+  }
+  async event(projectId, entityType, entityId, eventType, payload = {}) {
+    const context = this.context();
+    await this.executor.execute(`INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11)`, [randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), context.source, context.client ?? null, context.actor, context.idempotencyKey, context.occurredAt]);
+    if (projectId) await this.executor.execute("UPDATE projects SET last_activity_at=$1 WHERE id=$2", [context.occurredAt, projectId]);
+  }
+  async replaceSearch(type2, id2, projectId, title2, body) {
+    await this.executor.execute(
+      `INSERT INTO search_index(entity_type,entity_id,project_id,title,body)
+      VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (entity_type,entity_id) DO UPDATE SET project_id=EXCLUDED.project_id,title=EXCLUDED.title,body=EXCLUDED.body`,
+      [type2, id2, projectId, title2, body]
+    );
+  }
+  async project(projectId) {
+    const row = await this.executor.maybeOne("SELECT * FROM projects WHERE id=$1", [projectId]);
+    if (!row) throw new NotFoundError("Project", projectId);
+    return row;
+  }
+  async assertProjectEntity(table, id2, projectId) {
+    if (!allowedProjectTables.has(table)) throw new Error(`Unsupported project table ${table}`);
+    const row = await this.executor.maybeOne(`SELECT * FROM ${table} WHERE id=$1 AND project_id=$2`, [id2, projectId]);
+    if (!row) throw new ValidationError(`${table} must belong to the project`);
+    return row;
+  }
+  async listRequirementStates(projectId) {
+    await this.project(projectId);
+    return (await this.executor.many("SELECT * FROM requirement_states WHERE project_id=$1 ORDER BY position,created_at", [projectId])).map((row) => ({
+      id: String(row.id),
+      projectId: String(row.project_id),
+      name: String(row.name),
+      semantic: String(row.semantic),
+      position: Number(row.position),
+      colour: text(row.colour),
+      createdAt: iso(row.created_at),
+      updatedAt: iso(row.updated_at)
+    }));
+  }
+  async createRequirementState(projectId, input) {
+    await this.project(projectId);
+    const id2 = randomUUID();
+    const timestamp = now$2();
+    const position = input.position ?? Number((await this.executor.one("SELECT COALESCE(MAX(position),-1)+1 AS position FROM requirement_states WHERE project_id=$1", [projectId])).position);
+    try {
+      await this.executor.execute("INSERT INTO requirement_states(id,project_id,name,semantic,position,colour,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)", [id2, projectId, input.name, input.semantic, position, input.colour ?? null, timestamp]);
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : "Could not create requirement state");
+    }
+    await this.event(projectId, "requirement_state", id2, "requirement_state.created", { name: input.name, semantic: input.semantic });
+    return (await this.listRequirementStates(projectId)).find((state) => state.id === id2);
+  }
+  async evidenceStaleness(row) {
+    const targetVersion = row.target_version == null ? null : Number(row.target_version);
+    const storedStale = bool$1(row.stale);
+    const storedReason = text(row.stale_reason);
+    if (targetVersion == null) return { stale: storedStale, staleReason: storedReason };
+    const versions = await this.executor.many(`SELECT version FROM requirements r JOIN evidence_requirement_links l ON l.requirement_id=r.id WHERE l.evidence_id=$1
+      UNION ALL SELECT version FROM work_items w JOIN evidence_work_links l ON l.work_item_id=w.id WHERE l.evidence_id=$1
+      UNION ALL SELECT version FROM updates u JOIN evidence_update_links l ON l.update_id=u.id WHERE l.evidence_id=$1
+      UNION ALL SELECT version FROM updates u JOIN evidence_checkpoint_links l ON l.checkpoint_id=u.id WHERE l.evidence_id=$1`, [String(row.id)]);
+    const current = versions.length ? Math.max(...versions.map((entry) => Number(entry.version))) : targetVersion;
+    const derived = current > targetVersion;
+    return { stale: storedStale || derived, staleReason: storedStale ? storedReason ?? "Evidence was explicitly marked stale" : derived ? `Linked entity advanced from version ${targetVersion} to ${current}` : null };
+  }
+  async criteria(requirementId) {
+    const rows = await this.executor.many("SELECT * FROM acceptance_criteria WHERE requirement_id=$1 ORDER BY archived_at IS NOT NULL,position,created_at", [requirementId]);
+    return serialMap(rows, async (row) => {
+      const observations = await serialMap(await this.executor.many(`SELECT e.*,l.criterion_version FROM evidence_criterion_links l JOIN evidence e ON e.id=l.evidence_id WHERE l.criterion_id=$1 ORDER BY e.ordinal DESC`, [row.id]), async (entry) => {
+        const effective = await this.evidenceStaleness(entry);
+        return { id: String(entry.id), ordinal: Number(entry.ordinal), result: String(entry.result), createdAt: iso(entry.created_at), stale: effective.stale || Number(entry.criterion_version) !== Number(row.version), validationStatus: String(entry.validation_status) };
+      });
+      const proof = evaluateCriterionProof({ id: String(row.id), title: String(row.title), required: bool$1(row.required), evidence: observations });
+      const archivedAt = row.archived_at == null ? null : iso(row.archived_at);
+      return { id: String(row.id), requirementId: String(row.requirement_id), title: String(row.title), description: text(row.description), position: Number(row.position), required: bool$1(row.required), version: Number(row.version), archivedAt, proofStatus: proof.status, proofEvidenceId: proof.evidenceId, proofReason: archivedAt ? "Criterion is archived and does not participate in requirement proof" : proof.reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+    });
+  }
+  async requirementFromRow(row) {
+    const id2 = String(row.id);
+    const related = await this.executor.many("SELECT phase_id FROM requirement_phase_links WHERE requirement_id=$1 AND role='related' ORDER BY phase_id", [id2]);
+    const work = await this.executor.many("SELECT work_item_id FROM requirement_work_links WHERE requirement_id=$1 ORDER BY work_item_id", [id2]);
+    const evidence = await this.executor.many("SELECT evidence_id FROM evidence_requirement_links WHERE requirement_id=$1 ORDER BY evidence_id", [id2]);
+    const criteria = await this.criteria(id2);
+    const proofExplanation = explainRequirementProof(criteria.map((criterion) => ({ id: criterion.id, title: criterion.title, required: criterion.required, archivedAt: criterion.archivedAt, evidence: [], status: criterion.proofStatus, evidenceId: criterion.proofEvidenceId, reason: criterion.proofReason })));
+    return { id: id2, projectId: String(row.project_id), stableKey: String(row.stable_key), kind: String(row.kind), parentId: text(row.parent_id), title: String(row.title), description: text(row.description), stateId: String(row.state_id), responsiblePhaseId: text(row.responsible_phase_id), version: Number(row.version), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), criteria, relatedPhaseIds: related.map((x) => String(x.phase_id)), linkedWorkItemIds: work.map((x) => String(x.work_item_id)), linkedEvidenceIds: evidence.map((x) => String(x.evidence_id)), gate: proofExplanation.requiredCriteria === 0 ? "not_configured" : proofExplanation.status === "proven" ? "satisfied" : "unsatisfied", proofStatus: proofExplanation.status, proofExplanation };
+  }
+  async listRequirements(projectId) {
+    await this.project(projectId);
+    return serialMap(await this.executor.many("SELECT r.*,s.semantic FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.project_id=$1 ORDER BY lower(r.stable_key),r.id", [projectId]), (row) => this.requirementFromRow(row));
+  }
+  async listRequirementsPage(projectId, limit2, cursor) {
+    return pageOf(await this.listRequirements(projectId), limit2, cursor);
+  }
+  async getRequirement(id2) {
+    const row = await this.executor.maybeOne("SELECT r.*,s.semantic FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.id=$1", [id2]);
+    return row ? this.requirementFromRow(row) : null;
+  }
+  async assertRequirementParent(parentId, projectId, childId) {
+    await this.assertProjectEntity("requirements", parentId, projectId);
+    if (parentId === childId) throw new ValidationError("A requirement cannot be its own parent");
+    if (!childId) return;
+    const cycle = await this.executor.maybeOne(`WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM requirements WHERE id=$1 AND parent_id IS NOT NULL UNION SELECT r.parent_id FROM requirements r JOIN ancestors a ON r.id=a.id WHERE r.parent_id IS NOT NULL) SELECT 1 FROM ancestors WHERE id=$2 LIMIT 1`, [parentId, childId]);
+    if (cycle) throw new ValidationError("Requirement parent relationship would create a cycle");
+  }
+  async createRequirement(projectId, input) {
+    await this.project(projectId);
+    const state = input.stateId ? await this.executor.maybeOne("SELECT id FROM requirement_states WHERE id=$1 AND project_id=$2", [input.stateId, projectId]) : await this.executor.maybeOne("SELECT id FROM requirement_states WHERE project_id=$1 AND semantic='open' ORDER BY position LIMIT 1", [projectId]);
+    if (!state) throw new ValidationError("Requirement state does not belong to the project");
+    if (input.responsiblePhaseId) await this.assertProjectEntity("phases", input.responsiblePhaseId, projectId);
+    if (input.criteria?.some((criterion) => criterion.id)) throw new ValidationError("New requirements cannot reuse existing criterion ids");
+    return this.executor.transaction(async () => {
+      if (input.parentId) {
+        await lockProjectGraph(this.executor, projectId);
+        await this.assertRequirementParent(input.parentId, projectId);
+      }
+      const id2 = randomUUID();
+      const timestamp = now$2();
+      try {
+        await this.executor.execute("INSERT INTO requirements(id,project_id,stable_key,kind,parent_id,title,description,state_id,responsible_phase_id,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)", [id2, projectId, input.stableKey, input.kind, input.parentId ?? null, input.title, input.description ?? null, state.id, input.responsiblePhaseId ?? null, timestamp]);
+      } catch (error) {
+        throw new ValidationError(error instanceof Error ? error.message : "Could not create requirement");
+      }
+      for (const [position, criterion] of (input.criteria ?? []).entries()) await this.executor.execute("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)", [randomUUID(), id2, criterion.title, criterion.description ?? null, position, criterion.required, timestamp]);
+      for (const phaseId of new Set(input.relatedPhaseIds ?? [])) {
+        await this.assertProjectEntity("phases", phaseId, projectId);
+        await this.executor.execute("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING", [id2, phaseId, phaseId === input.responsiblePhaseId ? "responsible" : "related", timestamp]);
+      }
+      await this.replaceSearch("requirement", id2, projectId, `${input.stableKey} ${input.title}`, input.description ?? "");
+      await this.event(projectId, "requirement", id2, "requirement.created", { stableKey: input.stableKey, criterionCount: input.criteria?.length ?? 0 });
+      return await this.getRequirement(id2);
+    });
+  }
+  async updateRequirement(id2, input) {
+    const initial = await this.getRequirement(id2);
+    if (!initial) throw new NotFoundError("Requirement", id2);
+    return this.executor.transaction(async () => {
+      if (input.parentId !== void 0) await lockProjectGraph(this.executor, initial.projectId);
+      const current = input.parentId === void 0 ? initial : await this.getRequirement(id2);
+      if (!current) throw new NotFoundError("Requirement", id2);
+      const parentId = input.parentId === void 0 ? current.parentId : input.parentId;
+      if (parentId) await this.assertRequirementParent(parentId, current.projectId, id2);
+      const stateId = input.stateId ?? current.stateId;
+      if (!await this.executor.maybeOne("SELECT 1 FROM requirement_states WHERE id=$1 AND project_id=$2", [stateId, current.projectId])) throw new ValidationError("Requirement state does not belong to the project");
+      const responsiblePhaseId = input.responsiblePhaseId === void 0 ? current.responsiblePhaseId : input.responsiblePhaseId;
+      if (responsiblePhaseId) await this.assertProjectEntity("phases", responsiblePhaseId, current.projectId);
+      const relatedPhaseIds = input.relatedPhaseIds ?? current.relatedPhaseIds;
+      for (const phaseId of new Set(relatedPhaseIds)) await this.assertProjectEntity("phases", phaseId, current.projectId);
+      const next = { ...current, ...input };
+      const changed = await this.executor.execute(`UPDATE requirements SET stable_key=$1,kind=$2,parent_id=$3,title=$4,description=$5,state_id=$6,responsible_phase_id=$7,version=version+1,updated_at=$8 WHERE id=$9 AND version=$10`, [next.stableKey, next.kind, parentId ?? null, next.title, next.description ?? null, stateId, responsiblePhaseId ?? null, now$2(), id2, input.expectedVersion]);
+      if (!changed) throw new ConflictError("Requirement", id2);
+      if (input.relatedPhaseIds !== void 0 || input.responsiblePhaseId !== void 0) {
+        await this.executor.execute("DELETE FROM requirement_phase_links WHERE requirement_id=$1", [id2]);
+        if (responsiblePhaseId) await this.executor.execute("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)", [id2, responsiblePhaseId, "responsible", now$2()]);
+        for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== responsiblePhaseId) await this.executor.execute("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)", [id2, phaseId, "related", now$2()]);
+      }
+      if (input.criteria !== void 0) {
+        const existing = await this.executor.many("SELECT * FROM acceptance_criteria WHERE requirement_id=$1", [id2]);
+        const byId = new Map(existing.map((criterion) => [String(criterion.id), criterion]));
+        const retained = /* @__PURE__ */ new Set();
+        for (const [position, criterion] of input.criteria.entries()) {
+          if (!criterion.id) {
+            const criterionId = randomUUID();
+            const timestamp = now$2();
+            await this.executor.execute("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)", [criterionId, id2, criterion.title, criterion.description ?? null, position, criterion.required, timestamp]);
+            await this.event(current.projectId, "acceptance_criterion", criterionId, "acceptance_criterion.created", { requirementId: id2 });
+            continue;
+          }
+          const stored = byId.get(criterion.id);
+          if (!stored) throw new ValidationError("Criterion must belong to the requirement being updated");
+          const materiallyChanged = String(stored.title) !== criterion.title || text(stored.description) !== (criterion.description ?? null) || bool$1(stored.required) !== criterion.required || Number(stored.position) !== position || stored.archived_at !== null;
+          const count = await this.executor.execute(`UPDATE acceptance_criteria SET title=$1,description=$2,position=$3,required=$4,archived_at=NULL,version=version+$5,updated_at=$6 WHERE id=$7 AND requirement_id=$8 AND version=$9`, [criterion.title, criterion.description ?? null, position, criterion.required, materiallyChanged ? 1 : 0, now$2(), criterion.id, id2, criterion.expectedVersion]);
+          if (!count) throw new ConflictError("Acceptance criterion", criterion.id);
+          retained.add(criterion.id);
+          if (materiallyChanged) await this.event(current.projectId, "acceptance_criterion", criterion.id, "acceptance_criterion.updated", { requirementId: id2 });
+        }
+        for (const stored of existing.filter((criterion) => criterion.archived_at == null && !retained.has(String(criterion.id)))) {
+          await this.executor.execute("UPDATE acceptance_criteria SET archived_at=$1,version=version+1,updated_at=$1 WHERE id=$2", [now$2(), stored.id]);
+          await this.event(current.projectId, "acceptance_criterion", String(stored.id), "acceptance_criterion.archived", { requirementId: id2 });
+        }
+      }
+      await this.replaceSearch("requirement", id2, current.projectId, `${next.stableKey} ${next.title}`, next.description ?? "");
+      await this.event(current.projectId, "requirement", id2, "requirement.updated", { stableKey: next.stableKey });
+      return await this.getRequirement(id2);
+    });
+  }
+  async linkRequirementWork(projectId, requirementId, workItemId) {
+    await this.assertProjectEntity("requirements", requirementId, projectId);
+    await this.assertProjectEntity("work_items", workItemId, projectId);
+    await this.executor.execute("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [requirementId, workItemId, now$2()]);
+    await this.event(projectId, "requirement", requirementId, "requirement.work_linked", { workItemId });
+  }
+  async unlinkRequirementWork(requirementId, workItemId) {
+    const row = await this.executor.maybeOne("SELECT project_id FROM requirements WHERE id=$1", [requirementId]);
+    await this.executor.execute("DELETE FROM requirement_work_links WHERE requirement_id=$1 AND work_item_id=$2", [requirementId, workItemId]);
+    if (row) await this.event(String(row.project_id), "requirement", requirementId, "requirement.work_unlinked", { workItemId });
+  }
+  async getRequirementRollup(projectId) {
+    const requirements = await this.listRequirements(projectId);
+    const states = await this.listRequirementStates(projectId);
+    const phases = await this.executor.many("SELECT id,name FROM phases WHERE project_id=$1", [projectId]);
+    const bySemantic = { open: 0, partial: 0, proven: 0, defect: 0 };
+    const byProofStatus = { open: 0, partial: 0, proven: 0, defect: 0 };
+    const stateMap = new Map(states.map((state) => [state.id, state.semantic]));
+    const phaseMap = new Map(phases.map((phase) => [String(phase.id), String(phase.name)]));
+    const byId = new Map(requirements.map((requirement) => [requirement.id, requirement]));
+    const empty2 = () => ({ open: 0, partial: 0, proven: 0, defect: 0 });
+    const capabilities = /* @__PURE__ */ new Map();
+    const goals = /* @__PURE__ */ new Map();
+    const milestones = /* @__PURE__ */ new Map();
+    const add = (map, id2, name, requirement, stableKey) => {
+      const bucket = map.get(id2) ?? { id: id2, name, ...stableKey ? { stableKey } : {}, counts: empty2(), total: 0 };
+      bucket.counts[stateMap.get(requirement.stateId) ?? "open"] += 1;
+      bucket.total += 1;
+      map.set(id2, bucket);
+    };
+    for (const requirement of requirements) {
+      bySemantic[stateMap.get(requirement.stateId) ?? "open"] += 1;
+      byProofStatus[requirement.proofStatus] += 1;
+      const seen = /* @__PURE__ */ new Set();
+      let parentId = requirement.parentId;
+      while (parentId && !seen.has(parentId)) {
+        seen.add(parentId);
+        const parent = byId.get(parentId);
+        if (!parent) break;
+        if (parent.kind === "capability") add(capabilities, parent.id, parent.title, requirement, parent.stableKey);
+        if (parent.kind === "goal") add(goals, parent.id, parent.title, requirement, parent.stableKey);
+        parentId = parent.parentId;
+      }
+      if (requirement.kind === "capability") add(capabilities, requirement.id, requirement.title, requirement, requirement.stableKey);
+      if (requirement.kind === "goal") add(goals, requirement.id, requirement.title, requirement, requirement.stableKey);
+      for (const phaseId of /* @__PURE__ */ new Set([...requirement.responsiblePhaseId ? [requirement.responsiblePhaseId] : [], ...requirement.relatedPhaseIds])) {
+        const name = phaseMap.get(phaseId);
+        if (name) add(milestones, phaseId, name, requirement);
+      }
+    }
+    const sorted = (map) => [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+    return { total: requirements.length, bySemantic, byProofStatus, gateFailures: requirements.filter((r) => r.gate === "unsatisfied").length, defects: byProofStatus.defect, byCapability: sorted(capabilities), byMilestone: sorted(milestones), byGoal: sorted(goals) };
+  }
+  async listWorkQueues(projectId) {
+    await this.project(projectId);
+    return (await this.executor.many("SELECT * FROM work_queues WHERE project_id=$1 ORDER BY created_at,id", [projectId])).map((row) => ({ id: String(row.id), projectId: String(row.project_id), name: String(row.name), description: text(row.description), version: Number(row.version), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) }));
+  }
+  async createWorkQueue(projectId, input) {
+    await this.project(projectId);
+    const id2 = randomUUID();
+    const timestamp = now$2();
+    try {
+      await this.executor.execute("INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)", [id2, projectId, input.name, input.description ?? null, timestamp]);
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : "Could not create work queue");
+    }
+    await this.event(projectId, "work_queue", id2, "work_queue.created", { name: input.name });
+    return (await this.listWorkQueues(projectId)).find((q) => q.id === id2);
+  }
+  async workItemFromRow(row) {
+    const id2 = String(row.id);
+    const labels = await this.executor.many("SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=$1 ORDER BY lower(l.name)", [id2]);
+    const dependencies2 = await this.executor.many("SELECT wi.title,wr.kind FROM work_relations wr JOIN work_items wi ON ((wr.kind='depends_on' AND wi.id=wr.to_work_item_id) OR (wr.kind='blocks' AND wi.id=wr.from_work_item_id)) WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=$1) OR (wr.kind='blocks' AND wr.to_work_item_id=$1)) AND wi.status NOT IN ('resolved','dropped')", [id2]);
+    const external = await this.executor.many("SELECT content FROM external_blockers WHERE work_item_id=$1 AND resolved_at IS NULL", [id2]);
+    const reasons = [...dependencies2.map((x) => `${String(x.kind) === "blocks" ? "Blocked by" : "Depends on"} ${String(x.title)}`), ...external.map((x) => String(x.content))];
+    return { id: id2, projectId: String(row.project_id), phaseId: text(row.phase_id), kind: String(row.kind), title: String(row.title), description: text(row.description), status: String(row.status), priority: text(row.priority), labels: labels.map((label) => ({ id: String(label.id), name: String(label.name), colour: text(label.colour), version: Number(label.version), createdAt: iso(label.created_at), updatedAt: iso(label.updated_at) })), version: Number(row.version), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), stableKey: text(row.stable_key), parentId: text(row.parent_id), queueId: text(row.queue_id), rank: text(row.rank), effectiveBlocked: reasons.length > 0 || String(row.status) === "blocked", blockerReasons: reasons };
+  }
+  async listWorkItems(projectId, queueId) {
+    await this.project(projectId);
+    const rows = queueId ? await this.executor.many("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.project_id=$1 AND wqi.queue_id=$2 ORDER BY wqi.rank,wqi.work_item_id", [projectId, queueId]) : await this.executor.many("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi LEFT JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.project_id=$1 ORDER BY COALESCE(wqi.rank,'￿'),wi.updated_at DESC", [projectId]);
+    return serialMap(rows, (row) => this.workItemFromRow(row));
+  }
+  async listWorkItemsPage(projectId, limit2, cursor, queueId) {
+    return pageOf(await this.listWorkItems(projectId, queueId), limit2, cursor);
+  }
+  async dependencyWouldCycle(fromId, toId) {
+    return Boolean(await this.executor.maybeOne(`WITH RECURSIVE dependencies(dependent,dependency) AS (SELECT from_work_item_id,to_work_item_id FROM work_relations WHERE kind='depends_on' UNION ALL SELECT to_work_item_id,from_work_item_id FROM work_relations WHERE kind='blocks'), reachable(id) AS (SELECT dependency FROM dependencies WHERE dependent=$1 UNION SELECT d.dependency FROM dependencies d JOIN reachable r ON r.id=d.dependent) SELECT 1 FROM reachable WHERE id=$2 LIMIT 1`, [toId, fromId]));
+  }
+  async linkWorkItems(projectId, input) {
+    if (input.fromWorkItemId === input.toWorkItemId) throw new ValidationError("A work item cannot relate to itself");
+    return this.executor.transaction(async () => {
+      await lockProjectGraph(this.executor, projectId);
+      await this.assertProjectEntity("work_items", input.fromWorkItemId, projectId);
+      await this.assertProjectEntity("work_items", input.toWorkItemId, projectId);
+      if (input.kind === "depends_on" && await this.dependencyWouldCycle(input.fromWorkItemId, input.toWorkItemId)) throw new ValidationError("Dependency would create a cycle");
+      if (input.kind === "blocks" && await this.dependencyWouldCycle(input.toWorkItemId, input.fromWorkItemId)) throw new ValidationError("Blocking relationship would create a cycle");
+      const id2 = randomUUID();
+      const timestamp = now$2();
+      try {
+        await this.executor.execute("INSERT INTO work_relations(id,project_id,from_work_item_id,to_work_item_id,kind,created_at) VALUES ($1,$2,$3,$4,$5,$6)", [id2, projectId, input.fromWorkItemId, input.toWorkItemId, input.kind, timestamp]);
+      } catch (error) {
+        throw new ValidationError(error instanceof Error ? error.message : "Could not create work relation");
+      }
+      await this.event(projectId, "work_relation", id2, "work_relation.created", { ...input });
+      return { id: id2, projectId, fromWorkItemId: input.fromWorkItemId, toWorkItemId: input.toWorkItemId, kind: input.kind, createdAt: timestamp };
+    });
+  }
+  async unlinkWorkItems(id2) {
+    const relation = await this.executor.maybeOne("DELETE FROM work_relations WHERE id=$1 RETURNING *", [id2]);
+    if (relation) await this.event(String(relation.project_id), "work_relation", id2, "work_relation.deleted", { kind: relation.kind });
+  }
+  async listWorkRelations(projectId) {
+    return (await this.executor.many("SELECT * FROM work_relations WHERE project_id=$1 ORDER BY created_at,id", [projectId])).map((row) => ({ id: String(row.id), projectId: String(row.project_id), fromWorkItemId: String(row.from_work_item_id), toWorkItemId: String(row.to_work_item_id), kind: String(row.kind), createdAt: iso(row.created_at) }));
+  }
+  async createExternalBlocker(projectId, input) {
+    await this.project(projectId);
+    if (input.workItemId) await this.assertProjectEntity("work_items", input.workItemId, projectId);
+    const id2 = randomUUID();
+    const timestamp = now$2();
+    await this.executor.execute("INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)", [id2, projectId, input.workItemId ?? null, input.content, timestamp]);
+    await this.event(projectId, "external_blocker", id2, "external_blocker.created", { workItemId: input.workItemId ?? null });
+    return { id: id2, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp };
+  }
+  async listExternalBlockers(projectId, includeResolved = false) {
+    const rows = await this.executor.many(`SELECT * FROM external_blockers WHERE project_id=$1 ${includeResolved ? "" : "AND resolved_at IS NULL"} ORDER BY created_at DESC,id`, [projectId]);
+    return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: row.resolved_at == null ? null : iso(row.resolved_at), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) }));
+  }
+  async resolveExternalBlocker(id2) {
+    const timestamp = now$2();
+    const row = await this.executor.maybeOne("UPDATE external_blockers SET resolved_at=$1,updated_at=$1 WHERE id=$2 RETURNING *", [timestamp, id2]);
+    if (!row) throw new NotFoundError("External blocker", id2);
+    await this.event(String(row.project_id), "external_blocker", id2, "external_blocker.resolved");
+    return { id: id2, projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: timestamp, createdAt: iso(row.created_at), updatedAt: timestamp };
+  }
+  async createWorkspace(input) {
+    const id2 = randomUUID();
+    const timestamp = now$2();
+    const root = resolve$1(input.canonicalRoot);
+    const aliases = [...new Set((input.aliases ?? []).map((entry) => resolve$1(entry)))];
+    return this.executor.transaction(async () => {
+      try {
+        await this.executor.execute("INSERT INTO workspaces(id,name,canonical_root,remote,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)", [id2, input.name, root, input.remote ?? null, timestamp]);
+        for (const alias of aliases) await this.executor.execute("INSERT INTO workspace_aliases(workspace_id,alias,created_at) VALUES ($1,$2,$3)", [id2, alias, timestamp]);
+      } catch (error) {
+        throw new ValidationError(error instanceof Error ? error.message : "Could not create workspace");
+      }
+      await this.event(null, "workspace", id2, "workspace.created", { name: input.name, canonicalRoot: root });
+      return { id: id2, name: input.name, canonicalRoot: root, aliases, remote: input.remote ?? null, createdAt: timestamp, updatedAt: timestamp };
+    });
+  }
+  async linkProjectWorkspace(projectId, workspaceId) {
+    await this.project(projectId);
+    if (!await this.executor.maybeOne("SELECT 1 FROM workspaces WHERE id=$1", [workspaceId])) throw new NotFoundError("Workspace", workspaceId);
+    await this.executor.execute("INSERT INTO project_workspaces(project_id,workspace_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [projectId, workspaceId, now$2()]);
+    await this.event(projectId, "workspace", workspaceId, "workspace.linked", { projectId });
+  }
+  async createWorkspaceRevision(input) {
+    if (!await this.executor.maybeOne("SELECT 1 FROM workspaces WHERE id=$1", [input.workspaceId])) throw new NotFoundError("Workspace", input.workspaceId);
+    const id2 = randomUUID();
+    const capturedAt = now$2();
+    await this.executor.execute('INSERT INTO workspace_revisions(id,workspace_id,branch,"commit",dirty,diff_hash,captured_at) VALUES ($1,$2,$3,$4,$5,$6,$7)', [id2, input.workspaceId, input.branch ?? null, input.commit ?? null, input.dirty, input.diffHash ?? null, capturedAt]);
+    const projects = await this.executor.many("SELECT project_id FROM project_workspaces WHERE workspace_id=$1", [input.workspaceId]);
+    if (projects.length) for (const project of projects) await this.event(String(project.project_id), "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
+    else await this.event(null, "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
+    return { id: id2, workspaceId: input.workspaceId, branch: input.branch ?? null, commit: input.commit ?? null, dirty: input.dirty, diffHash: input.diffHash ?? null, capturedAt };
+  }
+  async resolveProject(workspacePath) {
+    const target = resolve$1(workspacePath);
+    const rows = await this.executor.many(`SELECT p.*,w.canonical_root FROM projects p JOIN project_workspaces pw ON pw.project_id=p.id JOIN workspaces w ON w.id=pw.workspace_id WHERE $1=w.canonical_root OR $1 LIKE w.canonical_root || '/%' OR EXISTS (SELECT 1 FROM workspace_aliases wa WHERE wa.workspace_id=w.id AND ($1=wa.alias OR $1 LIKE wa.alias || '/%')) ORDER BY GREATEST(length(w.canonical_root),COALESCE((SELECT MAX(length(wa.alias)) FROM workspace_aliases wa WHERE wa.workspace_id=w.id AND ($1=wa.alias OR $1 LIKE wa.alias || '/%')),0)) DESC`, [target]);
+    if (!rows.length) return [];
+    const longest = Math.max(...rows.map((row) => String(row.canonical_root).length));
+    return rows.filter((row) => String(row.canonical_root).length === longest).map(projectFromRow$1);
+  }
+  async secretRedactor(projectId) {
+    const names2 = projectId ? (await this.executor.many("SELECT name FROM project_secret_names WHERE project_id=$1 ORDER BY name", [projectId])).map((row) => String(row.name)) : [];
+    return new SecretRedactor({ secretNames: names2 });
+  }
+  errorReportFromRow(row) {
+    return { id: String(row.id), kind: String(row.kind), component: String(row.component), summary: String(row.summary), observation: String(row.observation), expectedBehaviour: text(row.expected_behaviour), actualBehaviour: text(row.actual_behaviour), reproductionSteps: json$1(row.reproduction_steps_json, []), impact: text(row.impact), projectId: text(row.project_id), workspacePath: text(row.workspace_path), status: String(row.status), triageNote: text(row.triage_note), source: String(row.source), client: text(row.client), actor: String(row.actor), redaction: json$1(row.redaction_json, { count: 0, fields: [] }), version: Number(row.version), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  }
+  async createErrorReport(input) {
+    if (input.projectId) await this.project(input.projectId);
+    const id2 = randomUUID();
+    const timestamp = now$2();
+    const context = this.context();
+    const redactor = await this.secretRedactor(input.projectId);
+    const component = redactor.redact(input.component);
+    const summary = redactor.redact(input.summary);
+    const observation = redactor.redact(input.observation);
+    const expected = input.expectedBehaviour ? redactor.redact(input.expectedBehaviour) : null;
+    const actual = input.actualBehaviour ? redactor.redact(input.actualBehaviour) : null;
+    const steps = (input.reproductionSteps ?? []).map((step) => redactor.redact(step));
+    const impact = input.impact ? redactor.redact(input.impact) : null;
+    const workspace = input.workspacePath ? redactor.redact(input.workspacePath) : null;
+    const redaction = redactionMetadata$1([{ field: "component", result: component }, { field: "summary", result: summary }, { field: "observation", result: observation }, ...expected ? [{ field: "expectedBehaviour", result: expected }] : [], ...actual ? [{ field: "actualBehaviour", result: actual }] : [], ...steps.map((result2, index) => ({ field: `reproductionSteps.${index}`, result: result2 })), ...impact ? [{ field: "impact", result: impact }] : [], ...workspace ? [{ field: "workspacePath", result: workspace }] : []]);
+    await this.executor.execute(`INSERT INTO error_reports(id,kind,component,summary,observation,expected_behaviour,actual_behaviour,reproduction_steps_json,impact,project_id,workspace_path,status,triage_note,source,client,actor,redaction_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,'open',NULL,$12,$13,$14,$15::jsonb,$16,$16)`, [id2, input.kind, component.value, summary.value, observation.value, expected?.value ?? null, actual?.value ?? null, JSON.stringify(steps.map((x) => x.value)), impact?.value ?? null, input.projectId ?? null, workspace?.value ?? null, context.source, context.client ?? null, context.actor, JSON.stringify(redaction), timestamp]);
+    await this.event(null, "error_report", id2, "error_report.created", { kind: input.kind, component: component.value, redactionCount: redaction.count });
+    return this.errorReportFromRow(await this.executor.one("SELECT * FROM error_reports WHERE id=$1", [id2]));
+  }
+  async listErrorReportsPage(limit2, cursor, statuses, kinds, component) {
+    const clauses = [];
+    const values = [];
+    const add = (sql, value) => {
+      values.push(value);
+      clauses.push(sql.replace("?", `$${values.length}`));
+    };
+    if (statuses?.length) {
+      values.push(statuses);
+      clauses.push(`status=ANY($${values.length}::text[])`);
+    }
+    if (kinds?.length) {
+      values.push(kinds);
+      clauses.push(`kind=ANY($${values.length}::text[])`);
+    }
+    if (component) add("component=?", component);
+    const rows = await this.executor.many(`SELECT * FROM error_reports ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY created_at DESC,id DESC`, values);
+    return pageOf(rows.map((row) => this.errorReportFromRow(row)), limit2, cursor);
+  }
+  async getErrorReport(id2) {
+    const row = await this.executor.maybeOne("SELECT * FROM error_reports WHERE id=$1", [id2]);
+    if (!row) return null;
+    const history = (await this.executor.many("SELECT * FROM activity_events WHERE entity_type='error_report' AND entity_id=$1 ORDER BY created_at,id", [id2])).map((e) => ({ id: String(e.id), projectId: text(e.project_id), entityType: String(e.entity_type), entityId: String(e.entity_id), eventType: String(e.event_type), payload: json$1(e.payload_json, {}), source: String(e.source), client: text(e.client), actor: String(e.actor), idempotencyKey: text(e.idempotency_key), createdAt: iso(e.created_at) }));
+    return { report: this.errorReportFromRow(row), history };
+  }
+  async updateErrorReport(id2, input) {
+    const current = await this.executor.maybeOne("SELECT * FROM error_reports WHERE id=$1", [id2]);
+    if (!current) throw new NotFoundError("Error report", id2);
+    const redactor = await this.secretRedactor(text(current.project_id));
+    const note = input.triageNote === void 0 ? text(current.triage_note) : input.triageNote === null ? null : redactor.redact(input.triageNote).value;
+    const status = input.status ?? String(current.status);
+    const changed = await this.executor.execute("UPDATE error_reports SET status=$1,triage_note=$2,version=version+1,updated_at=$3 WHERE id=$4 AND version=$5", [status, note, now$2(), id2, input.expectedVersion]);
+    if (!changed) throw new ConflictError("Error report", id2);
+    await this.event(null, "error_report", id2, "error_report.status_updated", { status });
+    return this.errorReportFromRow(await this.executor.one("SELECT * FROM error_reports WHERE id=$1", [id2]));
+  }
+  async artifactsForRun(runId) {
+    return (await this.executor.many("SELECT * FROM artifact_references WHERE run_id=$1 ORDER BY created_at,id", [runId])).map((row) => ({ id: String(row.id), runId: text(row.run_id), uri: String(row.uri), mediaType: text(row.media_type), byteCount: row.byte_count == null ? null : Number(row.byte_count), digest: text(row.digest), createdAt: iso(row.created_at) }));
+  }
+  async createRun(projectId, input) {
+    await this.project(projectId);
+    if (input.workspaceRevisionId && !await this.executor.maybeOne(`SELECT 1 FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id WHERE wr.id=$1 AND pw.project_id=$2`, [input.workspaceRevisionId, projectId])) throw new ValidationError("Workspace revision does not belong to the project");
+    const id2 = randomUUID();
+    const createdAt = now$2();
+    const redactor = await this.secretRedactor(projectId);
+    const command = redactor.redact(stripAnsi$1(input.command));
+    const working = input.workingDirectory ? redactor.redact(input.workingDirectory) : null;
+    const stdout = input.stdoutExcerpt ? redactor.redact(stripAnsi$1(input.stdoutExcerpt)) : null;
+    const stderr = input.stderrExcerpt ? redactor.redact(stripAnsi$1(input.stderrExcerpt)) : null;
+    const tools = Object.entries(input.toolchain ?? {}).map(([name, value]) => ({ name, result: redactor.redact(value) }));
+    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
+    const redaction = redactionMetadata$1([{ field: "command", result: command }, ...working ? [{ field: "workingDirectory", result: working }] : [], ...stdout ? [{ field: "stdoutExcerpt", result: stdout }] : [], ...stderr ? [{ field: "stderrExcerpt", result: stderr }] : [], ...tools.map(({ name, result: result2 }) => ({ field: `toolchain.${name}`, result: result2 })), ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))]);
+    const toolchain = Object.fromEntries(tools.map(({ name, result: result2 }) => [name, result2.value]));
+    const startedAt = input.startedAt ?? createdAt;
+    const endedAt = input.endedAt ?? null;
+    const durationMs = endedAt ? Math.max(0, new Date(endedAt).getTime() - new Date(startedAt).getTime()) : null;
+    assertRunInvariants({ startedAt, endedAt, outcome: input.outcome, exitCode: input.exitCode, testSummary: input.testSummary });
+    return this.executor.transaction(async () => {
+      await this.executor.execute(`INSERT INTO runs(id,project_id,workspace_revision_id,command,working_directory,started_at,ended_at,duration_ms,outcome,exit_code,toolchain_json,stdout_excerpt,stderr_excerpt,stdout_truncated,stderr_truncated,validation_status,redaction_json,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,'validated',$16::jsonb,$17)`, [id2, projectId, input.workspaceRevisionId ?? null, command.value, working?.value ?? null, startedAt, endedAt, durationMs, input.outcome, input.exitCode ?? null, JSON.stringify(toolchain), stdout?.value ?? null, stderr?.value ?? null, Boolean(input.stdoutTruncated), Boolean(input.stderrTruncated), JSON.stringify(redaction), createdAt]);
+      let testSummary = null;
+      if (input.testSummary) {
+        const sid = randomUUID();
+        await this.executor.execute("INSERT INTO test_summaries(id,run_id,scope,passed,failed,skipped,target_count,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", [sid, id2, input.testSummary.scope, input.testSummary.passed, input.testSummary.failed, input.testSummary.skipped, input.testSummary.targetCount, createdAt]);
+        testSummary = { id: sid, runId: id2, ...input.testSummary, createdAt };
+      }
+      const artifacts = [];
+      for (const { artifact, result: result2 } of artifactResults) {
+        const aid = randomUUID();
+        await this.executor.execute("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)", [aid, id2, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, createdAt]);
+        artifacts.push({ id: aid, runId: id2, uri: result2.value, mediaType: artifact.mediaType ?? null, byteCount: artifact.byteCount ?? null, digest: artifact.digest ?? null, createdAt });
+      }
+      const run = { id: id2, projectId, workspaceRevisionId: input.workspaceRevisionId ?? null, command: command.value, workingDirectory: working?.value ?? null, startedAt, endedAt, durationMs, outcome: input.outcome, exitCode: input.exitCode ?? null, toolchain, stdoutExcerpt: stdout?.value ?? null, stderrExcerpt: stderr?.value ?? null, stdoutTruncated: Boolean(input.stdoutTruncated), stderrTruncated: Boolean(input.stderrTruncated), artifacts, validationStatus: "validated", redaction, createdAt };
+      await this.replaceSearch("run", id2, projectId, command.value, [stdout?.value, stderr?.value].filter(Boolean).join("\n"));
+      await this.event(projectId, "run", id2, "run.created", { outcome: input.outcome, redactionCount: redaction.count });
+      return { run, testSummary, artifacts };
+    });
+  }
+  async listRuns(projectId) {
+    const rows = await this.executor.many("SELECT * FROM runs WHERE project_id=$1 ORDER BY started_at DESC,id DESC", [projectId]);
+    return serialMap(rows, async (row) => ({ id: String(row.id), projectId: String(row.project_id), workspaceRevisionId: text(row.workspace_revision_id), command: String(row.command), workingDirectory: text(row.working_directory), startedAt: iso(row.started_at), endedAt: row.ended_at == null ? null : iso(row.ended_at), durationMs: row.duration_ms == null ? null : Number(row.duration_ms), outcome: String(row.outcome), exitCode: row.exit_code == null ? null : Number(row.exit_code), toolchain: json$1(row.toolchain_json, {}), stdoutExcerpt: text(row.stdout_excerpt), stderrExcerpt: text(row.stderr_excerpt), stdoutTruncated: bool$1(row.stdout_truncated), stderrTruncated: bool$1(row.stderr_truncated), artifacts: await this.artifactsForRun(String(row.id)), validationStatus: String(row.validation_status), redaction: json$1(row.redaction_json, { count: 0, fields: [] }), createdAt: iso(row.created_at) }));
+  }
+  async listRunsPage(projectId, limit2, cursor) {
+    return pageOf(await this.listRuns(projectId), limit2, cursor);
+  }
+  async evidenceFromRow(row) {
+    const id2 = String(row.id);
+    const stale = await this.evidenceStaleness(row);
+    const reqs = await this.executor.many("SELECT requirement_id FROM evidence_requirement_links WHERE evidence_id=$1 ORDER BY requirement_id", [id2]);
+    const criteria = await this.executor.many("SELECT l.criterion_id,l.criterion_version,c.version FROM evidence_criterion_links l JOIN acceptance_criteria c ON c.id=l.criterion_id WHERE l.evidence_id=$1 ORDER BY l.criterion_id", [id2]);
+    const work = await this.executor.many("SELECT work_item_id FROM evidence_work_links WHERE evidence_id=$1 ORDER BY work_item_id", [id2]);
+    const updates = await this.executor.many("SELECT update_id FROM evidence_update_links WHERE evidence_id=$1 ORDER BY update_id", [id2]);
+    const checkpoints = await this.executor.many("SELECT checkpoint_id FROM evidence_checkpoint_links WHERE evidence_id=$1 ORDER BY checkpoint_id", [id2]);
+    const artifacts = await this.executor.many("SELECT a.* FROM artifact_references a JOIN evidence_artifact_links l ON l.artifact_id=a.id WHERE l.evidence_id=$1 ORDER BY a.created_at,a.id", [id2]);
+    const override = await this.executor.maybeOne("SELECT * FROM evidence_overrides WHERE evidence_id=$1", [id2]);
+    return { id: id2, ordinal: Number(row.ordinal), projectId: String(row.project_id), runId: text(row.run_id), result: String(row.result), summary: String(row.summary), targetVersion: row.target_version == null ? null : Number(row.target_version), stale: stale.stale, staleReason: stale.staleReason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), requirementIds: reqs.map((x) => String(x.requirement_id)), workItemIds: work.map((x) => String(x.work_item_id)), updateIds: updates.map((x) => String(x.update_id)), checkpointIds: checkpoints.map((x) => String(x.checkpoint_id)), artifacts: artifacts.map((a) => ({ id: String(a.id), runId: text(a.run_id), uri: String(a.uri), mediaType: text(a.media_type), byteCount: a.byte_count == null ? null : Number(a.byte_count), digest: text(a.digest), createdAt: iso(a.created_at) })), criterionLinks: criteria.map((x) => ({ criterionId: String(x.criterion_id), criterionVersion: Number(x.criterion_version), stale: Number(x.criterion_version) !== Number(x.version) })), validationStatus: String(row.validation_status), redaction: json$1(row.redaction_json, { count: 0, fields: [] }), override: override ? { reason: String(override.reason), actor: String(override.actor), source: String(override.source), client: text(override.client), createdAt: iso(override.created_at) } : null };
+  }
+  async createEvidence(projectId, input) {
+    await this.project(projectId);
+    const id2 = randomUUID();
+    const timestamp = now$2();
+    const requirementIds = new Set(input.requirementIds ?? []);
+    const criterionRows = [];
+    for (const criterionId of new Set(input.criterionIds ?? [])) {
+      const criterion = await this.executor.maybeOne("SELECT c.*,r.project_id FROM acceptance_criteria c JOIN requirements r ON r.id=c.requirement_id WHERE c.id=$1 AND r.project_id=$2", [criterionId, projectId]);
+      if (!criterion) throw new ValidationError("Criterion does not belong to the project");
+      criterionRows.push(criterion);
+      requirementIds.add(String(criterion.requirement_id));
+    }
+    for (const requirementId of requirementIds) await this.assertProjectEntity("requirements", requirementId, projectId);
+    for (const workItemId of input.workItemIds ?? []) await this.assertProjectEntity("work_items", workItemId, projectId);
+    for (const updateId of input.updateIds ?? []) if (!await this.executor.maybeOne("SELECT 1 FROM updates WHERE id=$1 AND project_id=$2", [updateId, projectId])) throw new ValidationError("Update does not belong to the project");
+    for (const checkpointId of input.checkpointIds ?? []) if (!await this.executor.maybeOne("SELECT 1 FROM updates WHERE id=$1 AND project_id=$2 AND kind='checkpoint'", [checkpointId, projectId])) throw new ValidationError("Checkpoint does not belong to the project");
+    const linkedRun = input.runId ? await this.executor.maybeOne("SELECT * FROM runs WHERE id=$1 AND project_id=$2", [input.runId, projectId]) : null;
+    if (input.runId && !linkedRun) throw new ValidationError("Run does not belong to the project");
+    const context = this.context();
+    if (input.override && context.source === "mcp") throw new ValidationError("Verification overrides are unavailable through MCP");
+    assertEvidenceInvariants({ result: input.result, runId: input.runId }, { linkedRun: linkedRun ? { id: String(linkedRun.id), outcome: String(linkedRun.outcome), invariantsValid: String(linkedRun.validation_status) === "validated" } : null, verifiedOverride: input.override });
+    const redactor = await this.secretRedactor(projectId);
+    const summary = redactor.redact(input.summary);
+    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
+    const redaction = redactionMetadata$1([{ field: "summary", result: summary }, ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))]);
+    return this.executor.transaction(async () => {
+      const inserted = await this.executor.one("INSERT INTO evidence(id,project_id,run_id,result,summary,target_version,validation_status,redaction_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$9) RETURNING *", [id2, projectId, input.runId ?? null, input.result, summary.value, input.targetVersion ?? null, input.override ? "overridden" : "validated", JSON.stringify(redaction), timestamp]);
+      for (const requirementId of requirementIds) await this.executor.execute("INSERT INTO evidence_requirement_links VALUES ($1,$2)", [id2, requirementId]);
+      for (const criterion of criterionRows) await this.executor.execute("INSERT INTO evidence_criterion_links VALUES ($1,$2,$3,$4)", [id2, criterion.id, criterion.version, timestamp]);
+      for (const workId of new Set(input.workItemIds ?? [])) await this.executor.execute("INSERT INTO evidence_work_links VALUES ($1,$2)", [id2, workId]);
+      for (const updateId of new Set(input.updateIds ?? [])) await this.executor.execute("INSERT INTO evidence_update_links VALUES ($1,$2)", [id2, updateId]);
+      for (const checkpointId of new Set(input.checkpointIds ?? [])) await this.executor.execute("INSERT INTO evidence_checkpoint_links VALUES ($1,$2)", [id2, checkpointId]);
+      for (const { artifact, result: result2 } of artifactResults) {
+        const aid = randomUUID();
+        await this.executor.execute("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)", [aid, input.runId ?? null, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, timestamp]);
+        await this.executor.execute("INSERT INTO evidence_artifact_links VALUES ($1,$2)", [id2, aid]);
+      }
+      if (input.override) await this.executor.execute("INSERT INTO evidence_overrides VALUES ($1,$2,$3,$4,$5,$6)", [id2, input.override.reason, context.actor, context.source, context.client ?? null, timestamp]);
+      await this.replaceSearch("evidence", id2, projectId, input.result, summary.value);
+      await this.event(projectId, "evidence", id2, "evidence.created", { result: input.result, criterionIds: criterionRows.map((x) => x.id), overridden: Boolean(input.override), redactionCount: redaction.count });
+      return this.evidenceFromRow(inserted);
+    });
+  }
+  async listEvidence(projectId, includeStale = false) {
+    await this.project(projectId);
+    const values = await serialMap(await this.executor.many("SELECT * FROM evidence WHERE project_id=$1 ORDER BY ordinal DESC", [projectId]), (row) => this.evidenceFromRow(row));
+    return includeStale ? values : values.filter((entry) => !entry.stale);
+  }
+  async listEvidencePage(projectId, limit2, cursor, includeStale = false) {
+    return pageOf(await this.listEvidence(projectId, includeStale), limit2, cursor);
+  }
+  async captureCheckpointSnapshot(projectId, checkpointId) {
+    return this.executor.transaction(async () => {
+      const project = await this.project(projectId);
+      if (!await this.executor.maybeOne("SELECT 1 FROM updates WHERE id=$1 AND project_id=$2 AND kind='checkpoint'", [checkpointId, projectId])) {
+        throw new ValidationError("Checkpoint does not belong to the project");
+      }
+      const existing = await this.getCheckpointSnapshot(checkpointId);
+      if (existing) return existing;
+      const phases = await this.executor.many("SELECT * FROM phases WHERE project_id=$1 ORDER BY position,id", [projectId]);
+      const requirementStates = await this.listRequirementStates(projectId);
+      const requirements = await this.listRequirements(projectId);
+      const workItems = await this.listWorkItems(projectId);
+      const queues = await this.listWorkQueues(projectId);
+      const relations = await this.listWorkRelations(projectId);
+      const blockers = await this.listExternalBlockers(projectId, true);
+      const workspaces = await this.executor.many("SELECT w.*,pw.project_id FROM workspaces w JOIN project_workspaces pw ON pw.workspace_id=w.id WHERE pw.project_id=$1 ORDER BY w.canonical_root,w.id", [projectId]);
+      const workspacesWithAliases = [];
+      for (const workspace of workspaces) {
+        const aliases = await this.executor.many("SELECT alias FROM workspace_aliases WHERE workspace_id=$1 ORDER BY alias", [workspace.id]);
+        workspacesWithAliases.push({ ...workspace, aliases: aliases.map((alias) => String(alias.alias)) });
+      }
+      const workspaceRevisions = await this.executor.many("SELECT wr.* FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id WHERE pw.project_id=$1 ORDER BY wr.captured_at,wr.id", [projectId]);
+      const runs = await this.listRuns(projectId);
+      const testSummaries = await this.executor.many("SELECT ts.* FROM test_summaries ts JOIN runs r ON r.id=ts.run_id WHERE r.project_id=$1 ORDER BY r.started_at,r.id", [projectId]);
+      const evidence = await this.listEvidence(projectId, true);
+      const updates = await this.executor.many("SELECT * FROM updates WHERE project_id=$1 ORDER BY created_at,id", [projectId]);
+      const updateRevisions = await this.executor.many("SELECT ur.* FROM update_revisions ur JOIN updates u ON u.id=ur.update_id WHERE u.project_id=$1 ORDER BY u.created_at,u.id,ur.revision", [projectId]);
+      const labels = await this.executor.many("SELECT DISTINCT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id JOIN work_items wi ON wi.id=wil.work_item_id WHERE wi.project_id=$1 ORDER BY l.name,l.id", [projectId]);
+      const requirementAliases = await this.executor.many("SELECT a.* FROM requirement_key_aliases a JOIN requirements r ON r.id=a.requirement_id WHERE r.project_id=$1 ORDER BY a.requirement_id,a.alias", [projectId]);
+      const requirementPhases = await this.executor.many("SELECT l.* FROM requirement_phase_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=$1 ORDER BY l.requirement_id,l.phase_id", [projectId]);
+      const requirementWork = await this.executor.many("SELECT l.* FROM requirement_work_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=$1 ORDER BY l.requirement_id,l.work_item_id", [projectId]);
+      const workPhases = await this.executor.many("SELECT l.* FROM work_phase_links l JOIN work_items w ON w.id=l.work_item_id WHERE w.project_id=$1 ORDER BY l.work_item_id,l.phase_id", [projectId]);
+      const secretNames = await this.executor.many("SELECT name FROM project_secret_names WHERE project_id=$1 ORDER BY name", [projectId]);
+      const document = canonicaliseJson({
+        project,
+        phases,
+        requirementStates,
+        requirements,
+        workItems,
+        queues,
+        relations,
+        blockers,
+        workspaces: workspacesWithAliases,
+        workspaceRevisions,
+        runs,
+        testSummaries,
+        evidence,
+        updates,
+        updateRevisions,
+        labels,
+        links: { requirementAliases, requirementPhases, requirementWork, workPhases },
+        projectSecretNames: secretNames.map((row) => String(row.name)),
+        evidenceHeads: evidence.map((entry) => ({ id: entry.id, ordinal: entry.ordinal, result: entry.result, stale: entry.stale, updatedAt: entry.updatedAt }))
+      });
+      const encoded = canonicalJson(document);
+      const digest = createHash("sha256").update(encoded).digest("hex");
+      const id2 = randomUUID();
+      const capturedAt = now$2();
+      const inserted = await this.executor.maybeOne("INSERT INTO checkpoint_snapshots(id,checkpoint_id,schema_version,captured_at,document_json,digest) VALUES ($1,$2,3,$3,$4::jsonb,$5) ON CONFLICT (checkpoint_id) DO NOTHING RETURNING *", [id2, checkpointId, capturedAt, encoded, digest]);
+      if (!inserted) return await this.getCheckpointSnapshot(checkpointId);
+      await this.event(projectId, "checkpoint_snapshot", id2, "checkpoint_snapshot.captured", { checkpointId, digest });
+      return { id: id2, checkpointId, schemaVersion: 3, capturedAt, document, digest };
+    });
+  }
+  async getCheckpointSnapshot(checkpointId) {
+    const row = await this.executor.maybeOne("SELECT * FROM checkpoint_snapshots WHERE checkpoint_id=$1", [checkpointId]);
+    return row ? { id: String(row.id), checkpointId: String(row.checkpoint_id), schemaVersion: 3, capturedAt: iso(row.captured_at), document: json$1(row.document_json, {}), digest: String(row.digest) } : null;
+  }
+  async reconstructCheckpointState(checkpointId) {
+    const structured = await this.getCheckpointSnapshot(checkpointId);
+    if (structured) return { ...structured.document, _snapshot: { legacy: false, schemaVersion: structured.schemaVersion, digest: structured.digest } };
+    const row = await this.executor.maybeOne("SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id WHERE u.id=$1 AND u.kind='checkpoint' AND u.deleted_at IS NULL", [checkpointId]);
+    const compact = row ? json$1(row.snapshot_json, null) : null;
+    return compact ? { compactSnapshot: compact, _snapshot: { legacy: true, schemaVersion: 1, digest: createHash("sha256").update(canonicalJson(compact)).digest("hex") } } : null;
+  }
+  async compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) {
+    const left = await this.reconstructCheckpointState(leftCheckpointId);
+    const right = await this.reconstructCheckpointState(rightCheckpointId);
+    if (!left || !right) throw new NotFoundError("Checkpoint snapshot", !left ? leftCheckpointId : rightCheckpointId);
+    const leftMeta = left._snapshot;
+    const rightMeta = right._snapshot;
+    const sections = new Set([...Object.keys(left), ...Object.keys(right)].filter((x) => x !== "_snapshot"));
+    const changedSections = [...sections].filter((section) => JSON.stringify(left[section]) !== JSON.stringify(right[section])).sort();
+    return { leftCheckpointId, rightCheckpointId, same: changedSections.length === 0, changedSections, leftDigest: leftMeta.digest, rightDigest: rightMeta.digest, leftLegacy: leftMeta.legacy, rightLegacy: rightMeta.legacy };
+  }
+  async getProjectPulseSummary(projectId) {
+    const row = await this.executor.maybeOne("SELECT * FROM projects WHERE id=$1", [projectId]);
+    if (!row) return null;
+    const project = projectFromRow$1(row);
+    const phases = await this.executor.many("SELECT id,name,status FROM phases WHERE project_id=$1 AND status='active' AND archived_at IS NULL ORDER BY position,id", [projectId]);
+    const queues = await this.listWorkQueues(projectId);
+    const blockers = await this.listExternalBlockers(projectId);
+    const evidence = await this.listEvidence(projectId, true);
+    const rollup = await this.getRequirementRollup(projectId);
+    const queueHead = queues[0] ? (await this.listWorkItems(projectId, queues[0].id)).filter((item) => !["resolved", "dropped"].includes(item.status)).slice(0, 10) : [];
+    const checkpoint = project.currentCheckpointId ? await this.executor.maybeOne("SELECT u.id,r.content,u.created_at FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id WHERE u.id=$1", [project.currentCheckpointId]) : null;
+    return { project, currentCheckpoint: checkpoint ? { id: String(checkpoint.id), content: String(checkpoint.content), createdAt: iso(checkpoint.created_at) } : null, activePhases: phases.map((phase) => ({ id: String(phase.id), name: String(phase.name), status: "active" })), requirementRollup: rollup, queueHead, blockers, staleEvidenceCount: evidence.filter((entry) => entry.stale).length, failedEvidenceCount: evidence.filter((entry) => entry.result === "failed").length };
+  }
+  async search(query2, limit2 = 50, filters = {}) {
+    const term = query2.trim();
+    if (!term) return [];
+    const bounded = Math.min(Math.max(limit2, 1), 200);
+    const types2 = filters.entityTypes ? new Set(filters.entityTypes) : null;
+    const results = [];
+    const append = async (sql, values) => {
+      const rows = await this.executor.many(sql, values);
+      results.push(...rows.map((row) => ({ type: String(row.entity_type), id: String(row.entity_id), projectId: String(row.project_id), title: String(row.title), excerpt: String(row.body).slice(0, 500), score: Number(row.score) })));
+    };
+    if ((!types2 || types2.has("requirement")) && !filters.requirementId && !filters.evidenceResult) {
+      const values = [term];
+      const clauses = ["si.entity_type='requirement'", "si.search_vector @@ websearch_to_tsquery('simple',istra_unaccent($1))"];
+      if (filters.projectId) {
+        values.push(filters.projectId);
+        clauses.push(`r.project_id=$${values.length}`);
+      }
+      if (filters.state) {
+        values.push(filters.state);
+        clauses.push(`(s.semantic=$${values.length} OR s.name=$${values.length})`);
+      }
+      if (filters.phaseId) {
+        values.push(filters.phaseId);
+        clauses.push(`(r.responsible_phase_id=$${values.length} OR EXISTS (SELECT 1 FROM requirement_phase_links l WHERE l.requirement_id=r.id AND l.phase_id=$${values.length}))`);
+      }
+      if (filters.from) {
+        values.push(filters.from);
+        clauses.push(`r.created_at>=$${values.length}`);
+      }
+      if (filters.to) {
+        values.push(filters.to);
+        clauses.push(`r.created_at<=$${values.length}`);
+      }
+      values.push(bounded);
+      await append(`SELECT si.*,ts_rank(si.search_vector,websearch_to_tsquery('simple',istra_unaccent($1))) score FROM search_index si JOIN requirements r ON r.id=si.entity_id JOIN requirement_states s ON s.id=r.state_id WHERE ${clauses.join(" AND ")} ORDER BY score DESC,r.updated_at DESC LIMIT $${values.length}`, values);
+    }
+    if ((!types2 || types2.has("work_item")) && !filters.evidenceResult) {
+      const values = [term];
+      const clauses = ["si.entity_type='work_item'", "si.search_vector @@ websearch_to_tsquery('simple',istra_unaccent($1))"];
+      if (filters.projectId) {
+        values.push(filters.projectId);
+        clauses.push(`w.project_id=$${values.length}`);
+      }
+      if (filters.state) {
+        values.push(filters.state);
+        clauses.push(`w.status=$${values.length}`);
+      }
+      if (filters.phaseId) {
+        values.push(filters.phaseId);
+        clauses.push(`(w.phase_id=$${values.length} OR EXISTS (SELECT 1 FROM work_phase_links l WHERE l.work_item_id=w.id AND l.phase_id=$${values.length}))`);
+      }
+      if (filters.requirementId) {
+        values.push(filters.requirementId);
+        clauses.push(`EXISTS (SELECT 1 FROM requirement_work_links l WHERE l.work_item_id=w.id AND l.requirement_id=$${values.length})`);
+      }
+      if (filters.from) {
+        values.push(filters.from);
+        clauses.push(`w.created_at>=$${values.length}`);
+      }
+      if (filters.to) {
+        values.push(filters.to);
+        clauses.push(`w.created_at<=$${values.length}`);
+      }
+      values.push(bounded);
+      await append(`SELECT si.*,ts_rank(si.search_vector,websearch_to_tsquery('simple',istra_unaccent($1))) score FROM search_index si JOIN work_items w ON w.id=si.entity_id WHERE ${clauses.join(" AND ")} ORDER BY score DESC,w.updated_at DESC LIMIT $${values.length}`, values);
+    }
+    if ((!types2 || types2.has("run")) && !filters.state && !filters.phaseId && !filters.requirementId && !filters.evidenceResult) {
+      const values = [term];
+      const clauses = ["si.entity_type='run'", "si.search_vector @@ websearch_to_tsquery('simple',istra_unaccent($1))"];
+      if (filters.projectId) {
+        values.push(filters.projectId);
+        clauses.push(`r.project_id=$${values.length}`);
+      }
+      if (filters.from) {
+        values.push(filters.from);
+        clauses.push(`r.created_at>=$${values.length}`);
+      }
+      if (filters.to) {
+        values.push(filters.to);
+        clauses.push(`r.created_at<=$${values.length}`);
+      }
+      values.push(bounded);
+      await append(`SELECT si.*,ts_rank(si.search_vector,websearch_to_tsquery('simple',istra_unaccent($1))) score FROM search_index si JOIN runs r ON r.id=si.entity_id WHERE ${clauses.join(" AND ")} ORDER BY score DESC,r.created_at DESC LIMIT $${values.length}`, values);
+    }
+    if ((!types2 || types2.has("evidence")) && !filters.state && !filters.phaseId && !filters.requirementId) {
+      const values = [term];
+      const clauses = ["si.entity_type='evidence'", "si.search_vector @@ websearch_to_tsquery('simple',istra_unaccent($1))"];
+      if (filters.projectId) {
+        values.push(filters.projectId);
+        clauses.push(`e.project_id=$${values.length}`);
+      }
+      if (filters.evidenceResult) {
+        values.push(filters.evidenceResult);
+        clauses.push(`e.result=$${values.length}`);
+      }
+      if (filters.from) {
+        values.push(filters.from);
+        clauses.push(`e.created_at>=$${values.length}`);
+      }
+      if (filters.to) {
+        values.push(filters.to);
+        clauses.push(`e.created_at<=$${values.length}`);
+      }
+      values.push(bounded);
+      await append(`SELECT si.*,ts_rank(si.search_vector,websearch_to_tsquery('simple',istra_unaccent($1))) score FROM search_index si JOIN evidence e ON e.id=si.entity_id WHERE ${clauses.join(" AND ")} ORDER BY score DESC,e.created_at DESC LIMIT $${values.length}`, values);
+    }
+    return results.slice(0, bounded);
   }
 }
 const migrations = [{
@@ -10689,217 +18700,939 @@ async function openIstraDatabase(options = {}) {
   }
   return { db, paths, backupManager };
 }
-function decodeCursor(cursor) {
-  if (!cursor) return 0;
-  try {
-    const value = Number(Buffer.from(cursor, "base64url").toString("utf8"));
-    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
-  } catch {
-    return 0;
-  }
-}
-function encodeCursor(offset) {
-  return Buffer.from(String(offset), "utf8").toString("base64url");
-}
-function pageOf(items2, limit2, cursor) {
-  const start = decodeCursor(cursor);
-  const boundedLimit = Math.min(Math.max(limit2, 1), 200);
-  const pageItems = items2.slice(start, start + boundedLimit);
-  const nextOffset = start + pageItems.length;
-  const hasMore = nextOffset < items2.length;
-  return { items: pageItems, nextCursor: hasMore ? encodeCursor(nextOffset) : null, hasMore };
-}
-function canonicaliseJson(value) {
-  if (Array.isArray(value)) {
-    return value.map(canonicaliseJson).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonicaliseJson(entry)])
-    );
-  }
-  return value;
-}
-function canonicalJson(value) {
-  return JSON.stringify(canonicaliseJson(value));
-}
-const DEFAULT_REPLACEMENT = "[REDACTED]";
-const DEFAULT_SECRET_NAMES = [
-  "access_token",
-  "api_key",
-  "authorization",
-  "bearer_token",
-  "client_secret",
-  "client_token",
-  "connection_string",
-  "cookie",
-  "database_url",
-  "id_token",
-  "password",
-  "passwd",
-  "private_key",
-  "refresh_token",
-  "secret",
-  "session",
-  "session_id",
-  "session_token",
-  "token"
-];
-const normaliseName = (value) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-const DEFAULT_SECRET_SUFFIXES = DEFAULT_SECRET_NAMES.map(normaliseName).filter((name) => name.length >= 5);
-const SENSITIVE_NAME_SEGMENTS = /* @__PURE__ */ new Set(["authorization", "cookie", "credential", "credentials", "passwd", "password", "secret", "session", "token"]);
-function hasSensitiveNameSegment(value) {
-  const separated = value.replace(/([a-z\d])([A-Z])/g, "$1_$2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return separated.some((segment) => SENSITIVE_NAME_SEGMENTS.has(segment));
-}
-function displayName(value) {
-  try {
-    return decodeURIComponent(value).toLowerCase();
-  } catch {
-    return value.toLowerCase();
-  }
-}
-function findJsonStringEnd(value, start) {
-  if (value[start] !== '"') return null;
-  for (let index = start + 1; index < value.length; index += 1) {
-    if (value[index] === "\\") index += 1;
-    else if (value[index] === '"') return index + 1;
-  }
-  return null;
-}
-function findJsonCompositeEnd(value, start) {
-  const opening = value[start];
-  if (opening !== "{" && opening !== "[") return null;
-  const closings = [opening === "{" ? "}" : "]"];
-  for (let index = start + 1; index < value.length; index += 1) {
-    if (value[index] === '"') {
-      const end = findJsonStringEnd(value, index);
-      if (end === null) return null;
-      index = end - 1;
-      continue;
-    }
-    if (value[index] === "{") closings.push("}");
-    else if (value[index] === "[") closings.push("]");
-    else if (value[index] === closings.at(-1)) {
-      closings.pop();
-      if (closings.length === 0) return index + 1;
-    }
-  }
-  return null;
-}
-function findJsonValueEnd(value, start) {
-  if (value[start] === '"') return findJsonStringEnd(value, start);
-  if (value[start] === "{" || value[start] === "[") return findJsonCompositeEnd(value, start);
-  const primitive = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:e[+-]?\d+)?)/i.exec(value.slice(start));
-  return primitive ? start + primitive[0].length : null;
-}
-function unquote(value) {
-  const quote = value[0];
-  return (quote === '"' || quote === "'") && value.at(-1) === quote ? value.slice(1, -1) : value;
-}
-function replacePreservingQuote(value, replacement) {
-  const quote = value[0];
-  return (quote === '"' || quote === "'") && value.at(-1) === quote ? `${quote}${replacement}${quote}` : replacement;
-}
-class SecretRedactor {
-  replacement;
-  sensitiveNames;
-  sensitiveSuffixes;
-  constructor(options = {}) {
-    this.replacement = options.replacement ?? DEFAULT_REPLACEMENT;
-    if (!this.replacement) throw new Error("Secret redaction replacement must not be empty");
-    const configured = options.secretNames ?? [];
-    const names2 = options.includeDefaultSecretNames === false ? configured : [...DEFAULT_SECRET_NAMES, ...configured];
-    this.sensitiveNames = new Set(names2.map(normaliseName).filter(Boolean));
-    this.sensitiveSuffixes = options.includeDefaultSecretNames === false ? [] : DEFAULT_SECRET_SUFFIXES;
-  }
-  redact(input) {
-    let value = input;
-    let count = 0;
-    const metadata2 = /* @__PURE__ */ new Map();
-    const isSensitive = (name) => {
-      const normalised = normaliseName(name);
-      return this.sensitiveNames.has(normalised) || this.sensitiveSuffixes.some((suffix) => normalised.length > suffix.length && normalised.endsWith(suffix)) || this.sensitiveSuffixes.length > 0 && hasSensitiveNameSegment(name);
-    };
-    const record2 = (kind, name) => {
-      count += 1;
-      const displayed = displayName(name);
-      const key = `${kind}:${normaliseName(displayed)}`;
-      const existing = metadata2.get(key);
-      if (existing) existing.count += 1;
-      else metadata2.set(key, { kind, name: displayed, count: 1 });
-    };
-    const isReplacement = (candidate) => unquote(candidate).trim() === this.replacement;
-    let output = "";
-    let copiedUntil = 0;
-    for (let index = 0; index < value.length; ) {
-      if (value[index] !== '"') {
-        index += 1;
-        continue;
-      }
-      const keyEnd = findJsonStringEnd(value, index);
-      if (keyEnd === null) break;
-      let separator = keyEnd;
-      while (/\s/.test(value[separator] ?? "")) separator += 1;
-      if (value[separator] !== ":") {
-        index = keyEnd;
-        continue;
-      }
-      let key = null;
-      try {
-        const parsed = JSON.parse(value.slice(index, keyEnd));
-        if (typeof parsed === "string") key = parsed;
-      } catch {
-        key = null;
-      }
-      let valueStart = separator + 1;
-      while (/\s/.test(value[valueStart] ?? "")) valueStart += 1;
-      const valueEnd = key && isSensitive(key) ? findJsonValueEnd(value, valueStart) : null;
-      if (key && valueEnd !== null && !isReplacement(value.slice(valueStart, valueEnd))) {
-        output += value.slice(copiedUntil, valueStart) + JSON.stringify(this.replacement);
-        copiedUntil = valueEnd;
-        record2("json-key", key);
-        index = valueEnd;
-      } else {
-        index = keyEnd;
-      }
-    }
-    if (copiedUntil > 0) value = output + value.slice(copiedUntil);
-    value = value.replace(/\b([a-z][a-z\d+.-]*:\/\/)([^/\s?#@]+)@/gi, (match, scheme, userinfo) => {
-      if (userinfo === this.replacement) return match;
-      record2("url-userinfo", "userinfo");
-      return `${scheme}${this.replacement}@`;
-    });
-    value = value.replace(/\b((?:proxy-)?authorization|cookie|set-cookie)(\s*:\s*)([^\r\n"']+)/gi, (match, name, separator, secret) => {
-      if (isReplacement(secret)) return match;
-      record2("header", name);
-      return `${name}${separator}${this.replacement}`;
-    });
-    value = value.replace(/([?&])([a-z0-9_.%~-]+)(=)([^&#\s"'`]*)/gi, (match, prefix, name, equals, secret) => {
-      let decodedName = name;
-      try {
-        decodedName = decodeURIComponent(name.replaceAll("+", " "));
-      } catch {
-      }
-      if (!secret || !isSensitive(decodedName) || isReplacement(secret)) return match;
-      record2("query-parameter", decodedName);
-      return `${prefix}${name}${equals}${this.replacement}`;
-    });
-    value = value.replace(/(^|[\s;(])(--?)([a-z][a-z0-9_.-]*)(?:(\s*=\s*)|(\s+))("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,&|)]+)/gim, (match, boundary, dashes, name, equals, spacing, secret) => {
-      if (!isSensitive(name) || isReplacement(secret)) return match;
-      record2("shell-flag", name);
-      return `${boundary}${dashes}${name}${equals ?? spacing ?? ""}${replacePreservingQuote(secret, this.replacement)}`;
-    });
-    value = value.replace(/(^|[\s;,(])((?:export\s+)?)([a-z_][a-z0-9_.-]*)(\s*=\s*)("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,&|)]+)/gim, (match, boundary, declaration, name, equals, secret) => {
-      if (!isSensitive(name) || isReplacement(secret)) return match;
-      record2("environment", name);
-      return `${boundary}${declaration}${name}${equals}${replacePreservingQuote(secret, this.replacement)}`;
-    });
-    return { value, redacted: count > 0, count, redactions: [...metadata2.values()] };
-  }
-}
 const now$1 = () => (/* @__PURE__ */ new Date()).toISOString();
-const textOrNull$1 = (value) => value == null ? null : String(value);
+const textOrNull$1 = (value) => value === null || value === void 0 ? null : String(value);
+const bool = (value) => Number(value) === 1;
+const json = (value, fallback) => {
+  try {
+    return value === null || value === void 0 ? fallback : JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+};
+const stripAnsi = (value) => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+const redactionMetadata = (entries) => ({
+  count: entries.reduce((total, entry) => total + entry.result.count, 0),
+  fields: [...new Set(entries.flatMap((entry) => entry.result.redactions.map((redaction) => `${entry.field}:${redaction.kind}:${redaction.name}`)))]
+});
+class SqliteOperationalRepository {
+  constructor(db) {
+    this.db = db;
+  }
+  db;
+  savepointSequence = 0;
+  activeContext = null;
+  transaction(work) {
+    if (this.db.isTransaction) {
+      const savepoint = `operational_${this.savepointSequence++}`;
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      try {
+        const result2 = work();
+        this.db.exec(`RELEASE ${savepoint}`);
+        return result2;
+      } catch (error) {
+        this.db.exec(`ROLLBACK TO ${savepoint}`);
+        this.db.exec(`RELEASE ${savepoint}`);
+        throw error;
+      }
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result2 = work();
+      this.db.exec("COMMIT");
+      return result2;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  runIdempotent(client2, key, operation, payload, work) {
+    return this.runMutation({ source: "system", actor: client2, client: client2, idempotencyKey: key, occurredAt: now$1() }, operation, payload, work);
+  }
+  runMutation(context, operation, payload, work) {
+    const requestHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+    return this.transaction(() => {
+      const previousContext = this.activeContext;
+      this.activeContext = context;
+      try {
+        const idempotencyClient = context.client ?? context.actor;
+        if (context.idempotencyKey) {
+          const existing = this.db.prepare("SELECT operation,request_hash,result_json FROM idempotency_records WHERE client=? AND idempotency_key=?").get(idempotencyClient, context.idempotencyKey);
+          if (existing) {
+            if (String(existing.operation) !== operation || String(existing.request_hash) !== requestHash) throw new IdempotencyConflictError(context.idempotencyKey);
+            return json(existing.result_json, void 0);
+          }
+        }
+        const result2 = work();
+        if (result2 instanceof Promise) throw new Error("SQLite mutation callbacks must complete synchronously");
+        if (context.idempotencyKey) this.db.prepare("INSERT INTO idempotency_records(client,idempotency_key,operation,request_hash,result_json,created_at) VALUES (?,?,?,?,?,?)").run(idempotencyClient, context.idempotencyKey, operation, requestHash, JSON.stringify(result2) ?? "null", context.occurredAt);
+        return result2;
+      } finally {
+        this.activeContext = previousContext;
+      }
+    });
+  }
+  mutationContext() {
+    return this.activeContext ?? { source: "system", actor: "internal", client: "internal", idempotencyKey: null, occurredAt: now$1() };
+  }
+  event(projectId, entityType, entityId, eventType, payload = {}) {
+    const context = this.mutationContext();
+    this.db.prepare("INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), context.source, context.client ?? null, context.actor, context.idempotencyKey, context.occurredAt);
+    if (projectId) this.db.prepare("UPDATE projects SET last_activity_at=? WHERE id=?").run(context.occurredAt, projectId);
+  }
+  project(projectId) {
+    const row = this.db.prepare("SELECT * FROM projects WHERE id=?").get(projectId);
+    if (!row) throw new NotFoundError("Project", projectId);
+    return row;
+  }
+  listRequirementStates(projectId) {
+    this.project(projectId);
+    return this.db.prepare("SELECT * FROM requirement_states WHERE project_id=? ORDER BY position,created_at").all(projectId).map((row) => ({
+      id: String(row.id),
+      projectId: String(row.project_id),
+      name: String(row.name),
+      semantic: String(row.semantic),
+      position: Number(row.position),
+      colour: textOrNull$1(row.colour),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    }));
+  }
+  createRequirementState(projectId, input) {
+    this.project(projectId);
+    const id2 = randomUUID();
+    const timestamp = now$1();
+    const position = input.position ?? Number(this.db.prepare("SELECT COALESCE(MAX(position),-1)+1 AS position FROM requirement_states WHERE project_id=?").get(projectId).position);
+    try {
+      this.db.prepare("INSERT INTO requirement_states(id,project_id,name,semantic,position,colour,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id2, projectId, input.name, input.semantic, position, input.colour ?? null, timestamp, timestamp);
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : "Could not create requirement state");
+    }
+    this.event(projectId, "requirement_state", id2, "requirement_state.created", { name: input.name, semantic: input.semantic });
+    return this.listRequirementStates(projectId).find((state) => state.id === id2);
+  }
+  evidenceStaleness(row) {
+    const id2 = String(row.id);
+    const targetVersion = row.target_version === null ? null : Number(row.target_version);
+    const storedStale = bool(row.stale);
+    const storedStaleReason = textOrNull$1(row.stale_reason);
+    let stale = storedStale;
+    let staleReason = storedStaleReason;
+    if (targetVersion !== null) {
+      const versions = [
+        ...this.db.prepare("SELECT version FROM requirements r JOIN evidence_requirement_links l ON l.requirement_id=r.id WHERE l.evidence_id=?").all(id2),
+        ...this.db.prepare("SELECT version FROM work_items w JOIN evidence_work_links l ON l.work_item_id=w.id WHERE l.evidence_id=?").all(id2),
+        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_update_links l ON l.update_id=u.id WHERE l.evidence_id=?").all(id2),
+        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_checkpoint_links l ON l.checkpoint_id=u.id WHERE l.evidence_id=?").all(id2)
+      ].map((entry) => Number(entry.version));
+      const currentVersion = versions.length ? Math.max(...versions) : targetVersion;
+      const derivedStale = currentVersion > targetVersion;
+      stale = storedStale || derivedStale;
+      staleReason = storedStale ? storedStaleReason ?? "Evidence was explicitly marked stale" : derivedStale ? `Linked entity advanced from version ${targetVersion} to ${currentVersion}` : null;
+    }
+    return { stale, staleReason };
+  }
+  criteria(requirementId) {
+    return this.db.prepare("SELECT * FROM acceptance_criteria WHERE requirement_id=? ORDER BY archived_at IS NOT NULL,position,created_at").all(requirementId).map((row) => {
+      const evidence = this.db.prepare(`SELECT e.*,l.criterion_version
+        FROM evidence_criterion_links l JOIN evidence e ON e.id=l.evidence_id WHERE l.criterion_id=? ORDER BY e.ordinal DESC`).all(String(row.id)).map((entry) => {
+        const effective = this.evidenceStaleness(entry);
+        return {
+          id: String(entry.id),
+          ordinal: Number(entry.ordinal),
+          result: String(entry.result),
+          createdAt: String(entry.created_at),
+          stale: effective.stale || Number(entry.criterion_version) !== Number(row.version),
+          validationStatus: String(entry.validation_status)
+        };
+      });
+      const proof = evaluateCriterionProof({ id: String(row.id), title: String(row.title), required: bool(row.required), evidence });
+      const archivedAt = textOrNull$1(row.archived_at);
+      return {
+        id: String(row.id),
+        requirementId: String(row.requirement_id),
+        title: String(row.title),
+        description: textOrNull$1(row.description),
+        position: Number(row.position),
+        required: bool(row.required),
+        version: Number(row.version),
+        archivedAt,
+        proofStatus: proof.status,
+        proofEvidenceId: proof.evidenceId,
+        proofReason: archivedAt ? "Criterion is archived and does not participate in requirement proof" : proof.reason,
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at)
+      };
+    });
+  }
+  requirementFromRow(row) {
+    const id2 = String(row.id);
+    const relatedPhaseIds = this.db.prepare("SELECT phase_id FROM requirement_phase_links WHERE requirement_id=? AND role='related'").all(id2).map((entry) => String(entry.phase_id));
+    const linkedWorkItemIds = this.db.prepare("SELECT work_item_id FROM requirement_work_links WHERE requirement_id=?").all(id2).map((entry) => String(entry.work_item_id));
+    const linkedEvidenceIds = this.db.prepare("SELECT evidence_id FROM evidence_requirement_links WHERE requirement_id=?").all(id2).map((entry) => String(entry.evidence_id));
+    const criteria = this.criteria(id2);
+    const proofExplanation = explainRequirementProof(criteria.map((criterion) => ({
+      id: criterion.id,
+      title: criterion.title,
+      required: criterion.required,
+      archivedAt: criterion.archivedAt,
+      evidence: [],
+      status: criterion.proofStatus,
+      evidenceId: criterion.proofEvidenceId,
+      reason: criterion.proofReason
+    })));
+    const gate = proofExplanation.requiredCriteria === 0 ? "not_configured" : proofExplanation.status === "proven" ? "satisfied" : "unsatisfied";
+    return {
+      id: id2,
+      projectId: String(row.project_id),
+      stableKey: String(row.stable_key),
+      kind: String(row.kind),
+      parentId: textOrNull$1(row.parent_id),
+      title: String(row.title),
+      description: textOrNull$1(row.description),
+      stateId: String(row.state_id),
+      responsiblePhaseId: textOrNull$1(row.responsible_phase_id),
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      criteria,
+      relatedPhaseIds,
+      linkedWorkItemIds,
+      linkedEvidenceIds,
+      gate,
+      proofStatus: proofExplanation.status,
+      proofExplanation
+    };
+  }
+  listRequirements(projectId) {
+    this.project(projectId);
+    return this.db.prepare("SELECT r.*,s.semantic FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.project_id=? ORDER BY r.stable_key").all(projectId).map((row) => this.requirementFromRow(row));
+  }
+  listRequirementsPage(projectId, limit2, cursor) {
+    return pageOf(this.listRequirements(projectId), limit2, cursor);
+  }
+  getRequirement(id2) {
+    const row = this.db.prepare("SELECT r.*,s.semantic FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.id=?").get(id2);
+    return row ? this.requirementFromRow(row) : null;
+  }
+  assertProjectEntity(table, id2, projectId) {
+    const row = this.db.prepare(`SELECT * FROM ${table} WHERE id=? AND project_id=?`).get(id2, projectId);
+    if (!row) throw new ValidationError(`${table} must belong to the project`);
+    return row;
+  }
+  assertRequirementParent(parentId, projectId, childId) {
+    this.assertProjectEntity("requirements", parentId, projectId);
+    if (parentId === childId) throw new ValidationError("A requirement cannot be its own parent");
+    if (!childId) return;
+    const cycle = this.db.prepare(`WITH RECURSIVE ancestors(id) AS (
+      SELECT parent_id FROM requirements WHERE id=? AND parent_id IS NOT NULL
+      UNION
+      SELECT r.parent_id FROM requirements r JOIN ancestors a ON r.id=a.id WHERE r.parent_id IS NOT NULL
+    ) SELECT 1 FROM ancestors WHERE id=? LIMIT 1`).get(parentId, childId);
+    if (cycle) throw new ValidationError("Requirement parent relationship would create a cycle");
+  }
+  createRequirement(projectId, input) {
+    this.project(projectId);
+    const state = input.stateId ? this.db.prepare("SELECT id FROM requirement_states WHERE id=? AND project_id=?").get(input.stateId, projectId) : this.db.prepare("SELECT id FROM requirement_states WHERE project_id=? AND semantic='open' ORDER BY position LIMIT 1").get(projectId);
+    if (!state) throw new ValidationError("Requirement state does not belong to the project");
+    if (input.parentId) this.assertRequirementParent(input.parentId, projectId);
+    if (input.responsiblePhaseId) this.assertProjectEntity("phases", input.responsiblePhaseId, projectId);
+    if (input.criteria?.some((criterion) => criterion.id)) throw new ValidationError("New requirements cannot reuse existing criterion ids");
+    return this.transaction(() => {
+      const id2 = randomUUID();
+      const timestamp = now$1();
+      try {
+        this.db.prepare("INSERT INTO requirements(id,project_id,stable_key,kind,parent_id,title,description,state_id,responsible_phase_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id2, projectId, input.stableKey, input.kind, input.parentId ?? null, input.title, input.description ?? null, String(state.id), input.responsiblePhaseId ?? null, timestamp, timestamp);
+      } catch (error) {
+        throw new ValidationError(error instanceof Error ? error.message : "Could not create requirement");
+      }
+      for (const [position, criterion] of (input.criteria ?? []).entries()) this.db.prepare("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(randomUUID(), id2, criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, timestamp, timestamp);
+      for (const phaseId of new Set(input.relatedPhaseIds ?? [])) {
+        this.assertProjectEntity("phases", phaseId, projectId);
+        this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, phaseId, phaseId === input.responsiblePhaseId ? "responsible" : "related", timestamp);
+      }
+      this.event(projectId, "requirement", id2, "requirement.created", { stableKey: input.stableKey, criterionCount: input.criteria?.length ?? 0 });
+      return this.getRequirement(id2);
+    });
+  }
+  updateRequirement(id2, input) {
+    const current = this.getRequirement(id2);
+    if (!current) throw new NotFoundError("Requirement", id2);
+    const parentId = input.parentId === void 0 ? current.parentId : input.parentId;
+    if (parentId) this.assertRequirementParent(parentId, current.projectId, id2);
+    const stateId = input.stateId ?? current.stateId;
+    if (!this.db.prepare("SELECT id FROM requirement_states WHERE id=? AND project_id=?").get(stateId, current.projectId)) throw new ValidationError("Requirement state does not belong to the project");
+    const responsiblePhaseId = input.responsiblePhaseId === void 0 ? current.responsiblePhaseId : input.responsiblePhaseId;
+    if (responsiblePhaseId) this.assertProjectEntity("phases", responsiblePhaseId, current.projectId);
+    const relatedPhaseIds = input.relatedPhaseIds ?? current.relatedPhaseIds;
+    for (const phaseId of new Set(relatedPhaseIds)) this.assertProjectEntity("phases", phaseId, current.projectId);
+    return this.transaction(() => {
+      const next = { ...current, ...input };
+      const result2 = this.db.prepare("UPDATE requirements SET stable_key=?,kind=?,parent_id=?,title=?,description=?,state_id=?,responsible_phase_id=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(next.stableKey, next.kind, parentId ?? null, next.title, next.description ?? null, stateId, responsiblePhaseId ?? null, now$1(), id2, input.expectedVersion);
+      if (!Number(result2.changes)) throw new ConflictError("Requirement", id2);
+      if (input.relatedPhaseIds !== void 0 || input.responsiblePhaseId !== void 0) {
+        this.db.prepare("DELETE FROM requirement_phase_links WHERE requirement_id=?").run(id2);
+        if (responsiblePhaseId) this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, responsiblePhaseId, "responsible", now$1());
+        for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== responsiblePhaseId) this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, phaseId, "related", now$1());
+      }
+      if (input.criteria !== void 0) {
+        const existing = this.db.prepare("SELECT * FROM acceptance_criteria WHERE requirement_id=?").all(id2);
+        const byId = new Map(existing.map((criterion) => [String(criterion.id), criterion]));
+        const retained = /* @__PURE__ */ new Set();
+        for (const [position, criterion] of input.criteria.entries()) {
+          if (!criterion.id) {
+            const criterionId = randomUUID();
+            const timestamp = now$1();
+            this.db.prepare("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(criterionId, id2, criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, timestamp, timestamp);
+            this.event(current.projectId, "acceptance_criterion", criterionId, "acceptance_criterion.created", { requirementId: id2 });
+            continue;
+          }
+          const stored = byId.get(criterion.id);
+          if (!stored) throw new ValidationError("Criterion must belong to the requirement being updated");
+          const changed = String(stored.title) !== criterion.title || textOrNull$1(stored.description) !== (criterion.description ?? null) || bool(stored.required) !== criterion.required || Number(stored.position) !== position || stored.archived_at !== null;
+          const result22 = this.db.prepare(`UPDATE acceptance_criteria SET title=?,description=?,position=?,required=?,archived_at=NULL,version=version+?,updated_at=? WHERE id=? AND requirement_id=? AND version=?`).run(criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, changed ? 1 : 0, now$1(), criterion.id, id2, criterion.expectedVersion);
+          if (!Number(result22.changes)) throw new ConflictError("Acceptance criterion", criterion.id);
+          retained.add(criterion.id);
+          if (changed) this.event(current.projectId, "acceptance_criterion", criterion.id, "acceptance_criterion.updated", { requirementId: id2 });
+        }
+        for (const stored of existing.filter((criterion) => criterion.archived_at === null && !retained.has(String(criterion.id)))) {
+          this.db.prepare("UPDATE acceptance_criteria SET archived_at=?,version=version+1,updated_at=? WHERE id=?").run(now$1(), now$1(), String(stored.id));
+          this.event(current.projectId, "acceptance_criterion", String(stored.id), "acceptance_criterion.archived", { requirementId: id2 });
+        }
+      }
+      this.event(current.projectId, "requirement", id2, "requirement.updated", { stableKey: next.stableKey });
+      return this.getRequirement(id2);
+    });
+  }
+  linkRequirementWork(projectId, requirementId, workItemId) {
+    this.assertProjectEntity("requirements", requirementId, projectId);
+    this.assertProjectEntity("work_items", workItemId, projectId);
+    this.db.prepare("INSERT OR IGNORE INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)").run(requirementId, workItemId, now$1());
+    this.event(projectId, "requirement", requirementId, "requirement.work_linked", { workItemId });
+  }
+  unlinkRequirementWork(requirementId, workItemId) {
+    const requirement = this.db.prepare("SELECT project_id FROM requirements WHERE id=?").get(requirementId);
+    this.db.prepare("DELETE FROM requirement_work_links WHERE requirement_id=? AND work_item_id=?").run(requirementId, workItemId);
+    if (requirement) this.event(String(requirement.project_id), "requirement", requirementId, "requirement.work_unlinked", { workItemId });
+  }
+  getRequirementRollup(projectId) {
+    const bySemantic = { open: 0, partial: 0, proven: 0, defect: 0 };
+    const rows = this.db.prepare("SELECT s.semantic,COUNT(*) AS count FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.project_id=? GROUP BY s.semantic").all(projectId);
+    for (const row of rows) bySemantic[String(row.semantic)] = Number(row.count);
+    const requirements = this.listRequirements(projectId);
+    const byProofStatus = { open: 0, partial: 0, proven: 0, defect: 0 };
+    for (const requirement of requirements) byProofStatus[requirement.proofStatus] += 1;
+    const states = new Map(this.listRequirementStates(projectId).map((state) => [state.id, state.semantic]));
+    const emptyCounts = () => ({ open: 0, partial: 0, proven: 0, defect: 0 });
+    const byCapability = /* @__PURE__ */ new Map();
+    const byGoal = /* @__PURE__ */ new Map();
+    const byMilestone = /* @__PURE__ */ new Map();
+    const addTo = (target, key, name, requirement, stableKey) => {
+      const existing = target.get(key) ?? { id: key, name, ...stableKey ? { stableKey } : {}, counts: emptyCounts(), total: 0 };
+      const semantic = states.get(requirement.stateId) ?? "open";
+      existing.counts[semantic] += 1;
+      existing.total += 1;
+      target.set(key, existing);
+    };
+    const requirementsById = new Map(requirements.map((requirement) => [requirement.id, requirement]));
+    for (const requirement of requirements) {
+      const ancestors = /* @__PURE__ */ new Set();
+      let parentId = requirement.parentId;
+      while (parentId && !ancestors.has(parentId)) {
+        ancestors.add(parentId);
+        const parent = requirementsById.get(parentId);
+        if (!parent) break;
+        if (parent.kind === "capability") addTo(byCapability, parent.id, parent.title, requirement, parent.stableKey);
+        if (parent.kind === "goal") addTo(byGoal, parent.id, parent.title, requirement, parent.stableKey);
+        parentId = parent.parentId;
+      }
+      if (requirement.kind === "capability") addTo(byCapability, requirement.id, requirement.title, requirement, requirement.stableKey);
+      if (requirement.kind === "goal") addTo(byGoal, requirement.id, requirement.title, requirement, requirement.stableKey);
+      const phaseIds = /* @__PURE__ */ new Set([...requirement.responsiblePhaseId ? [requirement.responsiblePhaseId] : [], ...requirement.relatedPhaseIds]);
+      for (const phaseId of phaseIds) {
+        const phase = this.db.prepare("SELECT id,name FROM phases WHERE id=? AND project_id=?").get(phaseId, projectId);
+        if (phase) addTo(byMilestone, String(phase.id), String(phase.name), requirement);
+      }
+    }
+    return {
+      total: requirements.length,
+      bySemantic,
+      byProofStatus,
+      gateFailures: requirements.filter((requirement) => requirement.gate === "unsatisfied").length,
+      defects: byProofStatus.defect,
+      byCapability: [...byCapability.values()].sort((left, right) => left.name.localeCompare(right.name)),
+      byMilestone: [...byMilestone.values()].sort((left, right) => left.name.localeCompare(right.name)),
+      byGoal: [...byGoal.values()].sort((left, right) => left.name.localeCompare(right.name))
+    };
+  }
+  listWorkQueues(projectId) {
+    this.project(projectId);
+    return this.db.prepare("SELECT * FROM work_queues WHERE project_id=? ORDER BY created_at").all(projectId).map((row) => ({ id: String(row.id), projectId: String(row.project_id), name: String(row.name), description: textOrNull$1(row.description), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }));
+  }
+  createWorkQueue(projectId, input) {
+    this.project(projectId);
+    const id2 = randomUUID();
+    const timestamp = now$1();
+    try {
+      this.db.prepare("INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, input.name, input.description ?? null, timestamp, timestamp);
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : "Could not create work queue");
+    }
+    this.event(projectId, "work_queue", id2, "work_queue.created", { name: input.name });
+    return this.listWorkQueues(projectId).find((queue) => queue.id === id2);
+  }
+  workItemFromRow(row) {
+    const id2 = String(row.id);
+    const labels = this.db.prepare("SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=? ORDER BY l.name COLLATE NOCASE").all(id2).map((label) => ({ id: String(label.id), name: String(label.name), colour: textOrNull$1(label.colour), version: Number(label.version), createdAt: String(label.created_at), updatedAt: String(label.updated_at) }));
+    const reasons = [];
+    const dependencyRows = this.db.prepare("SELECT wi.title,wr.kind FROM work_relations wr JOIN work_items wi ON ((wr.kind='depends_on' AND wi.id=wr.to_work_item_id) OR (wr.kind='blocks' AND wi.id=wr.from_work_item_id)) WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=?) OR (wr.kind='blocks' AND wr.to_work_item_id=?)) AND wi.status NOT IN ('resolved','dropped')").all(id2, id2);
+    if (dependencyRows.length) reasons.push(...dependencyRows.map((entry) => `${String(entry.kind) === "blocks" ? "Blocked by" : "Depends on"} ${String(entry.title)}`));
+    const external = this.db.prepare("SELECT content FROM external_blockers WHERE work_item_id=? AND resolved_at IS NULL").all(id2);
+    if (external.length) reasons.push(...external.map((entry) => String(entry.content)));
+    return {
+      id: id2,
+      projectId: String(row.project_id),
+      phaseId: textOrNull$1(row.phase_id),
+      kind: String(row.kind),
+      title: String(row.title),
+      description: textOrNull$1(row.description),
+      status: String(row.status),
+      priority: textOrNull$1(row.priority),
+      labels,
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      stableKey: textOrNull$1(row.stable_key),
+      parentId: textOrNull$1(row.parent_id),
+      queueId: textOrNull$1(row.queue_id),
+      rank: textOrNull$1(row.rank),
+      effectiveBlocked: reasons.length > 0 || String(row.status) === "blocked",
+      blockerReasons: reasons
+    };
+  }
+  listWorkItems(projectId, queueId) {
+    this.project(projectId);
+    const rows = queueId ? this.db.prepare("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.project_id=? AND wqi.queue_id=? ORDER BY wqi.rank,wqi.work_item_id").all(projectId, queueId) : this.db.prepare("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi LEFT JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.project_id=? ORDER BY COALESCE(wqi.rank,'￿'),wi.updated_at DESC").all(projectId);
+    return rows.map((row) => this.workItemFromRow(row));
+  }
+  listWorkItemsPage(projectId, limit2, cursor, queueId) {
+    return pageOf(this.listWorkItems(projectId, queueId), limit2, cursor);
+  }
+  assertWorkPair(projectId, fromId, toId) {
+    if (fromId === toId) throw new ValidationError("A work item cannot relate to itself");
+    this.assertProjectEntity("work_items", fromId, projectId);
+    this.assertProjectEntity("work_items", toId, projectId);
+  }
+  dependencyWouldCycle(fromId, toId) {
+    const result2 = this.db.prepare(`WITH RECURSIVE dependencies(dependent,dependency) AS (
+      SELECT from_work_item_id,to_work_item_id FROM work_relations WHERE kind='depends_on'
+      UNION ALL
+      SELECT to_work_item_id,from_work_item_id FROM work_relations WHERE kind='blocks'
+    ), reachable(id) AS (
+      SELECT dependency FROM dependencies WHERE dependent=?
+      UNION
+      SELECT d.dependency FROM dependencies d JOIN reachable r ON r.id=d.dependent
+    ) SELECT 1 FROM reachable WHERE id=? LIMIT 1`).get(toId, fromId);
+    return Boolean(result2);
+  }
+  linkWorkItems(projectId, input) {
+    this.assertWorkPair(projectId, input.fromWorkItemId, input.toWorkItemId);
+    if (input.kind === "depends_on" && this.dependencyWouldCycle(input.fromWorkItemId, input.toWorkItemId)) throw new ValidationError("Dependency would create a cycle");
+    if (input.kind === "blocks" && this.dependencyWouldCycle(input.toWorkItemId, input.fromWorkItemId)) throw new ValidationError("Blocking relationship would create a cycle");
+    const id2 = randomUUID();
+    const timestamp = now$1();
+    try {
+      this.db.prepare("INSERT INTO work_relations(id,project_id,from_work_item_id,to_work_item_id,kind,created_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, input.fromWorkItemId, input.toWorkItemId, input.kind, timestamp);
+    } catch (error) {
+      throw new ValidationError(error instanceof Error ? error.message : "Could not create work relation");
+    }
+    this.event(projectId, "work_relation", id2, "work_relation.created", { ...input });
+    return { id: id2, projectId, fromWorkItemId: input.fromWorkItemId, toWorkItemId: input.toWorkItemId, kind: input.kind, createdAt: timestamp };
+  }
+  unlinkWorkItems(id2) {
+    const relation = this.db.prepare("SELECT * FROM work_relations WHERE id=?").get(id2);
+    this.db.prepare("DELETE FROM work_relations WHERE id=?").run(id2);
+    if (relation) this.event(String(relation.project_id), "work_relation", id2, "work_relation.deleted", { kind: relation.kind });
+  }
+  listWorkRelations(projectId) {
+    return this.db.prepare("SELECT * FROM work_relations WHERE project_id=? ORDER BY created_at,id").all(projectId).map((row) => ({ id: String(row.id), projectId: String(row.project_id), fromWorkItemId: String(row.from_work_item_id), toWorkItemId: String(row.to_work_item_id), kind: String(row.kind), createdAt: String(row.created_at) }));
+  }
+  createExternalBlocker(projectId, input) {
+    this.project(projectId);
+    if (input.workItemId) this.assertProjectEntity("work_items", input.workItemId, projectId);
+    const id2 = randomUUID();
+    const timestamp = now$1();
+    this.db.prepare("INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, input.workItemId ?? null, input.content, timestamp, timestamp);
+    this.event(projectId, "external_blocker", id2, "external_blocker.created", { workItemId: input.workItemId ?? null });
+    return { id: id2, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp };
+  }
+  listExternalBlockers(projectId, includeResolved = false) {
+    const rows = (includeResolved ? this.db.prepare("SELECT * FROM external_blockers WHERE project_id=? ORDER BY created_at DESC") : this.db.prepare("SELECT * FROM external_blockers WHERE project_id=? AND resolved_at IS NULL ORDER BY created_at DESC")).all(projectId);
+    return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workItemId: textOrNull$1(row.work_item_id), content: String(row.content), resolvedAt: textOrNull$1(row.resolved_at), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }));
+  }
+  resolveExternalBlocker(id2) {
+    const current = this.db.prepare("SELECT * FROM external_blockers WHERE id=?").get(id2);
+    if (!current) throw new NotFoundError("External blocker", id2);
+    const timestamp = now$1();
+    this.db.prepare("UPDATE external_blockers SET resolved_at=?,updated_at=? WHERE id=?").run(timestamp, timestamp, id2);
+    this.event(String(current.project_id), "external_blocker", id2, "external_blocker.resolved");
+    return { id: id2, projectId: String(current.project_id), workItemId: textOrNull$1(current.work_item_id), content: String(current.content), resolvedAt: timestamp, createdAt: String(current.created_at), updatedAt: timestamp };
+  }
+  createWorkspace(input) {
+    const id2 = randomUUID();
+    const timestamp = now$1();
+    const root = resolve$1(input.canonicalRoot);
+    const aliases = [...new Set((input.aliases ?? []).map((entry) => resolve$1(entry)))];
+    return this.transaction(() => {
+      try {
+        this.db.prepare("INSERT INTO workspaces(id,name,canonical_root,remote,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, input.name, root, input.remote ?? null, timestamp, timestamp);
+      } catch (error) {
+        throw new ValidationError(error instanceof Error ? error.message : "Could not create workspace");
+      }
+      for (const alias of aliases) this.db.prepare("INSERT INTO workspace_aliases(workspace_id,alias,created_at) VALUES (?,?,?)").run(id2, alias, timestamp);
+      this.event(null, "workspace", id2, "workspace.created", { name: input.name, canonicalRoot: root });
+      return { id: id2, name: input.name, canonicalRoot: root, aliases, remote: input.remote ?? null, createdAt: timestamp, updatedAt: timestamp };
+    });
+  }
+  linkProjectWorkspace(projectId, workspaceId) {
+    this.project(projectId);
+    if (!this.db.prepare("SELECT id FROM workspaces WHERE id=?").get(workspaceId)) throw new NotFoundError("Workspace", workspaceId);
+    this.db.prepare("INSERT OR IGNORE INTO project_workspaces(project_id,workspace_id,created_at) VALUES (?,?,?)").run(projectId, workspaceId, now$1());
+    this.event(projectId, "workspace", workspaceId, "workspace.linked", { projectId });
+  }
+  createWorkspaceRevision(input) {
+    if (!this.db.prepare("SELECT id FROM workspaces WHERE id=?").get(input.workspaceId)) throw new NotFoundError("Workspace", input.workspaceId);
+    const id2 = randomUUID();
+    const capturedAt = now$1();
+    this.db.prepare('INSERT INTO workspace_revisions(id,workspace_id,branch,"commit",dirty,diff_hash,captured_at) VALUES (?,?,?,?,?,?,?)').run(id2, input.workspaceId, input.branch ?? null, input.commit ?? null, input.dirty ? 1 : 0, input.diffHash ?? null, capturedAt);
+    const projects = this.db.prepare("SELECT project_id FROM project_workspaces WHERE workspace_id=?").all(input.workspaceId);
+    if (projects.length) for (const project of projects) this.event(String(project.project_id), "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
+    else this.event(null, "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
+    return { id: id2, workspaceId: input.workspaceId, branch: input.branch ?? null, commit: input.commit ?? null, dirty: input.dirty, diffHash: input.diffHash ?? null, capturedAt };
+  }
+  resolveProject(workspacePath) {
+    const target = resolve$1(workspacePath);
+    const rows = this.db.prepare(`SELECT p.* FROM projects p JOIN project_workspaces pw ON pw.project_id=p.id JOIN workspaces w ON w.id=pw.workspace_id WHERE w.canonical_root=? OR EXISTS (SELECT 1 FROM workspace_aliases wa WHERE wa.workspace_id=w.id AND wa.alias=?)`).all(target, target);
+    const enclosing = this.db.prepare(`SELECT p.*,w.canonical_root FROM projects p JOIN project_workspaces pw ON pw.project_id=p.id JOIN workspaces w ON w.id=pw.workspace_id WHERE ?=w.canonical_root OR ? LIKE w.canonical_root || '/%' ORDER BY length(w.canonical_root) DESC`).all(target, target);
+    const selected = enclosing.length ? enclosing.filter((row, index, all) => index === 0 || String(row.canonical_root).length === String(all[0]?.canonical_root).length) : rows;
+    return selected.map((row) => ({ id: String(row.id), title: String(row.title), description: textOrNull$1(row.description), intent: textOrNull$1(row.intent), deadline: textOrNull$1(row.deadline), completionCriteria: textOrNull$1(row.completion_criteria), state: String(row.state), currentFocus: textOrNull$1(row.current_focus), nextAction: textOrNull$1(row.next_action), blockers: json(row.blockers_json, []), currentCheckpointId: textOrNull$1(row.current_checkpoint_id), archivedAt: textOrNull$1(row.archived_at), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at), lastActivityAt: String(row.last_activity_at) }));
+  }
+  secretRedactor(projectId) {
+    const secretNames = projectId ? this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name)) : [];
+    return new SecretRedactor({ secretNames });
+  }
+  errorReportFromRow(row) {
+    return {
+      id: String(row.id),
+      kind: String(row.kind),
+      component: String(row.component),
+      summary: String(row.summary),
+      observation: String(row.observation),
+      expectedBehaviour: textOrNull$1(row.expected_behaviour),
+      actualBehaviour: textOrNull$1(row.actual_behaviour),
+      reproductionSteps: json(row.reproduction_steps_json, []),
+      impact: textOrNull$1(row.impact),
+      projectId: textOrNull$1(row.project_id),
+      workspacePath: textOrNull$1(row.workspace_path),
+      status: String(row.status),
+      triageNote: textOrNull$1(row.triage_note),
+      source: String(row.source),
+      client: textOrNull$1(row.client),
+      actor: String(row.actor),
+      redaction: json(row.redaction_json, { count: 0, fields: [] }),
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    };
+  }
+  createErrorReport(input) {
+    if (input.projectId) this.project(input.projectId);
+    const id2 = randomUUID();
+    const timestamp = now$1();
+    const context = this.mutationContext();
+    const redactor = this.secretRedactor(input.projectId);
+    const component = redactor.redact(input.component);
+    const summary = redactor.redact(input.summary);
+    const observation = redactor.redact(input.observation);
+    const expectedBehaviour = input.expectedBehaviour ? redactor.redact(input.expectedBehaviour) : null;
+    const actualBehaviour = input.actualBehaviour ? redactor.redact(input.actualBehaviour) : null;
+    const reproductionSteps = (input.reproductionSteps ?? []).map((step) => redactor.redact(step));
+    const impact = input.impact ? redactor.redact(input.impact) : null;
+    const workspacePath = input.workspacePath ? redactor.redact(input.workspacePath) : null;
+    const redaction = redactionMetadata([
+      { field: "component", result: component },
+      { field: "summary", result: summary },
+      { field: "observation", result: observation },
+      ...expectedBehaviour ? [{ field: "expectedBehaviour", result: expectedBehaviour }] : [],
+      ...actualBehaviour ? [{ field: "actualBehaviour", result: actualBehaviour }] : [],
+      ...reproductionSteps.map((result2, index) => ({ field: `reproductionSteps.${index}`, result: result2 })),
+      ...impact ? [{ field: "impact", result: impact }] : [],
+      ...workspacePath ? [{ field: "workspacePath", result: workspacePath }] : []
+    ]);
+    return this.transaction(() => {
+      this.db.prepare("INSERT INTO error_reports(id,kind,component,summary,observation,expected_behaviour,actual_behaviour,reproduction_steps_json,impact,project_id,workspace_path,status,triage_note,source,client,actor,redaction_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, input.kind, component.value, summary.value, observation.value, expectedBehaviour?.value ?? null, actualBehaviour?.value ?? null, JSON.stringify(reproductionSteps.map((result2) => result2.value)), impact?.value ?? null, input.projectId ?? null, workspacePath?.value ?? null, "open", null, context.source, context.client ?? null, context.actor, JSON.stringify(redaction), timestamp, timestamp);
+      this.event(null, "error_report", id2, "error_report.created", { kind: input.kind, component: component.value, redactionCount: redaction.count });
+      return this.errorReportFromRow(this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2));
+    });
+  }
+  listErrorReportsPage(limit2, cursor, statuses, kinds, component) {
+    const selectedStatuses = statuses ?? ["open", "acknowledged"];
+    const clauses = [];
+    const parameters = [];
+    clauses.push(`status IN (${selectedStatuses.map(() => "?").join(",")})`);
+    parameters.push(...selectedStatuses);
+    if (kinds?.length) {
+      clauses.push(`kind IN (${kinds.map(() => "?").join(",")})`);
+      parameters.push(...kinds);
+    }
+    if (component) {
+      clauses.push("component=?");
+      parameters.push(component);
+    }
+    const rows = this.db.prepare(`SELECT * FROM error_reports WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC,id DESC`).all(...parameters);
+    return pageOf(rows.map((row) => this.errorReportFromRow(row)), limit2, cursor);
+  }
+  getErrorReport(id2) {
+    const row = this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2);
+    if (!row) return null;
+    const history = this.db.prepare("SELECT * FROM activity_events WHERE entity_type='error_report' AND entity_id=? ORDER BY created_at DESC,id DESC").all(id2).map((event) => ({
+      id: String(event.id),
+      projectId: textOrNull$1(event.project_id),
+      entityType: String(event.entity_type),
+      entityId: String(event.entity_id),
+      eventType: String(event.event_type),
+      payload: json(event.payload_json, {}),
+      source: String(event.source),
+      client: textOrNull$1(event.client),
+      actor: String(event.actor),
+      idempotencyKey: textOrNull$1(event.idempotency_key),
+      createdAt: String(event.created_at)
+    }));
+    return { report: this.errorReportFromRow(row), history };
+  }
+  updateErrorReport(id2, input) {
+    const row = this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2);
+    if (!row) throw new NotFoundError("Error report", id2);
+    const current = this.errorReportFromRow(row);
+    const redactor = this.secretRedactor(current.projectId);
+    const triageNote = input.triageNote === void 0 ? void 0 : input.triageNote === null ? null : redactor.redact(input.triageNote);
+    const redaction = triageNote && triageNote !== null ? { count: current.redaction.count + triageNote.count, fields: [.../* @__PURE__ */ new Set([...current.redaction.fields, ...redactionMetadata([{ field: "triageNote", result: triageNote }]).fields])] } : current.redaction;
+    return this.transaction(() => {
+      const result2 = this.db.prepare("UPDATE error_reports SET status=?,triage_note=?,redaction_json=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(input.status, triageNote === void 0 ? current.triageNote : triageNote?.value ?? null, JSON.stringify(redaction), now$1(), id2, input.expectedVersion);
+      if (!Number(result2.changes)) throw new ConflictError("Error report", id2);
+      this.event(null, "error_report", id2, "error_report.status_updated", { from: current.status, to: input.status, triageNoteUpdated: triageNote !== void 0, redactionCount: redaction.count });
+      return this.errorReportFromRow(this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2));
+    });
+  }
+  createRun(projectId, input) {
+    this.project(projectId);
+    if (input.workspaceRevisionId && !this.db.prepare("SELECT wr.id FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id WHERE wr.id=? AND pw.project_id=?").get(input.workspaceRevisionId, projectId)) throw new ValidationError("Workspace revision does not belong to the project");
+    const id2 = randomUUID();
+    const createdAt = now$1();
+    const startedAt = input.startedAt ?? createdAt;
+    const endedAt = input.endedAt ?? null;
+    const violations = validateRunInvariants({ ...input, startedAt, endedAt });
+    if (violations.length) throw new ValidationError("Run violates authoritative ledger invariants", { violations });
+    const durationMs = endedAt ? new Date(endedAt).getTime() - new Date(startedAt).getTime() : null;
+    const redactor = this.secretRedactor(projectId);
+    const commandResult = redactor.redact(stripAnsi(input.command));
+    const workingDirectoryResult = input.workingDirectory ? redactor.redact(input.workingDirectory) : null;
+    const stdoutResult = input.stdoutExcerpt ? redactor.redact(stripAnsi(input.stdoutExcerpt).slice(0, 32768)) : null;
+    const stderrResult = input.stderrExcerpt ? redactor.redact(stripAnsi(input.stderrExcerpt).slice(0, 32768)) : null;
+    const toolchainResults = Object.entries(input.toolchain ?? {}).map(([name, value]) => ({ name, result: redactor.redact(value) }));
+    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
+    const redactionEntries = [
+      { field: "command", result: commandResult },
+      ...workingDirectoryResult ? [{ field: "workingDirectory", result: workingDirectoryResult }] : [],
+      ...stdoutResult ? [{ field: "stdoutExcerpt", result: stdoutResult }] : [],
+      ...stderrResult ? [{ field: "stderrExcerpt", result: stderrResult }] : [],
+      ...toolchainResults.map(({ name, result: result2 }) => ({ field: `toolchain.${name}`, result: result2 })),
+      ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))
+    ];
+    const redaction = redactionMetadata(redactionEntries);
+    const toolchain = Object.fromEntries(toolchainResults.map(({ name, result: result2 }) => [name, result2.value]));
+    return this.transaction(() => {
+      this.db.prepare("INSERT INTO runs(id,project_id,workspace_revision_id,command,working_directory,started_at,ended_at,duration_ms,outcome,exit_code,toolchain_json,stdout_excerpt,stderr_excerpt,stdout_truncated,stderr_truncated,validation_status,redaction_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, projectId, input.workspaceRevisionId ?? null, commandResult.value, workingDirectoryResult?.value ?? null, startedAt, endedAt, durationMs, input.outcome, input.exitCode ?? null, JSON.stringify(toolchain), stdoutResult?.value ?? null, stderrResult?.value ?? null, input.stdoutTruncated ? 1 : 0, input.stderrTruncated ? 1 : 0, "validated", JSON.stringify(redaction), createdAt);
+      let testSummary = null;
+      if (input.testSummary) {
+        const summaryId = randomUUID();
+        this.db.prepare("INSERT INTO test_summaries(id,run_id,scope,passed,failed,skipped,target_count,created_at) VALUES (?,?,?,?,?,?,?,?)").run(summaryId, id2, input.testSummary.scope, input.testSummary.passed, input.testSummary.failed, input.testSummary.skipped, input.testSummary.targetCount, createdAt);
+        testSummary = { id: summaryId, runId: id2, ...input.testSummary, createdAt };
+      }
+      const artifacts = artifactResults.map(({ artifact, result: result2 }) => {
+        const artifactId = randomUUID();
+        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, id2, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, createdAt);
+        return { id: artifactId, runId: id2, uri: result2.value, mediaType: artifact.mediaType ?? null, byteCount: artifact.byteCount ?? null, digest: artifact.digest ?? null, createdAt };
+      });
+      const run = { id: id2, projectId, workspaceRevisionId: input.workspaceRevisionId ?? null, command: commandResult.value, workingDirectory: workingDirectoryResult?.value ?? null, startedAt, endedAt, durationMs, outcome: input.outcome, exitCode: input.exitCode ?? null, toolchain, stdoutExcerpt: stdoutResult?.value ?? null, stderrExcerpt: stderrResult?.value ?? null, stdoutTruncated: Boolean(input.stdoutTruncated), stderrTruncated: Boolean(input.stderrTruncated), artifacts, validationStatus: "validated", redaction, createdAt };
+      this.event(projectId, "run", id2, "run.created", { outcome: input.outcome, redactionCount: redaction.count });
+      return { run, testSummary, artifacts };
+    });
+  }
+  artifactsForRun(runId) {
+    return this.db.prepare("SELECT * FROM artifact_references WHERE run_id=? ORDER BY created_at,id").all(runId).map((row) => ({ id: String(row.id), runId: textOrNull$1(row.run_id), uri: String(row.uri), mediaType: textOrNull$1(row.media_type), byteCount: row.byte_count === null ? null : Number(row.byte_count), digest: textOrNull$1(row.digest), createdAt: String(row.created_at) }));
+  }
+  listRuns(projectId) {
+    const rows = this.db.prepare("SELECT * FROM runs WHERE project_id=? ORDER BY started_at DESC,id DESC").all(projectId);
+    return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workspaceRevisionId: textOrNull$1(row.workspace_revision_id), command: String(row.command), workingDirectory: textOrNull$1(row.working_directory), startedAt: String(row.started_at), endedAt: textOrNull$1(row.ended_at), durationMs: row.duration_ms === null ? null : Number(row.duration_ms), outcome: String(row.outcome), exitCode: row.exit_code === null ? null : Number(row.exit_code), toolchain: json(row.toolchain_json, {}), stdoutExcerpt: textOrNull$1(row.stdout_excerpt), stderrExcerpt: textOrNull$1(row.stderr_excerpt), stdoutTruncated: bool(row.stdout_truncated), stderrTruncated: bool(row.stderr_truncated), artifacts: this.artifactsForRun(String(row.id)), validationStatus: String(row.validation_status), redaction: json(row.redaction_json, { count: 0, fields: [] }), createdAt: String(row.created_at) }));
+  }
+  listRunsPage(projectId, limit2, cursor) {
+    return pageOf(this.listRuns(projectId), limit2, cursor);
+  }
+  createEvidence(projectId, input) {
+    this.project(projectId);
+    const id2 = randomUUID();
+    const timestamp = now$1();
+    const requirementIds = new Set(input.requirementIds ?? []);
+    for (const requirementId of requirementIds) this.assertProjectEntity("requirements", requirementId, projectId);
+    const criteria = (input.criterionIds ?? []).map((criterionId) => {
+      const row = this.db.prepare(`SELECT c.*,r.project_id FROM acceptance_criteria c JOIN requirements r ON r.id=c.requirement_id WHERE c.id=? AND r.project_id=? AND c.archived_at IS NULL`).get(criterionId, projectId);
+      if (!row) throw new ValidationError("Criterion must be active and belong to the project");
+      requirementIds.add(String(row.requirement_id));
+      return row;
+    });
+    for (const workItemId of input.workItemIds ?? []) this.assertProjectEntity("work_items", workItemId, projectId);
+    for (const updateId of [...input.updateIds ?? [], ...input.checkpointIds ?? []]) this.assertProjectEntity("updates", updateId, projectId);
+    const linkedRun = input.runId ? this.db.prepare("SELECT * FROM runs WHERE id=? AND project_id=?").get(input.runId, projectId) : void 0;
+    if (input.runId && !linkedRun) throw new ValidationError("Run does not belong to the project");
+    const context = this.mutationContext();
+    if (input.override && context.source === "mcp") throw new ValidationError("Verification overrides are unavailable through MCP");
+    const evidenceViolations = (() => {
+      try {
+        assertEvidenceInvariants({ result: input.result, runId: input.runId }, {
+          linkedRun: linkedRun ? { id: String(linkedRun.id), outcome: String(linkedRun.outcome), invariantsValid: String(linkedRun.validation_status) === "validated" } : null,
+          verifiedOverride: input.override
+        });
+        return [];
+      } catch (error) {
+        return error instanceof Error && "violations" in error ? error.violations : [String(error)];
+      }
+    })();
+    if (evidenceViolations.length) throw new ValidationError("Evidence violates authoritative ledger invariants", { violations: evidenceViolations });
+    const redactor = this.secretRedactor(projectId);
+    const summaryResult = redactor.redact(input.summary);
+    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
+    const redaction = redactionMetadata([{ field: "summary", result: summaryResult }, ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))]);
+    const validationStatus = input.override ? "overridden" : "validated";
+    return this.transaction(() => {
+      const ordinal = Number(this.db.prepare("SELECT COALESCE(MAX(ordinal),0)+1 AS ordinal FROM evidence").get().ordinal);
+      this.db.prepare("INSERT INTO evidence(id,ordinal,project_id,run_id,result,summary,target_version,validation_status,redaction_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id2, ordinal, projectId, input.runId ?? null, input.result, summaryResult.value, input.targetVersion ?? null, validationStatus, JSON.stringify(redaction), timestamp, timestamp);
+      for (const requirementId of requirementIds) this.db.prepare("INSERT INTO evidence_requirement_links(evidence_id,requirement_id) VALUES (?,?)").run(id2, requirementId);
+      for (const criterion of criteria) this.db.prepare("INSERT INTO evidence_criterion_links(evidence_id,criterion_id,criterion_version,created_at) VALUES (?,?,?,?)").run(id2, String(criterion.id), Number(criterion.version), timestamp);
+      for (const workItemId of new Set(input.workItemIds ?? [])) this.db.prepare("INSERT INTO evidence_work_links(evidence_id,work_item_id) VALUES (?,?)").run(id2, workItemId);
+      for (const updateId of new Set(input.updateIds ?? [])) this.db.prepare("INSERT INTO evidence_update_links(evidence_id,update_id) VALUES (?,?)").run(id2, updateId);
+      for (const checkpointId of new Set(input.checkpointIds ?? [])) this.db.prepare("INSERT INTO evidence_checkpoint_links(evidence_id,checkpoint_id) VALUES (?,?)").run(id2, checkpointId);
+      for (const { artifact, result: result2 } of artifactResults) {
+        const artifactId = randomUUID();
+        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, input.runId ?? null, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, timestamp);
+        this.db.prepare("INSERT INTO evidence_artifact_links(evidence_id,artifact_id) VALUES (?,?)").run(id2, artifactId);
+      }
+      if (input.override) this.db.prepare("INSERT INTO evidence_overrides(evidence_id,reason,actor,source,client,created_at) VALUES (?,?,?,?,?,?)").run(id2, input.override.reason, context.actor, context.source, context.client ?? null, timestamp);
+      this.event(projectId, "evidence", id2, "evidence.created", { result: input.result, criterionIds: criteria.map((criterion) => criterion.id), overridden: Boolean(input.override), redactionCount: redaction.count });
+      return this.evidenceFromRow(this.db.prepare("SELECT * FROM evidence WHERE id=?").get(id2));
+    });
+  }
+  artifactsForEvidence(evidenceId) {
+    return this.db.prepare("SELECT a.* FROM artifact_references a JOIN evidence_artifact_links l ON l.artifact_id=a.id WHERE l.evidence_id=? ORDER BY a.created_at,a.id").all(evidenceId).map((row) => ({
+      id: String(row.id),
+      runId: textOrNull$1(row.run_id),
+      uri: String(row.uri),
+      mediaType: textOrNull$1(row.media_type),
+      byteCount: row.byte_count === null ? null : Number(row.byte_count),
+      digest: textOrNull$1(row.digest),
+      createdAt: String(row.created_at)
+    }));
+  }
+  evidenceFromRow(row) {
+    const id2 = String(row.id);
+    const targetVersion = row.target_version === null ? null : Number(row.target_version);
+    const { stale, staleReason } = this.evidenceStaleness(row);
+    const criterionLinks = this.db.prepare(`SELECT l.criterion_id,l.criterion_version,c.version FROM evidence_criterion_links l JOIN acceptance_criteria c ON c.id=l.criterion_id WHERE l.evidence_id=? ORDER BY l.criterion_id`).all(id2).map((entry) => ({
+      criterionId: String(entry.criterion_id),
+      criterionVersion: Number(entry.criterion_version),
+      stale: Number(entry.criterion_version) !== Number(entry.version)
+    }));
+    const override = this.db.prepare("SELECT * FROM evidence_overrides WHERE evidence_id=?").get(id2);
+    return {
+      id: id2,
+      ordinal: Number(row.ordinal),
+      projectId: String(row.project_id),
+      runId: textOrNull$1(row.run_id),
+      result: String(row.result),
+      summary: String(row.summary),
+      targetVersion,
+      stale,
+      staleReason,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      requirementIds: this.db.prepare("SELECT requirement_id FROM evidence_requirement_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.requirement_id)),
+      workItemIds: this.db.prepare("SELECT work_item_id FROM evidence_work_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.work_item_id)),
+      updateIds: this.db.prepare("SELECT update_id FROM evidence_update_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.update_id)),
+      checkpointIds: this.db.prepare("SELECT checkpoint_id FROM evidence_checkpoint_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.checkpoint_id)),
+      artifacts: this.artifactsForEvidence(id2),
+      criterionLinks,
+      validationStatus: String(row.validation_status),
+      redaction: json(row.redaction_json, { count: 0, fields: [] }),
+      override: override ? { reason: String(override.reason), actor: String(override.actor), source: String(override.source), client: textOrNull$1(override.client), createdAt: String(override.created_at) } : null
+    };
+  }
+  listEvidence(projectId, includeStale = false) {
+    this.project(projectId);
+    const evidence = this.db.prepare("SELECT * FROM evidence WHERE project_id=? ORDER BY ordinal DESC").all(projectId).map((row) => this.evidenceFromRow(row));
+    return includeStale ? evidence : evidence.filter((entry) => !entry.stale);
+  }
+  listEvidencePage(projectId, limit2, cursor, includeStale = false) {
+    return pageOf(this.listEvidence(projectId, includeStale), limit2, cursor);
+  }
+  captureCheckpointSnapshot(projectId, checkpointId) {
+    this.project(projectId);
+    if (!this.db.prepare("SELECT id FROM updates WHERE id=? AND project_id=? AND kind='checkpoint'").get(checkpointId, projectId)) throw new ValidationError("Checkpoint does not belong to the project");
+    const existing = this.getCheckpointSnapshot(checkpointId);
+    if (existing) return existing;
+    const project = this.project(projectId);
+    const phases = this.db.prepare("SELECT * FROM phases WHERE project_id=? ORDER BY position,id").all(projectId);
+    const requirementStates = this.listRequirementStates(projectId);
+    const requirements = this.listRequirements(projectId);
+    const workItems = this.listWorkItems(projectId);
+    const queues = this.listWorkQueues(projectId);
+    const relations = this.listWorkRelations(projectId);
+    const blockers = this.listExternalBlockers(projectId, true);
+    const workspaces = this.db.prepare("SELECT w.*,pw.project_id FROM workspaces w JOIN project_workspaces pw ON pw.workspace_id=w.id WHERE pw.project_id=? ORDER BY w.canonical_root,w.id").all(projectId).map((workspace) => ({
+      ...workspace,
+      aliases: this.db.prepare("SELECT alias FROM workspace_aliases WHERE workspace_id=? ORDER BY alias").all(String(workspace.id)).map((alias) => String(alias.alias))
+    }));
+    const workspaceRevisions = this.db.prepare(`SELECT wr.* FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id
+      WHERE pw.project_id=? ORDER BY wr.captured_at,wr.id`).all(projectId);
+    const runs = this.listRuns(projectId);
+    const testSummaries = this.db.prepare(`SELECT ts.* FROM test_summaries ts JOIN runs r ON r.id=ts.run_id
+      WHERE r.project_id=? ORDER BY r.started_at,r.id`).all(projectId);
+    const evidence = this.listEvidence(projectId, true);
+    const updates = this.db.prepare("SELECT * FROM updates WHERE project_id=? ORDER BY created_at,id").all(projectId);
+    const updateRevisions = this.db.prepare(`SELECT ur.* FROM update_revisions ur JOIN updates u ON u.id=ur.update_id
+      WHERE u.project_id=? ORDER BY u.created_at,u.id,ur.revision`).all(projectId);
+    const labels = this.db.prepare(`SELECT DISTINCT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id JOIN work_items wi ON wi.id=wil.work_item_id
+      WHERE wi.project_id=? ORDER BY l.name COLLATE NOCASE,l.id`).all(projectId);
+    const links = {
+      requirementAliases: this.db.prepare(`SELECT a.* FROM requirement_key_aliases a JOIN requirements r ON r.id=a.requirement_id WHERE r.project_id=? ORDER BY a.requirement_id,a.alias`).all(projectId),
+      requirementPhases: this.db.prepare(`SELECT l.* FROM requirement_phase_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=? ORDER BY l.requirement_id,l.phase_id`).all(projectId),
+      requirementWork: this.db.prepare(`SELECT l.* FROM requirement_work_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=? ORDER BY l.requirement_id,l.work_item_id`).all(projectId),
+      workPhases: this.db.prepare(`SELECT l.* FROM work_phase_links l JOIN work_items w ON w.id=l.work_item_id WHERE w.project_id=? ORDER BY l.work_item_id,l.phase_id`).all(projectId)
+    };
+    const projectSecretNames = this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name));
+    const document = canonicaliseJson({
+      project,
+      phases,
+      requirementStates,
+      requirements,
+      workItems,
+      queues,
+      relations,
+      blockers,
+      workspaces,
+      workspaceRevisions,
+      runs,
+      testSummaries,
+      evidence,
+      updates,
+      updateRevisions,
+      labels,
+      links,
+      projectSecretNames,
+      evidenceHeads: evidence.map((entry) => ({ id: entry.id, ordinal: entry.ordinal, result: entry.result, stale: entry.stale, updatedAt: entry.updatedAt }))
+    });
+    const encoded = canonicalJson(document);
+    const digest = createHash("sha256").update(encoded).digest("hex");
+    const id2 = randomUUID();
+    const capturedAt = now$1();
+    try {
+      this.db.prepare("INSERT INTO checkpoint_snapshots(id,checkpoint_id,schema_version,captured_at,document_json,digest) VALUES (?,?,?,?,?,?)").run(id2, checkpointId, 3, capturedAt, encoded, digest);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("UNIQUE")) return this.getCheckpointSnapshot(checkpointId);
+      throw error;
+    }
+    this.event(projectId, "checkpoint_snapshot", id2, "checkpoint_snapshot.captured", { checkpointId, digest });
+    return { id: id2, checkpointId, schemaVersion: 3, capturedAt, document, digest };
+  }
+  getCheckpointSnapshot(checkpointId) {
+    const row = this.db.prepare("SELECT * FROM checkpoint_snapshots WHERE checkpoint_id=?").get(checkpointId);
+    if (!row) return null;
+    return { id: String(row.id), checkpointId: String(row.checkpoint_id), schemaVersion: 3, capturedAt: String(row.captured_at), document: json(row.document_json, {}), digest: String(row.digest) };
+  }
+  compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) {
+    const comparable = (checkpointId) => {
+      const structured = this.getCheckpointSnapshot(checkpointId);
+      if (structured) return { document: structured.document, digest: structured.digest, legacy: false };
+      const row = this.db.prepare(`SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id
+        WHERE u.id=? AND u.kind='checkpoint' AND u.deleted_at IS NULL`).get(checkpointId);
+      if (!row) return null;
+      const document = json(row.snapshot_json, null);
+      if (!document) return null;
+      return { document, digest: createHash("sha256").update(canonicalJson(document)).digest("hex"), legacy: true };
+    };
+    const left = comparable(leftCheckpointId);
+    const right = comparable(rightCheckpointId);
+    if (!left || !right) throw new NotFoundError("Checkpoint snapshot", !left ? leftCheckpointId : rightCheckpointId);
+    const sections = /* @__PURE__ */ new Set([...Object.keys(left.document), ...Object.keys(right.document)]);
+    const changedSections = [...sections].filter((section) => JSON.stringify(left.document[section]) !== JSON.stringify(right.document[section])).sort();
+    return { leftCheckpointId, rightCheckpointId, same: changedSections.length === 0, changedSections, leftDigest: left.digest, rightDigest: right.digest, leftLegacy: left.legacy, rightLegacy: right.legacy };
+  }
+  reconstructCheckpointState(checkpointId) {
+    const structured = this.getCheckpointSnapshot(checkpointId);
+    if (structured) return { ...structured.document, _snapshot: { legacy: false, schemaVersion: structured.schemaVersion, digest: structured.digest } };
+    const row = this.db.prepare(`SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id
+      WHERE u.id=? AND u.kind='checkpoint' AND u.deleted_at IS NULL`).get(checkpointId);
+    if (!row) return null;
+    const compactSnapshot = json(row.snapshot_json, null);
+    if (!compactSnapshot) return null;
+    return {
+      compactSnapshot,
+      _snapshot: { legacy: true, schemaVersion: 1, digest: createHash("sha256").update(canonicalJson(compactSnapshot)).digest("hex") }
+    };
+  }
+  getProjectPulseSummary(projectId) {
+    const projectRow = this.db.prepare("SELECT * FROM projects WHERE id=?").get(projectId);
+    if (!projectRow) return null;
+    const project = { id: String(projectRow.id), title: String(projectRow.title), description: textOrNull$1(projectRow.description), intent: textOrNull$1(projectRow.intent), deadline: textOrNull$1(projectRow.deadline), completionCriteria: textOrNull$1(projectRow.completion_criteria), state: String(projectRow.state), currentFocus: textOrNull$1(projectRow.current_focus), nextAction: textOrNull$1(projectRow.next_action), blockers: json(projectRow.blockers_json, []), currentCheckpointId: textOrNull$1(projectRow.current_checkpoint_id), archivedAt: textOrNull$1(projectRow.archived_at), version: Number(projectRow.version), createdAt: String(projectRow.created_at), updatedAt: String(projectRow.updated_at), lastActivityAt: String(projectRow.last_activity_at) };
+    const checkpoint = project.currentCheckpointId ? this.db.prepare("SELECT u.id,r.content,u.created_at FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id WHERE u.id=?").get(project.currentCheckpointId) : void 0;
+    const activePhases = this.db.prepare("SELECT id,name,status FROM phases WHERE project_id=? AND status='active' AND archived_at IS NULL ORDER BY position,id").all(projectId).map((row) => ({ id: String(row.id), name: String(row.name), status: String(row.status) }));
+    const queue = this.listWorkQueues(projectId)[0];
+    const queueHead = queue ? this.listWorkItems(projectId, queue.id).filter((item) => !["resolved", "dropped"].includes(item.status)).slice(0, 10) : [];
+    const blockers = this.listExternalBlockers(projectId);
+    const evidence = this.listEvidence(projectId, true);
+    return { project, currentCheckpoint: checkpoint ? { id: String(checkpoint.id), content: String(checkpoint.content), createdAt: String(checkpoint.created_at) } : null, activePhases, requirementRollup: this.getRequirementRollup(projectId), queueHead, blockers, staleEvidenceCount: evidence.filter((entry) => entry.stale).length, failedEvidenceCount: evidence.filter((entry) => entry.result === "failed").length };
+  }
+  search(query2, limit2 = 50, filters = {}) {
+    const term = `%${query2.trim()}%`;
+    if (!query2.trim()) return [];
+    const types2 = filters.entityTypes ? new Set(filters.entityTypes) : null;
+    const results = [];
+    const projectClause = filters.projectId ? " AND r.project_id=?" : "";
+    const projectArgs = filters.projectId ? [filters.projectId] : [];
+    const searchRequirements = (!types2 || types2.has("requirement")) && !filters.requirementId && !filters.evidenceResult;
+    const searchWorkItems = (!types2 || types2.has("work_item")) && !filters.evidenceResult;
+    const searchRuns = (!types2 || types2.has("run")) && !filters.state && !filters.phaseId && !filters.requirementId && !filters.evidenceResult;
+    const searchEvidence = (!types2 || types2.has("evidence")) && !filters.state && !filters.phaseId && !filters.requirementId;
+    if (searchRequirements) {
+      const rows = this.db.prepare(`SELECT r.id,r.project_id,r.stable_key,r.title,r.description FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE (r.title LIKE ? OR COALESCE(r.description,'') LIKE ?)${projectClause}${filters.state ? " AND (s.semantic=? OR s.name=?)" : ""}${filters.phaseId ? " AND (r.responsible_phase_id=? OR EXISTS (SELECT 1 FROM requirement_phase_links l WHERE l.requirement_id=r.id AND l.phase_id=?))" : ""}${filters.from ? " AND r.created_at>=?" : ""}${filters.to ? " AND r.created_at<=?" : ""} ORDER BY r.updated_at DESC LIMIT ?`).all(term, term, ...projectArgs, ...filters.state ? [filters.state, filters.state] : [], ...filters.phaseId ? [filters.phaseId, filters.phaseId] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
+      for (const row of rows) results.push({ type: "requirement", id: String(row.id), projectId: String(row.project_id), title: `${String(row.stable_key)} ${String(row.title)}`, excerpt: textOrNull$1(row.description) ?? "", score: 0 });
+    }
+    if (searchWorkItems) {
+      const rows = this.db.prepare(`SELECT w.id,w.project_id,w.title,w.description FROM work_items w WHERE (w.title LIKE ? OR COALESCE(w.description,'') LIKE ?)${filters.projectId ? " AND w.project_id=?" : ""}${filters.state ? " AND w.status=?" : ""}${filters.phaseId ? " AND w.phase_id=?" : ""}${filters.requirementId ? " AND EXISTS (SELECT 1 FROM requirement_work_links l WHERE l.work_item_id=w.id AND l.requirement_id=?)" : ""}${filters.from ? " AND w.created_at>=?" : ""}${filters.to ? " AND w.created_at<=?" : ""} ORDER BY w.updated_at DESC LIMIT ?`).all(term, term, ...filters.projectId ? [filters.projectId] : [], ...filters.state ? [filters.state] : [], ...filters.phaseId ? [filters.phaseId] : [], ...filters.requirementId ? [filters.requirementId] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
+      for (const row of rows) results.push({ type: "work_item", id: String(row.id), projectId: String(row.project_id), title: String(row.title), excerpt: textOrNull$1(row.description) ?? "", score: 0 });
+    }
+    if (searchRuns) {
+      const rows = this.db.prepare(`SELECT id,project_id,command,stdout_excerpt,stderr_excerpt FROM runs WHERE (command LIKE ? OR COALESCE(stdout_excerpt,'') LIKE ? OR COALESCE(stderr_excerpt,'') LIKE ?)${filters.projectId ? " AND project_id=?" : ""}${filters.from ? " AND created_at>=?" : ""}${filters.to ? " AND created_at<=?" : ""} ORDER BY created_at DESC LIMIT ?`).all(term, term, term, ...filters.projectId ? [filters.projectId] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
+      for (const row of rows) results.push({ type: "run", id: String(row.id), projectId: String(row.project_id), title: String(row.command), excerpt: textOrNull$1(row.stderr_excerpt) ?? textOrNull$1(row.stdout_excerpt) ?? "", score: 0 });
+    }
+    if (searchEvidence) {
+      const rows = this.db.prepare(`SELECT id,project_id,summary,result FROM evidence WHERE summary LIKE ?${filters.projectId ? " AND project_id=?" : ""}${filters.evidenceResult ? " AND result=?" : ""}${filters.from ? " AND created_at>=?" : ""}${filters.to ? " AND created_at<=?" : ""} ORDER BY created_at DESC LIMIT ?`).all(term, ...filters.projectId ? [filters.projectId] : [], ...filters.evidenceResult ? [filters.evidenceResult] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
+      for (const row of rows) results.push({ type: "evidence", id: String(row.id), projectId: String(row.project_id), title: String(row.result), excerpt: String(row.summary), score: 0 });
+    }
+    return results.slice(0, Math.min(Math.max(limit2, 1), 200));
+  }
+}
+const now = () => (/* @__PURE__ */ new Date()).toISOString();
+const textOrNull = (value) => value == null ? null : String(value);
 function beforeAfter(before, after, keys) {
   return Object.fromEntries(keys.filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key])).map((key) => [key, { before: before[key], after: after[key] }]));
 }
@@ -10915,16 +19648,16 @@ function projectFromRow(row) {
   return {
     id: String(row.id),
     title: String(row.title),
-    description: textOrNull$1(row.description),
-    intent: textOrNull$1(row.intent),
-    deadline: textOrNull$1(row.deadline),
-    completionCriteria: textOrNull$1(row.completion_criteria),
+    description: textOrNull(row.description),
+    intent: textOrNull(row.intent),
+    deadline: textOrNull(row.deadline),
+    completionCriteria: textOrNull(row.completion_criteria),
     state: String(row.state),
-    currentFocus: textOrNull$1(row.current_focus),
-    nextAction: textOrNull$1(row.next_action),
+    currentFocus: textOrNull(row.current_focus),
+    nextAction: textOrNull(row.next_action),
     blockers: parseJson(row.blockers_json, []),
-    currentCheckpointId: textOrNull$1(row.current_checkpoint_id),
-    archivedAt: textOrNull$1(row.archived_at),
+    currentCheckpointId: textOrNull(row.current_checkpoint_id),
+    archivedAt: textOrNull(row.archived_at),
     version: Number(row.version),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
@@ -10936,17 +19669,17 @@ function phaseFromRow(row) {
     id: String(row.id),
     projectId: String(row.project_id),
     name: String(row.name),
-    description: textOrNull$1(row.description),
+    description: textOrNull(row.description),
     status: String(row.status),
     position: Number(row.position),
-    archivedAt: textOrNull$1(row.archived_at),
+    archivedAt: textOrNull(row.archived_at),
     version: Number(row.version),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at)
   };
 }
 function labelFromRow(row) {
-  return { id: String(row.id), name: String(row.name), colour: textOrNull$1(row.colour), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
+  return { id: String(row.id), name: String(row.name), colour: textOrNull(row.colour), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
 }
 function revisionFromRow(row) {
   return {
@@ -10956,50 +19689,10 @@ function revisionFromRow(row) {
     content: String(row.content),
     snapshot: parseJson(row.snapshot_json, null),
     source: String(row.source),
-    client: textOrNull$1(row.client),
+    client: textOrNull(row.client),
     createdAt: String(row.created_at)
   };
 }
-const exportTables = {
-  projects: ["id", "title", "description", "intent", "deadline", "completion_criteria", "state", "current_focus", "next_action", "blockers_json", "current_checkpoint_id", "archived_at", "version", "created_at", "updated_at", "last_activity_at"],
-  error_reports: ["id", "kind", "component", "summary", "observation", "expected_behaviour", "actual_behaviour", "reproduction_steps_json", "impact", "project_id", "workspace_path", "status", "triage_note", "source", "client", "actor", "redaction_json", "version", "created_at", "updated_at"],
-  phases: ["id", "project_id", "name", "description", "status", "position", "archived_at", "version", "created_at", "updated_at"],
-  work_items: ["id", "project_id", "phase_id", "stable_key", "parent_id", "kind", "title", "description", "status", "priority", "version", "created_at", "updated_at"],
-  labels: ["id", "name", "colour", "version", "created_at", "updated_at"],
-  work_item_labels: ["work_item_id", "label_id", "created_at"],
-  updates: ["id", "project_id", "kind", "current_revision_id", "deleted_at", "version", "created_at", "updated_at"],
-  update_revisions: ["id", "update_id", "revision", "content", "snapshot_json", "source", "client", "created_at"],
-  activity_events: ["id", "project_id", "entity_type", "entity_id", "event_type", "payload_json", "source", "client", "actor", "idempotency_key", "created_at"],
-  requirement_states: ["id", "project_id", "name", "semantic", "position", "colour", "created_at", "updated_at"],
-  requirements: ["id", "project_id", "stable_key", "kind", "parent_id", "title", "description", "state_id", "responsible_phase_id", "version", "created_at", "updated_at"],
-  requirement_key_aliases: ["requirement_id", "alias", "created_at"],
-  acceptance_criteria: ["id", "requirement_id", "title", "description", "position", "required", "version", "archived_at", "created_at", "updated_at"],
-  requirement_phase_links: ["requirement_id", "phase_id", "role", "created_at"],
-  work_queues: ["id", "project_id", "name", "description", "version", "created_at", "updated_at"],
-  work_queue_items: ["queue_id", "work_item_id", "rank", "created_at"],
-  requirement_work_links: ["requirement_id", "work_item_id", "created_at"],
-  work_phase_links: ["work_item_id", "phase_id", "role", "created_at"],
-  work_relations: ["id", "project_id", "from_work_item_id", "to_work_item_id", "kind", "created_at"],
-  external_blockers: ["id", "project_id", "work_item_id", "content", "resolved_at", "created_at", "updated_at"],
-  workspaces: ["id", "name", "canonical_root", "remote", "created_at", "updated_at"],
-  workspace_aliases: ["workspace_id", "alias", "created_at"],
-  project_workspaces: ["project_id", "workspace_id", "created_at"],
-  workspace_revisions: ["id", "workspace_id", "branch", '"commit"', "dirty", "diff_hash", "captured_at"],
-  project_secret_names: ["project_id", "name", "created_at"],
-  runs: ["id", "project_id", "workspace_revision_id", "command", "working_directory", "started_at", "ended_at", "duration_ms", "outcome", "exit_code", "toolchain_json", "stdout_excerpt", "stderr_excerpt", "stdout_truncated", "stderr_truncated", "validation_status", "redaction_json", "created_at"],
-  test_summaries: ["id", "run_id", "scope", "passed", "failed", "skipped", "target_count", "created_at"],
-  artifact_references: ["id", "run_id", "uri", "media_type", "byte_count", "digest", "created_at"],
-  evidence: ["id", "ordinal", "project_id", "run_id", "result", "summary", "target_version", "stale", "stale_reason", "validation_status", "redaction_json", "created_at", "updated_at"],
-  evidence_artifact_links: ["evidence_id", "artifact_id"],
-  evidence_requirement_links: ["evidence_id", "requirement_id"],
-  evidence_criterion_links: ["evidence_id", "criterion_id", "criterion_version", "created_at"],
-  evidence_work_links: ["evidence_id", "work_item_id"],
-  evidence_update_links: ["evidence_id", "update_id"],
-  evidence_checkpoint_links: ["evidence_id", "checkpoint_id"],
-  evidence_overrides: ["evidence_id", "reason", "actor", "source", "client", "created_at"],
-  checkpoint_snapshots: ["id", "checkpoint_id", "schema_version", "captured_at", "document_json", "digest"],
-  idempotency_records: ["client", "idempotency_key", "operation", "request_hash", "result_json", "created_at"]
-};
 class SqliteIstraRepository {
   constructor(db) {
     this.db = db;
@@ -11030,7 +19723,7 @@ class SqliteIstraRepository {
       throw error;
     }
   }
-  seedOperationalDefaults(projectId, timestamp = now$1()) {
+  seedOperationalDefaults(projectId, timestamp = now()) {
     const defaults2 = [
       ["Missing", "open", 0, "#7A8594"],
       ["Partial", "partial", 1, "#C18401"],
@@ -11044,7 +19737,7 @@ class SqliteIstraRepository {
     }
   }
   event(projectId, entityType, entityId, eventType, payload, provenance) {
-    const occurredAt = provenance.occurredAt ?? now$1();
+    const occurredAt = provenance.occurredAt ?? now();
     this.db.prepare(`INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), provenance.source, provenance.client ?? null, provenance.actor ?? provenance.client ?? provenance.source, provenance.idempotencyKey ?? null, occurredAt);
     if (projectId) this.db.prepare("UPDATE projects SET last_activity_at=? WHERE id=?").run(occurredAt, projectId);
   }
@@ -11064,20 +19757,20 @@ class SqliteIstraRepository {
     return {
       id: id2,
       projectId: String(row.project_id),
-      phaseId: textOrNull$1(row.phase_id),
+      phaseId: textOrNull(row.phase_id),
       kind: String(row.kind),
       title: String(row.title),
-      description: textOrNull$1(row.description),
+      description: textOrNull(row.description),
       status: String(row.status),
-      priority: textOrNull$1(row.priority),
+      priority: textOrNull(row.priority),
       labels: labels.map(labelFromRow),
       version: Number(row.version),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
-      stableKey: textOrNull$1(row.stable_key),
-      parentId: textOrNull$1(row.parent_id),
-      queueId: textOrNull$1(queue?.queue_id),
-      rank: textOrNull$1(queue?.rank),
+      stableKey: textOrNull(row.stable_key),
+      parentId: textOrNull(row.parent_id),
+      queueId: textOrNull(queue?.queue_id),
+      rank: textOrNull(queue?.rank),
       effectiveBlocked: String(row.status) === "blocked" || reasons.length > 0,
       blockerReasons: reasons
     };
@@ -11090,7 +19783,7 @@ class SqliteIstraRepository {
       projectId: String(row.project_id),
       kind: String(row.kind),
       currentRevision: revisionFromRow(revision),
-      deletedAt: textOrNull$1(row.deleted_at),
+      deletedAt: textOrNull(row.deleted_at),
       version: Number(row.version),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at)
@@ -11143,7 +19836,7 @@ class SqliteIstraRepository {
   }
   createProject(input, provenance) {
     const id2 = randomUUID();
-    const timestamp = now$1();
+    const timestamp = now();
     return this.transaction(() => {
       this.db.prepare(`INSERT INTO projects(id,title,description,intent,deadline,completion_criteria,state,created_at,updated_at,last_activity_at) VALUES (?,?,?,?,?,?,'active',?,?,?)`).run(id2, input.title, input.description ?? null, input.intent ?? null, input.deadline ?? null, input.completionCriteria ?? null, timestamp, timestamp, timestamp);
       this.seedOperationalDefaults(id2, timestamp);
@@ -11157,7 +19850,7 @@ class SqliteIstraRepository {
     if (!current) throw new NotFoundError("Project", id2);
     const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([key, value]) => key !== "expectedVersion" && value !== void 0)) };
     return this.transaction(() => {
-      const result2 = this.db.prepare(`UPDATE projects SET title=?,description=?,intent=?,deadline=?,completion_criteria=?,state=?,current_focus=?,next_action=?,blockers_json=?,version=version+1,updated_at=? WHERE id=? AND version=?`).run(next.title, next.description, next.intent, next.deadline, next.completionCriteria, next.state, next.currentFocus, next.nextAction, JSON.stringify(next.blockers), now$1(), id2, input.expectedVersion);
+      const result2 = this.db.prepare(`UPDATE projects SET title=?,description=?,intent=?,deadline=?,completion_criteria=?,state=?,current_focus=?,next_action=?,blockers_json=?,version=version+1,updated_at=? WHERE id=? AND version=?`).run(next.title, next.description, next.intent, next.deadline, next.completionCriteria, next.state, next.currentFocus, next.nextAction, JSON.stringify(next.blockers), now(), id2, input.expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Project", id2);
       this.replaceSearch("project", id2, id2, next.title, [next.description, next.intent, next.completionCriteria].filter(Boolean).join("\n"));
       const changes = beforeAfter(current, next, ["title", "description", "intent", "deadline", "completionCriteria", "state", "currentFocus", "nextAction", "blockers"]);
@@ -11169,7 +19862,7 @@ class SqliteIstraRepository {
     const current = this.getProject(id2);
     if (!current) throw new NotFoundError("Project", id2);
     return this.transaction(() => {
-      const result2 = this.db.prepare("UPDATE projects SET archived_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(archived ? now$1() : null, now$1(), id2, expectedVersion);
+      const result2 = this.db.prepare("UPDATE projects SET archived_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(archived ? now() : null, now(), id2, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Project", id2);
       const updated = this.getProject(id2);
       this.event(id2, "project", id2, archived ? "project.archived" : "project.unarchived", { changes: { archivedAt: { before: current.archivedAt, after: updated.archivedAt } } }, provenance);
@@ -11182,7 +19875,7 @@ class SqliteIstraRepository {
   createPhase(projectId, input, provenance) {
     if (!this.getProject(projectId)) throw new NotFoundError("Project", projectId);
     const id2 = randomUUID();
-    const timestamp = now$1();
+    const timestamp = now();
     const position = input.position ?? Number(this.db.prepare("SELECT COALESCE(MAX(position),-1)+1 AS p FROM phases WHERE project_id=?").get(projectId).p);
     return this.transaction(() => {
       this.db.prepare("INSERT INTO phases(id,project_id,name,description,status,position,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id2, projectId, input.name, input.description ?? null, input.status, position, timestamp, timestamp);
@@ -11197,7 +19890,7 @@ class SqliteIstraRepository {
     const current = phaseFromRow(row);
     const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([k, v]) => !["expectedVersion", "archived"].includes(k) && v !== void 0)) };
     return this.transaction(() => {
-      const result2 = this.db.prepare("UPDATE phases SET name=?,description=?,status=?,position=?,archived_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(next.name, next.description, next.status, next.position, input.archived === void 0 ? current.archivedAt : input.archived ? now$1() : null, now$1(), id2, input.expectedVersion);
+      const result2 = this.db.prepare("UPDATE phases SET name=?,description=?,status=?,position=?,archived_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(next.name, next.description, next.status, next.position, input.archived === void 0 ? current.archivedAt : input.archived ? now() : null, now(), id2, input.expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Phase", id2);
       this.replaceSearch("phase", id2, current.projectId, next.name, next.description ?? "");
       const updated = phaseFromRow(this.db.prepare("SELECT * FROM phases WHERE id=?").get(id2));
@@ -11222,7 +19915,7 @@ class SqliteIstraRepository {
     for (const phaseId of new Set(input.relatedPhaseIds ?? [])) this.assertPhaseInProject(phaseId, projectId);
     for (const requirementId of new Set(input.requirementIds ?? [])) this.assertProjectEntity("requirements", requirementId, projectId);
     const id2 = randomUUID();
-    const timestamp = now$1();
+    const timestamp = now();
     const labelIds = [...new Set(input.labelIds ?? [])];
     return this.transaction(() => {
       this.db.prepare("INSERT INTO work_items(id,project_id,phase_id,stable_key,parent_id,kind,title,description,status,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, projectId, input.phaseId ?? null, input.stableKey ?? null, input.parentId ?? null, input.kind, input.title, input.description ?? null, input.status ?? "open", input.priority ?? null, timestamp, timestamp);
@@ -11251,7 +19944,7 @@ class SqliteIstraRepository {
     for (const requirementId of new Set(input.requirementIds ?? [])) this.assertProjectEntity("requirements", requirementId, current.projectId);
     const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([k, v]) => !["expectedVersion", "labelIds", "requirementIds", "relatedPhaseIds", "queueId", "rank"].includes(k) && v !== void 0)), rank: input.rank === void 0 ? current.rank ?? null : input.rank };
     return this.transaction(() => {
-      const result2 = this.db.prepare("UPDATE work_items SET phase_id=?,stable_key=?,parent_id=?,kind=?,title=?,description=?,status=?,priority=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(next.phaseId, next.stableKey ?? null, parentId, next.kind, next.title, next.description, next.status, next.priority, now$1(), id2, input.expectedVersion);
+      const result2 = this.db.prepare("UPDATE work_items SET phase_id=?,stable_key=?,parent_id=?,kind=?,title=?,description=?,status=?,priority=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(next.phaseId, next.stableKey ?? null, parentId, next.kind, next.title, next.description, next.status, next.priority, now(), id2, input.expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Work item", id2);
       const previousLabelIds = current.labels.map((label) => label.id);
       if (input.labelIds) {
@@ -11260,7 +19953,7 @@ class SqliteIstraRepository {
       }
       if (input.queueId !== void 0 || input.rank !== void 0) {
         this.db.prepare("DELETE FROM work_queue_items WHERE work_item_id=?").run(id2);
-        if (queueId) this.insertQueueItem(queueId, id2, input.rank ?? current.rank ?? `${now$1()}-${id2}`);
+        if (queueId) this.insertQueueItem(queueId, id2, input.rank ?? current.rank ?? `${now()}-${id2}`);
       }
       if (input.relatedPhaseIds !== void 0 || input.phaseId !== void 0) {
         this.db.prepare("DELETE FROM work_phase_links WHERE work_item_id=?").run(id2);
@@ -11269,7 +19962,7 @@ class SqliteIstraRepository {
       }
       if (input.requirementIds !== void 0) {
         this.db.prepare("DELETE FROM requirement_work_links WHERE work_item_id=?").run(id2);
-        for (const requirementId of new Set(input.requirementIds)) this.db.prepare("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)").run(requirementId, id2, now$1());
+        for (const requirementId of new Set(input.requirementIds)) this.db.prepare("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)").run(requirementId, id2, now());
       }
       this.replaceSearch("work_item", id2, current.projectId, next.title, next.description ?? "");
       const updated = this.workItemFromRow(this.db.prepare("SELECT * FROM work_items WHERE id=?").get(id2));
@@ -11311,24 +20004,24 @@ class SqliteIstraRepository {
     const existing = this.db.prepare("SELECT id FROM work_queues WHERE project_id=? ORDER BY created_at LIMIT 1").get(projectId);
     if (existing) return String(existing.id);
     const id2 = randomUUID();
-    const timestamp = now$1();
+    const timestamp = now();
     this.db.prepare("INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, "Main queue", "Default ordered work queue", timestamp, timestamp);
     return id2;
   }
   insertQueueItem(queueId, workItemId, rank) {
     try {
-      this.db.prepare("INSERT INTO work_queue_items(queue_id,work_item_id,rank,created_at) VALUES (?,?,?,?)").run(queueId, workItemId, rank, now$1());
+      this.db.prepare("INSERT INTO work_queue_items(queue_id,work_item_id,rank,created_at) VALUES (?,?,?,?)").run(queueId, workItemId, rank, now());
     } catch (error) {
       throw new ValidationError(error instanceof Error ? error.message : "Could not add work item to queue");
     }
   }
   insertWorkPhaseLink(workItemId, phaseId, role, projectId) {
     this.assertPhaseInProject(phaseId, projectId);
-    this.db.prepare("INSERT OR REPLACE INTO work_phase_links(work_item_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(workItemId, phaseId, role, now$1());
+    this.db.prepare("INSERT OR REPLACE INTO work_phase_links(work_item_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(workItemId, phaseId, role, now());
   }
   insertWorkItemLabel(workItemId, labelId) {
     if (!this.db.prepare("SELECT 1 FROM labels WHERE id=?").get(labelId)) throw new NotFoundError("Label", labelId);
-    this.db.prepare("INSERT OR IGNORE INTO work_item_labels(work_item_id,label_id,created_at) VALUES (?,?,?)").run(workItemId, labelId, now$1());
+    this.db.prepare("INSERT OR IGNORE INTO work_item_labels(work_item_id,label_id,created_at) VALUES (?,?,?)").run(workItemId, labelId, now());
   }
   listUpdates(projectId, includeDeleted = false) {
     return this.db.prepare(`SELECT * FROM updates WHERE project_id=? ${includeDeleted ? "" : "AND deleted_at IS NULL"} ORDER BY created_at DESC`).all(projectId).map((row) => this.updateFromRow(row));
@@ -11347,7 +20040,7 @@ class SqliteIstraRepository {
     if (!this.getProject(projectId)) throw new NotFoundError("Project", projectId);
     const id2 = randomUUID();
     const revisionId = randomUUID();
-    const timestamp = now$1();
+    const timestamp = now();
     this.db.prepare("INSERT INTO updates(id,project_id,kind,current_revision_id,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, kind, revisionId, timestamp, timestamp);
     this.db.prepare("INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?)").run(revisionId, id2, 1, content, snapshot ? JSON.stringify(snapshot) : null, provenance.source, provenance.client ?? null, timestamp);
     this.replaceSearch("update", id2, projectId, kind, content);
@@ -11360,13 +20053,13 @@ class SqliteIstraRepository {
     if (row.deleted_at) throw new ValidationError("Deleted updates cannot be revised");
     const projectId = String(row.project_id);
     return this.transaction(() => {
-      const result2 = this.db.prepare("UPDATE updates SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now$1(), updateId, input.expectedVersion);
+      const result2 = this.db.prepare("UPDATE updates SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now(), updateId, input.expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Update", updateId);
       const revision = Number(this.db.prepare("SELECT COALESCE(MAX(revision),0)+1 AS revision FROM update_revisions WHERE update_id=?").get(updateId).revision);
       const revisionId = randomUUID();
-      const timestamp = now$1();
+      const timestamp = now();
       const currentRevision = this.db.prepare("SELECT snapshot_json FROM update_revisions WHERE id=?").get(String(row.current_revision_id));
-      this.db.prepare("INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?)").run(revisionId, updateId, revision, input.content, textOrNull$1(currentRevision.snapshot_json), provenance.source, provenance.client ?? null, timestamp);
+      this.db.prepare("INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at) VALUES (?,?,?,?,?,?,?,?)").run(revisionId, updateId, revision, input.content, textOrNull(currentRevision.snapshot_json), provenance.source, provenance.client ?? null, timestamp);
       this.db.prepare("UPDATE updates SET current_revision_id=? WHERE id=?").run(revisionId, updateId);
       this.replaceSearch("update", updateId, projectId, String(row.kind), input.content);
       this.event(projectId, "update", updateId, "update.revised", { revision, content: input.content }, provenance);
@@ -11378,7 +20071,7 @@ class SqliteIstraRepository {
     if (!row) throw new NotFoundError("Update", updateId);
     if (row.kind === "checkpoint" && this.db.prepare("SELECT 1 FROM projects WHERE current_checkpoint_id=?").get(updateId)) throw new ValidationError("The current checkpoint cannot be deleted until another checkpoint is saved");
     return this.transaction(() => {
-      const result2 = this.db.prepare("UPDATE updates SET deleted_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(now$1(), now$1(), updateId, expectedVersion);
+      const result2 = this.db.prepare("UPDATE updates SET deleted_at=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(now(), now(), updateId, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Update", updateId);
       this.db.prepare("DELETE FROM search_index WHERE entity_type=? AND entity_id=?").run("update", updateId);
       this.event(String(row.project_id), "update", updateId, "update.deleted", {}, provenance);
@@ -11400,10 +20093,10 @@ class SqliteIstraRepository {
         blockers,
         activePhaseIds: this.listPhases(projectId).filter((phase) => phase.status === "active").map((phase) => phase.id),
         unresolvedWorkItemIds: this.listWorkItems(projectId).filter((item) => !["resolved", "dropped"].includes(item.status)).map((item) => item.id),
-        capturedAt: now$1()
+        capturedAt: now()
       };
       const checkpoint = this.insertUpdate(projectId, "checkpoint", input.content, snapshot, provenance);
-      const result2 = this.db.prepare("UPDATE projects SET current_focus=?,next_action=?,blockers_json=?,current_checkpoint_id=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(currentFocus, nextAction, JSON.stringify(blockers), checkpoint.id, now$1(), projectId, input.expectedVersion);
+      const result2 = this.db.prepare("UPDATE projects SET current_focus=?,next_action=?,blockers_json=?,current_checkpoint_id=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(currentFocus, nextAction, JSON.stringify(blockers), checkpoint.id, now(), projectId, input.expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Project", projectId);
       this.event(projectId, "project", projectId, "project.checkpoint_selected", { checkpointId: checkpoint.id }, provenance);
       return checkpoint;
@@ -11414,7 +20107,7 @@ class SqliteIstraRepository {
   }
   createLabel(input, provenance) {
     const id2 = randomUUID();
-    const timestamp = now$1();
+    const timestamp = now();
     return this.transaction(() => {
       try {
         this.db.prepare("INSERT INTO labels(id,name,colour,created_at,updated_at) VALUES (?,?,?,?,?)").run(id2, input.name, input.colour ?? null, timestamp, timestamp);
@@ -11434,7 +20127,7 @@ class SqliteIstraRepository {
       if (Number(fresh.version) !== expectedVersion) throw new ConflictError("Work item", workItemId);
       if (!this.db.prepare("SELECT 1 FROM labels WHERE id=?").get(labelId)) throw new NotFoundError("Label", labelId);
       if (this.db.prepare("SELECT 1 FROM work_item_labels WHERE work_item_id=? AND label_id=?").get(workItemId, labelId)) return this.workItemFromRow(fresh);
-      const result2 = this.db.prepare("UPDATE work_items SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now$1(), workItemId, expectedVersion);
+      const result2 = this.db.prepare("UPDATE work_items SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now(), workItemId, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Work item", workItemId);
       this.insertWorkItemLabel(workItemId, labelId);
       this.event(String(row.project_id), "work_item", workItemId, "work_item.label_attached", { labelId }, provenance);
@@ -11448,7 +20141,7 @@ class SqliteIstraRepository {
       const fresh = this.db.prepare("SELECT * FROM work_items WHERE id=?").get(workItemId);
       if (Number(fresh.version) !== expectedVersion) throw new ConflictError("Work item", workItemId);
       if (!this.db.prepare("SELECT 1 FROM work_item_labels WHERE work_item_id=? AND label_id=?").get(workItemId, labelId)) return this.workItemFromRow(fresh);
-      const result2 = this.db.prepare("UPDATE work_items SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now$1(), workItemId, expectedVersion);
+      const result2 = this.db.prepare("UPDATE work_items SET version=version+1,updated_at=? WHERE id=? AND version=?").run(now(), workItemId, expectedVersion);
       if (Number(result2.changes) === 0) throw new ConflictError("Work item", workItemId);
       this.db.prepare("DELETE FROM work_item_labels WHERE work_item_id=? AND label_id=?").run(workItemId, labelId);
       this.event(String(row.project_id), "work_item", workItemId, "work_item.label_detached", { labelId }, provenance);
@@ -11458,15 +20151,15 @@ class SqliteIstraRepository {
   listActivity(projectId, limit2 = 200) {
     return this.db.prepare("SELECT * FROM activity_events WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT ?").all(projectId, Math.min(Math.max(limit2, 1), 1e3)).map((row) => ({
       id: String(row.id),
-      projectId: textOrNull$1(row.project_id),
+      projectId: textOrNull(row.project_id),
       entityType: String(row.entity_type),
       entityId: String(row.entity_id),
       eventType: String(row.event_type),
       payload: parseJson(row.payload_json, {}),
       source: String(row.source),
-      client: textOrNull$1(row.client),
+      client: textOrNull(row.client),
       actor: String(row.actor),
-      idempotencyKey: textOrNull$1(row.idempotency_key),
+      idempotencyKey: textOrNull(row.idempotency_key),
       createdAt: String(row.created_at)
     }));
   }
@@ -11477,15 +20170,15 @@ class SqliteIstraRepository {
     const hasMore = rows.length > boundedLimit;
     const items2 = rows.slice(0, boundedLimit).map((row) => ({
       id: String(row.id),
-      projectId: textOrNull$1(row.project_id),
+      projectId: textOrNull(row.project_id),
       entityType: String(row.entity_type),
       entityId: String(row.entity_id),
       eventType: String(row.event_type),
       payload: parseJson(row.payload_json, {}),
       source: String(row.source),
-      client: textOrNull$1(row.client),
+      client: textOrNull(row.client),
       actor: String(row.actor),
-      idempotencyKey: textOrNull$1(row.idempotency_key),
+      idempotencyKey: textOrNull(row.idempotency_key),
       createdAt: String(row.created_at)
     }));
     return { items: items2, nextCursor: hasMore ? encodeCursor(start + items2.length) : null, hasMore };
@@ -11501,14 +20194,14 @@ class SqliteIstraRepository {
       eventType: String(row.event_type),
       payload: parseJson(row.payload_json, {}),
       source: String(row.source),
-      client: textOrNull$1(row.client),
+      client: textOrNull(row.client),
       actor: String(row.actor),
-      idempotencyKey: textOrNull$1(row.idempotency_key),
+      idempotencyKey: textOrNull(row.idempotency_key),
       createdAt: String(row.created_at)
     }));
   }
-  search(query, limit2 = 50, filters = {}) {
-    const terms = query.trim().split(/\s+/).filter(Boolean).map((term) => `"${term.replaceAll('"', '""')}"*`).join(" ");
+  search(query2, limit2 = 50, filters = {}) {
+    const terms = query2.trim().split(/\s+/).filter(Boolean).map((term) => `"${term.replaceAll('"', '""')}"*`).join(" ");
     if (!terms) return [];
     const clauses = ["search_index MATCH ?"];
     const parameters = [terms];
@@ -11556,8 +20249,10 @@ class SqliteIstraRepository {
   }
   exportAll() {
     const tables = {};
-    for (const [table, columns] of Object.entries(exportTables)) tables[table] = this.db.prepare(`SELECT ${columns.join(",")} FROM ${table}`).all();
-    return { format: "istra-export", formatVersion: 4, exportedAt: now$1(), tables };
+    for (const [table, columns] of Object.entries(exportTables)) {
+      tables[table] = deterministicRows(table, this.db.prepare(`SELECT ${columns.join(",")} FROM ${table}`).all());
+    }
+    return { format: "istra-export", formatVersion: 4, exportedAt: now(), tables };
   }
   validateImport(bundle) {
     const temp = new DatabaseSync(":memory:");
@@ -11602,7 +20297,7 @@ class SqliteIstraRepository {
         const summary = temp.prepare("SELECT passed,failed,skipped,target_count FROM test_summaries WHERE run_id=?").get(String(run.id));
         const violations = validateRunInvariants({
           startedAt: String(run.started_at),
-          endedAt: textOrNull$1(run.ended_at),
+          endedAt: textOrNull(run.ended_at),
           outcome: String(run.outcome),
           exitCode: run.exit_code === null ? null : Number(run.exit_code),
           testSummary: summary ? { passed: Number(summary.passed), failed: Number(summary.failed), skipped: Number(summary.skipped), targetCount: Number(summary.target_count) } : null
@@ -11612,7 +20307,7 @@ class SqliteIstraRepository {
       const invalidEvidence = temp.prepare("SELECT * FROM evidence").all().flatMap((evidence) => {
         const run = evidence.run_id ? temp.prepare("SELECT * FROM runs WHERE id=?").get(String(evidence.run_id)) : void 0;
         const override = temp.prepare("SELECT reason FROM evidence_overrides WHERE evidence_id=?").get(String(evidence.id));
-        const violations = validateEvidenceInvariants({ result: String(evidence.result), runId: textOrNull$1(evidence.run_id) }, {
+        const violations = validateEvidenceInvariants({ result: String(evidence.result), runId: textOrNull(evidence.run_id) }, {
           linkedRun: run ? { id: String(run.id), outcome: String(run.outcome), invariantsValid: String(run.validation_status) === "validated" } : null,
           verifiedOverride: override ? { reason: String(override.reason) } : null
         });
@@ -11671,7 +20366,7 @@ class SqliteIstraRepository {
           continue;
         }
         const validatedReproductionSteps = creation.data.reproductionSteps ?? [];
-        const redactor = redactorFor(textOrNull$1(report.project_id));
+        const redactor = redactorFor(textOrNull(report.project_id));
         const fields = {
           component: report.component,
           summary: report.summary,
@@ -11819,986 +20514,156 @@ class SqliteIstraRepository {
   }
   rebuildSearch() {
     for (const row of this.db.prepare("SELECT * FROM projects").all()) this.replaceSearch("project", String(row.id), String(row.id), String(row.title), [row.description, row.intent, row.completion_criteria].filter(Boolean).join("\n"));
-    for (const row of this.db.prepare("SELECT * FROM phases").all()) this.replaceSearch("phase", String(row.id), String(row.project_id), String(row.name), textOrNull$1(row.description) ?? "");
-    for (const row of this.db.prepare("SELECT * FROM work_items").all()) this.replaceSearch("work_item", String(row.id), String(row.project_id), String(row.title), textOrNull$1(row.description) ?? "");
+    for (const row of this.db.prepare("SELECT * FROM phases").all()) this.replaceSearch("phase", String(row.id), String(row.project_id), String(row.name), textOrNull(row.description) ?? "");
+    for (const row of this.db.prepare("SELECT * FROM work_items").all()) this.replaceSearch("work_item", String(row.id), String(row.project_id), String(row.title), textOrNull(row.description) ?? "");
     const updateRows = this.db.prepare(`SELECT u.id,u.project_id,u.kind,r.content FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id WHERE u.deleted_at IS NULL`).all();
     for (const row of updateRows) this.replaceSearch("update", String(row.id), String(row.project_id), String(row.kind), String(row.content));
   }
 }
-function newestFirst(left, right) {
-  return right.ordinal - left.ordinal;
-}
-function evaluateCriterionProof(input) {
-  const current = input.evidence.filter((entry) => !entry.stale && entry.validationStatus !== "legacy_unvalidated").sort(newestFirst);
-  const decisive = current.find((entry) => entry.result === "verified" || entry.result === "failed");
-  if (decisive?.result === "verified") return { status: "proven", evidenceId: decisive.id, reason: "Latest decisive evidence is verified" };
-  if (decisive?.result === "failed") return { status: "defect", evidenceId: decisive.id, reason: "Latest decisive evidence failed" };
-  const partial2 = current.find((entry) => entry.result === "recorded" || entry.result === "interrupted");
-  if (partial2) return { status: "partial", evidenceId: partial2.id, reason: `Latest current evidence is ${partial2.result}` };
-  return { status: "open", evidenceId: null, reason: "No current validated evidence" };
-}
-function explainRequirementProof(criteria) {
-  const activeRequired = criteria.filter((criterion) => criterion.required && !criterion.archivedAt);
-  const count = (status2) => activeRequired.filter((criterion) => criterion.status === status2).length;
-  const defectiveCriteria = count("defect");
-  const provenCriteria = count("proven");
-  const partialCriteria = count("partial");
-  const openCriteria = count("open");
-  const status = activeRequired.length === 0 ? "open" : defectiveCriteria > 0 ? "defect" : provenCriteria === activeRequired.length ? "proven" : provenCriteria + partialCriteria > 0 ? "partial" : "open";
-  return {
-    status,
-    requiredCriteria: activeRequired.length,
-    provenCriteria,
-    defectiveCriteria,
-    partialCriteria,
-    openCriteria,
-    criteria: criteria.map((criterion) => ({
-      id: criterion.id,
-      title: criterion.title,
-      required: criterion.required,
-      archivedAt: criterion.archivedAt ?? null,
-      proofStatus: criterion.status,
-      proofEvidenceId: criterion.evidenceId,
-      proofReason: criterion.reason
-    }))
-  };
-}
-const now = () => (/* @__PURE__ */ new Date()).toISOString();
-const textOrNull = (value) => value === null || value === void 0 ? null : String(value);
-const bool = (value) => Number(value) === 1;
-const json = (value, fallback) => {
-  try {
-    return value === null || value === void 0 ? fallback : JSON.parse(String(value));
-  } catch {
-    return fallback;
+const StorageBackendSchema = enumType(["sqlite", "postgresql"]);
+const storageFileSchema = objectType({
+  backend: StorageBackendSchema,
+  databaseUrl: stringType().trim().min(1).optional(),
+  poolMax: numberType().int().min(1).max(20).optional()
+}).strict().superRefine((value, context) => {
+  if (value.backend === "postgresql" && !value.databaseUrl) {
+    context.addIssue({ code: ZodIssueCode.custom, path: ["databaseUrl"], message: "databaseUrl is required for PostgreSQL" });
   }
-};
-const stripAnsi = (value) => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-const redactionMetadata = (entries) => ({
-  count: entries.reduce((total, entry) => total + entry.result.count, 0),
-  fields: [...new Set(entries.flatMap((entry) => entry.result.redactions.map((redaction) => `${entry.field}:${redaction.kind}:${redaction.name}`)))]
 });
-class SqliteOperationalRepository {
-  constructor(db) {
-    this.db = db;
+function defaultIstraDataDir(environment = process.env) {
+  if (process.platform === "darwin") return join(homedir(), "Library", "Application Support", "Istra");
+  if (process.platform === "win32") return join(environment.LOCALAPPDATA ?? homedir(), "Istra");
+  return join(environment.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "istra");
+}
+function parseDatabaseUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("ISTRA_DATABASE_URL must be a valid PostgreSQL URL");
   }
-  db;
-  savepointSequence = 0;
-  activeContext = null;
-  transaction(work) {
-    if (this.db.isTransaction) {
-      const savepoint = `operational_${this.savepointSequence++}`;
-      this.db.exec(`SAVEPOINT ${savepoint}`);
-      try {
-        const result2 = work();
-        this.db.exec(`RELEASE ${savepoint}`);
-        return result2;
-      } catch (error) {
-        this.db.exec(`ROLLBACK TO ${savepoint}`);
-        this.db.exec(`RELEASE ${savepoint}`);
-        throw error;
-      }
-    }
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const result2 = work();
-      this.db.exec("COMMIT");
-      return result2;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+  if (!["postgres:", "postgresql:"].includes(parsed.protocol)) {
+    throw new Error("ISTRA_DATABASE_URL must use the postgres or postgresql scheme");
   }
-  runIdempotent(client2, key, operation, payload, work) {
-    return this.runMutation({ source: "system", actor: client2, client: client2, idempotencyKey: key, occurredAt: now() }, operation, payload, work);
+  if (!parsed.hostname || !parsed.pathname || parsed.pathname === "/") {
+    throw new Error("ISTRA_DATABASE_URL must include a host and database name");
   }
-  runMutation(context, operation, payload, work) {
-    const requestHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
-    return this.transaction(() => {
-      const previousContext = this.activeContext;
-      this.activeContext = context;
-      try {
-        const idempotencyClient = context.client ?? context.actor;
-        if (context.idempotencyKey) {
-          const existing = this.db.prepare("SELECT operation,request_hash,result_json FROM idempotency_records WHERE client=? AND idempotency_key=?").get(idempotencyClient, context.idempotencyKey);
-          if (existing) {
-            if (String(existing.operation) !== operation || String(existing.request_hash) !== requestHash) throw new IdempotencyConflictError(context.idempotencyKey);
-            return json(existing.result_json, void 0);
-          }
-        }
-        const result2 = work();
-        if (context.idempotencyKey) this.db.prepare("INSERT INTO idempotency_records(client,idempotency_key,operation,request_hash,result_json,created_at) VALUES (?,?,?,?,?,?)").run(idempotencyClient, context.idempotencyKey, operation, requestHash, JSON.stringify(result2) ?? "null", context.occurredAt);
-        return result2;
-      } finally {
-        this.activeContext = previousContext;
-      }
-    });
+  return value;
+}
+function parsePoolMax(value) {
+  if (value === void 0 || value === "") return void 0;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 20) throw new Error("ISTRA_POSTGRES_POOL_MAX must be an integer between 1 and 20");
+  return parsed;
+}
+async function readStorageFile(configPath) {
+  const document = await readFile(configPath, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (document === null) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(document);
+  } catch {
+    throw new Error(`Istra storage configuration is not valid JSON: ${configPath}`);
   }
-  mutationContext() {
-    return this.activeContext ?? { source: "system", actor: "internal", client: "internal", idempotencyKey: null, occurredAt: now() };
+  const result2 = storageFileSchema.safeParse(parsed);
+  if (!result2.success) throw new Error(`Istra storage configuration is invalid: ${result2.error.issues.map((issue2) => issue2.message).join("; ")}`);
+  return result2.data;
+}
+async function resolveStorageConfig(options = {}) {
+  const environment = options.environment ?? process.env;
+  const dataDir = resolve$1(options.dataDir ?? environment.ISTRA_DATA_DIR ?? defaultIstraDataDir(environment));
+  const configPath = resolve$1(options.configPath ?? environment.ISTRA_CONFIG_PATH ?? join(dataDir, "config.json"));
+  const stored = await readStorageFile(configPath);
+  const explicitBackend = options.backend ?? (options.databaseUrl ? "postgresql" : void 0);
+  const environmentBackend = environment.ISTRA_STORAGE ? StorageBackendSchema.parse(environment.ISTRA_STORAGE) : environment.ISTRA_DATABASE_URL ? "postgresql" : void 0;
+  const backend = explicitBackend ?? environmentBackend ?? stored?.backend ?? "sqlite";
+  const databaseUrl = options.databaseUrl ?? environment.ISTRA_DATABASE_URL ?? stored?.databaseUrl;
+  const poolMax = parsePoolMax(options.poolMax ?? environment.ISTRA_POSTGRES_POOL_MAX ?? stored?.poolMax) ?? 4;
+  if (backend === "postgresql") {
+    if (!databaseUrl) throw new Error("PostgreSQL storage requires ISTRA_DATABASE_URL or databaseUrl in the shared Istra config");
+    return { backend, databaseUrl: parseDatabaseUrl(databaseUrl), poolMax, dataDir, configPath };
   }
-  event(projectId, entityType, entityId, eventType, payload = {}) {
-    const context = this.mutationContext();
-    this.db.prepare("INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(randomUUID(), projectId, entityType, entityId, eventType, JSON.stringify(payload), context.source, context.client ?? null, context.actor, context.idempotencyKey, context.occurredAt);
-    if (projectId) this.db.prepare("UPDATE projects SET last_activity_at=? WHERE id=?").run(context.occurredAt, projectId);
-  }
-  project(projectId) {
-    const row = this.db.prepare("SELECT * FROM projects WHERE id=?").get(projectId);
-    if (!row) throw new NotFoundError("Project", projectId);
-    return row;
-  }
-  listRequirementStates(projectId) {
-    this.project(projectId);
-    return this.db.prepare("SELECT * FROM requirement_states WHERE project_id=? ORDER BY position,created_at").all(projectId).map((row) => ({
-      id: String(row.id),
-      projectId: String(row.project_id),
-      name: String(row.name),
-      semantic: String(row.semantic),
-      position: Number(row.position),
-      colour: textOrNull(row.colour),
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at)
-    }));
-  }
-  createRequirementState(projectId, input) {
-    this.project(projectId);
-    const id2 = randomUUID();
-    const timestamp = now();
-    const position = input.position ?? Number(this.db.prepare("SELECT COALESCE(MAX(position),-1)+1 AS position FROM requirement_states WHERE project_id=?").get(projectId).position);
-    try {
-      this.db.prepare("INSERT INTO requirement_states(id,project_id,name,semantic,position,colour,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(id2, projectId, input.name, input.semantic, position, input.colour ?? null, timestamp, timestamp);
-    } catch (error) {
-      throw new ValidationError(error instanceof Error ? error.message : "Could not create requirement state");
-    }
-    this.event(projectId, "requirement_state", id2, "requirement_state.created", { name: input.name, semantic: input.semantic });
-    return this.listRequirementStates(projectId).find((state) => state.id === id2);
-  }
-  evidenceStaleness(row) {
-    const id2 = String(row.id);
-    const targetVersion = row.target_version === null ? null : Number(row.target_version);
-    const storedStale = bool(row.stale);
-    const storedStaleReason = textOrNull(row.stale_reason);
-    let stale = storedStale;
-    let staleReason = storedStaleReason;
-    if (targetVersion !== null) {
-      const versions = [
-        ...this.db.prepare("SELECT version FROM requirements r JOIN evidence_requirement_links l ON l.requirement_id=r.id WHERE l.evidence_id=?").all(id2),
-        ...this.db.prepare("SELECT version FROM work_items w JOIN evidence_work_links l ON l.work_item_id=w.id WHERE l.evidence_id=?").all(id2),
-        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_update_links l ON l.update_id=u.id WHERE l.evidence_id=?").all(id2),
-        ...this.db.prepare("SELECT version FROM updates u JOIN evidence_checkpoint_links l ON l.checkpoint_id=u.id WHERE l.evidence_id=?").all(id2)
-      ].map((entry) => Number(entry.version));
-      const currentVersion = versions.length ? Math.max(...versions) : targetVersion;
-      const derivedStale = currentVersion > targetVersion;
-      stale = storedStale || derivedStale;
-      staleReason = storedStale ? storedStaleReason ?? "Evidence was explicitly marked stale" : derivedStale ? `Linked entity advanced from version ${targetVersion} to ${currentVersion}` : null;
-    }
-    return { stale, staleReason };
-  }
-  criteria(requirementId) {
-    return this.db.prepare("SELECT * FROM acceptance_criteria WHERE requirement_id=? ORDER BY archived_at IS NOT NULL,position,created_at").all(requirementId).map((row) => {
-      const evidence = this.db.prepare(`SELECT e.*,l.criterion_version
-        FROM evidence_criterion_links l JOIN evidence e ON e.id=l.evidence_id WHERE l.criterion_id=? ORDER BY e.ordinal DESC`).all(String(row.id)).map((entry) => {
-        const effective = this.evidenceStaleness(entry);
-        return {
-          id: String(entry.id),
-          ordinal: Number(entry.ordinal),
-          result: String(entry.result),
-          createdAt: String(entry.created_at),
-          stale: effective.stale || Number(entry.criterion_version) !== Number(row.version),
-          validationStatus: String(entry.validation_status)
-        };
-      });
-      const proof = evaluateCriterionProof({ id: String(row.id), title: String(row.title), required: bool(row.required), evidence });
-      const archivedAt = textOrNull(row.archived_at);
-      return {
-        id: String(row.id),
-        requirementId: String(row.requirement_id),
-        title: String(row.title),
-        description: textOrNull(row.description),
-        position: Number(row.position),
-        required: bool(row.required),
-        version: Number(row.version),
-        archivedAt,
-        proofStatus: proof.status,
-        proofEvidenceId: proof.evidenceId,
-        proofReason: archivedAt ? "Criterion is archived and does not participate in requirement proof" : proof.reason,
-        createdAt: String(row.created_at),
-        updatedAt: String(row.updated_at)
-      };
-    });
-  }
-  requirementFromRow(row) {
-    const id2 = String(row.id);
-    const relatedPhaseIds = this.db.prepare("SELECT phase_id FROM requirement_phase_links WHERE requirement_id=? AND role='related'").all(id2).map((entry) => String(entry.phase_id));
-    const linkedWorkItemIds = this.db.prepare("SELECT work_item_id FROM requirement_work_links WHERE requirement_id=?").all(id2).map((entry) => String(entry.work_item_id));
-    const linkedEvidenceIds = this.db.prepare("SELECT evidence_id FROM evidence_requirement_links WHERE requirement_id=?").all(id2).map((entry) => String(entry.evidence_id));
-    const criteria = this.criteria(id2);
-    const proofExplanation = explainRequirementProof(criteria.map((criterion) => ({
-      id: criterion.id,
-      title: criterion.title,
-      required: criterion.required,
-      archivedAt: criterion.archivedAt,
-      evidence: [],
-      status: criterion.proofStatus,
-      evidenceId: criterion.proofEvidenceId,
-      reason: criterion.proofReason
-    })));
-    const gate = proofExplanation.requiredCriteria === 0 ? "not_configured" : proofExplanation.status === "proven" ? "satisfied" : "unsatisfied";
-    return {
-      id: id2,
-      projectId: String(row.project_id),
-      stableKey: String(row.stable_key),
-      kind: String(row.kind),
-      parentId: textOrNull(row.parent_id),
-      title: String(row.title),
-      description: textOrNull(row.description),
-      stateId: String(row.state_id),
-      responsiblePhaseId: textOrNull(row.responsible_phase_id),
-      version: Number(row.version),
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at),
-      criteria,
-      relatedPhaseIds,
-      linkedWorkItemIds,
-      linkedEvidenceIds,
-      gate,
-      proofStatus: proofExplanation.status,
-      proofExplanation
-    };
-  }
-  listRequirements(projectId) {
-    this.project(projectId);
-    return this.db.prepare("SELECT r.*,s.semantic FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.project_id=? ORDER BY r.stable_key").all(projectId).map((row) => this.requirementFromRow(row));
-  }
-  listRequirementsPage(projectId, limit2, cursor) {
-    return pageOf(this.listRequirements(projectId), limit2, cursor);
-  }
-  getRequirement(id2) {
-    const row = this.db.prepare("SELECT r.*,s.semantic FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.id=?").get(id2);
-    return row ? this.requirementFromRow(row) : null;
-  }
-  assertProjectEntity(table, id2, projectId) {
-    const row = this.db.prepare(`SELECT * FROM ${table} WHERE id=? AND project_id=?`).get(id2, projectId);
-    if (!row) throw new ValidationError(`${table} must belong to the project`);
-    return row;
-  }
-  assertRequirementParent(parentId, projectId, childId) {
-    this.assertProjectEntity("requirements", parentId, projectId);
-    if (parentId === childId) throw new ValidationError("A requirement cannot be its own parent");
-    if (!childId) return;
-    const cycle = this.db.prepare(`WITH RECURSIVE ancestors(id) AS (
-      SELECT parent_id FROM requirements WHERE id=? AND parent_id IS NOT NULL
-      UNION
-      SELECT r.parent_id FROM requirements r JOIN ancestors a ON r.id=a.id WHERE r.parent_id IS NOT NULL
-    ) SELECT 1 FROM ancestors WHERE id=? LIMIT 1`).get(parentId, childId);
-    if (cycle) throw new ValidationError("Requirement parent relationship would create a cycle");
-  }
-  createRequirement(projectId, input) {
-    this.project(projectId);
-    const state = input.stateId ? this.db.prepare("SELECT id FROM requirement_states WHERE id=? AND project_id=?").get(input.stateId, projectId) : this.db.prepare("SELECT id FROM requirement_states WHERE project_id=? AND semantic='open' ORDER BY position LIMIT 1").get(projectId);
-    if (!state) throw new ValidationError("Requirement state does not belong to the project");
-    if (input.parentId) this.assertRequirementParent(input.parentId, projectId);
-    if (input.responsiblePhaseId) this.assertProjectEntity("phases", input.responsiblePhaseId, projectId);
-    if (input.criteria?.some((criterion) => criterion.id)) throw new ValidationError("New requirements cannot reuse existing criterion ids");
-    return this.transaction(() => {
-      const id2 = randomUUID();
-      const timestamp = now();
-      try {
-        this.db.prepare("INSERT INTO requirements(id,project_id,stable_key,kind,parent_id,title,description,state_id,responsible_phase_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id2, projectId, input.stableKey, input.kind, input.parentId ?? null, input.title, input.description ?? null, String(state.id), input.responsiblePhaseId ?? null, timestamp, timestamp);
-      } catch (error) {
-        throw new ValidationError(error instanceof Error ? error.message : "Could not create requirement");
-      }
-      for (const [position, criterion] of (input.criteria ?? []).entries()) this.db.prepare("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(randomUUID(), id2, criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, timestamp, timestamp);
-      for (const phaseId of new Set(input.relatedPhaseIds ?? [])) {
-        this.assertProjectEntity("phases", phaseId, projectId);
-        this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, phaseId, phaseId === input.responsiblePhaseId ? "responsible" : "related", timestamp);
-      }
-      this.event(projectId, "requirement", id2, "requirement.created", { stableKey: input.stableKey, criterionCount: input.criteria?.length ?? 0 });
-      return this.getRequirement(id2);
-    });
-  }
-  updateRequirement(id2, input) {
-    const current = this.getRequirement(id2);
-    if (!current) throw new NotFoundError("Requirement", id2);
-    const parentId = input.parentId === void 0 ? current.parentId : input.parentId;
-    if (parentId) this.assertRequirementParent(parentId, current.projectId, id2);
-    const stateId = input.stateId ?? current.stateId;
-    if (!this.db.prepare("SELECT id FROM requirement_states WHERE id=? AND project_id=?").get(stateId, current.projectId)) throw new ValidationError("Requirement state does not belong to the project");
-    const responsiblePhaseId = input.responsiblePhaseId === void 0 ? current.responsiblePhaseId : input.responsiblePhaseId;
-    if (responsiblePhaseId) this.assertProjectEntity("phases", responsiblePhaseId, current.projectId);
-    const relatedPhaseIds = input.relatedPhaseIds ?? current.relatedPhaseIds;
-    for (const phaseId of new Set(relatedPhaseIds)) this.assertProjectEntity("phases", phaseId, current.projectId);
-    return this.transaction(() => {
-      const next = { ...current, ...input };
-      const result2 = this.db.prepare("UPDATE requirements SET stable_key=?,kind=?,parent_id=?,title=?,description=?,state_id=?,responsible_phase_id=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(next.stableKey, next.kind, parentId ?? null, next.title, next.description ?? null, stateId, responsiblePhaseId ?? null, now(), id2, input.expectedVersion);
-      if (!Number(result2.changes)) throw new ConflictError("Requirement", id2);
-      if (input.relatedPhaseIds !== void 0 || input.responsiblePhaseId !== void 0) {
-        this.db.prepare("DELETE FROM requirement_phase_links WHERE requirement_id=?").run(id2);
-        if (responsiblePhaseId) this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, responsiblePhaseId, "responsible", now());
-        for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== responsiblePhaseId) this.db.prepare("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES (?,?,?,?)").run(id2, phaseId, "related", now());
-      }
-      if (input.criteria !== void 0) {
-        const existing = this.db.prepare("SELECT * FROM acceptance_criteria WHERE requirement_id=?").all(id2);
-        const byId = new Map(existing.map((criterion) => [String(criterion.id), criterion]));
-        const retained = /* @__PURE__ */ new Set();
-        for (const [position, criterion] of input.criteria.entries()) {
-          if (!criterion.id) {
-            const criterionId = randomUUID();
-            const timestamp = now();
-            this.db.prepare("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(criterionId, id2, criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, timestamp, timestamp);
-            this.event(current.projectId, "acceptance_criterion", criterionId, "acceptance_criterion.created", { requirementId: id2 });
-            continue;
-          }
-          const stored = byId.get(criterion.id);
-          if (!stored) throw new ValidationError("Criterion must belong to the requirement being updated");
-          const changed = String(stored.title) !== criterion.title || textOrNull(stored.description) !== (criterion.description ?? null) || bool(stored.required) !== criterion.required || Number(stored.position) !== position || stored.archived_at !== null;
-          const result22 = this.db.prepare(`UPDATE acceptance_criteria SET title=?,description=?,position=?,required=?,archived_at=NULL,version=version+?,updated_at=? WHERE id=? AND requirement_id=? AND version=?`).run(criterion.title, criterion.description ?? null, position, criterion.required ? 1 : 0, changed ? 1 : 0, now(), criterion.id, id2, criterion.expectedVersion);
-          if (!Number(result22.changes)) throw new ConflictError("Acceptance criterion", criterion.id);
-          retained.add(criterion.id);
-          if (changed) this.event(current.projectId, "acceptance_criterion", criterion.id, "acceptance_criterion.updated", { requirementId: id2 });
-        }
-        for (const stored of existing.filter((criterion) => criterion.archived_at === null && !retained.has(String(criterion.id)))) {
-          this.db.prepare("UPDATE acceptance_criteria SET archived_at=?,version=version+1,updated_at=? WHERE id=?").run(now(), now(), String(stored.id));
-          this.event(current.projectId, "acceptance_criterion", String(stored.id), "acceptance_criterion.archived", { requirementId: id2 });
-        }
-      }
-      this.event(current.projectId, "requirement", id2, "requirement.updated", { stableKey: next.stableKey });
-      return this.getRequirement(id2);
-    });
-  }
-  linkRequirementWork(projectId, requirementId, workItemId) {
-    this.assertProjectEntity("requirements", requirementId, projectId);
-    this.assertProjectEntity("work_items", workItemId, projectId);
-    this.db.prepare("INSERT OR IGNORE INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES (?,?,?)").run(requirementId, workItemId, now());
-    this.event(projectId, "requirement", requirementId, "requirement.work_linked", { workItemId });
-  }
-  unlinkRequirementWork(requirementId, workItemId) {
-    const requirement = this.db.prepare("SELECT project_id FROM requirements WHERE id=?").get(requirementId);
-    this.db.prepare("DELETE FROM requirement_work_links WHERE requirement_id=? AND work_item_id=?").run(requirementId, workItemId);
-    if (requirement) this.event(String(requirement.project_id), "requirement", requirementId, "requirement.work_unlinked", { workItemId });
-  }
-  getRequirementRollup(projectId) {
-    const bySemantic = { open: 0, partial: 0, proven: 0, defect: 0 };
-    const rows = this.db.prepare("SELECT s.semantic,COUNT(*) AS count FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE r.project_id=? GROUP BY s.semantic").all(projectId);
-    for (const row of rows) bySemantic[String(row.semantic)] = Number(row.count);
-    const requirements = this.listRequirements(projectId);
-    const byProofStatus = { open: 0, partial: 0, proven: 0, defect: 0 };
-    for (const requirement of requirements) byProofStatus[requirement.proofStatus] += 1;
-    const states = new Map(this.listRequirementStates(projectId).map((state) => [state.id, state.semantic]));
-    const emptyCounts = () => ({ open: 0, partial: 0, proven: 0, defect: 0 });
-    const byCapability = /* @__PURE__ */ new Map();
-    const byGoal = /* @__PURE__ */ new Map();
-    const byMilestone = /* @__PURE__ */ new Map();
-    const addTo = (target, key, name, requirement, stableKey) => {
-      const existing = target.get(key) ?? { id: key, name, ...stableKey ? { stableKey } : {}, counts: emptyCounts(), total: 0 };
-      const semantic = states.get(requirement.stateId) ?? "open";
-      existing.counts[semantic] += 1;
-      existing.total += 1;
-      target.set(key, existing);
-    };
-    const requirementsById = new Map(requirements.map((requirement) => [requirement.id, requirement]));
-    for (const requirement of requirements) {
-      const ancestors = /* @__PURE__ */ new Set();
-      let parentId = requirement.parentId;
-      while (parentId && !ancestors.has(parentId)) {
-        ancestors.add(parentId);
-        const parent = requirementsById.get(parentId);
-        if (!parent) break;
-        if (parent.kind === "capability") addTo(byCapability, parent.id, parent.title, requirement, parent.stableKey);
-        if (parent.kind === "goal") addTo(byGoal, parent.id, parent.title, requirement, parent.stableKey);
-        parentId = parent.parentId;
-      }
-      if (requirement.kind === "capability") addTo(byCapability, requirement.id, requirement.title, requirement, requirement.stableKey);
-      if (requirement.kind === "goal") addTo(byGoal, requirement.id, requirement.title, requirement, requirement.stableKey);
-      const phaseIds = /* @__PURE__ */ new Set([...requirement.responsiblePhaseId ? [requirement.responsiblePhaseId] : [], ...requirement.relatedPhaseIds]);
-      for (const phaseId of phaseIds) {
-        const phase = this.db.prepare("SELECT id,name FROM phases WHERE id=? AND project_id=?").get(phaseId, projectId);
-        if (phase) addTo(byMilestone, String(phase.id), String(phase.name), requirement);
-      }
-    }
-    return {
-      total: requirements.length,
-      bySemantic,
-      byProofStatus,
-      gateFailures: requirements.filter((requirement) => requirement.gate === "unsatisfied").length,
-      defects: byProofStatus.defect,
-      byCapability: [...byCapability.values()].sort((left, right) => left.name.localeCompare(right.name)),
-      byMilestone: [...byMilestone.values()].sort((left, right) => left.name.localeCompare(right.name)),
-      byGoal: [...byGoal.values()].sort((left, right) => left.name.localeCompare(right.name))
-    };
-  }
-  listWorkQueues(projectId) {
-    this.project(projectId);
-    return this.db.prepare("SELECT * FROM work_queues WHERE project_id=? ORDER BY created_at").all(projectId).map((row) => ({ id: String(row.id), projectId: String(row.project_id), name: String(row.name), description: textOrNull(row.description), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }));
-  }
-  createWorkQueue(projectId, input) {
-    this.project(projectId);
-    const id2 = randomUUID();
-    const timestamp = now();
-    try {
-      this.db.prepare("INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, input.name, input.description ?? null, timestamp, timestamp);
-    } catch (error) {
-      throw new ValidationError(error instanceof Error ? error.message : "Could not create work queue");
-    }
-    this.event(projectId, "work_queue", id2, "work_queue.created", { name: input.name });
-    return this.listWorkQueues(projectId).find((queue) => queue.id === id2);
-  }
-  workItemFromRow(row) {
-    const id2 = String(row.id);
-    const labels = this.db.prepare("SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=? ORDER BY l.name COLLATE NOCASE").all(id2).map((label) => ({ id: String(label.id), name: String(label.name), colour: textOrNull(label.colour), version: Number(label.version), createdAt: String(label.created_at), updatedAt: String(label.updated_at) }));
-    const reasons = [];
-    const dependencyRows = this.db.prepare("SELECT wi.title,wr.kind FROM work_relations wr JOIN work_items wi ON ((wr.kind='depends_on' AND wi.id=wr.to_work_item_id) OR (wr.kind='blocks' AND wi.id=wr.from_work_item_id)) WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=?) OR (wr.kind='blocks' AND wr.to_work_item_id=?)) AND wi.status NOT IN ('resolved','dropped')").all(id2, id2);
-    if (dependencyRows.length) reasons.push(...dependencyRows.map((entry) => `${String(entry.kind) === "blocks" ? "Blocked by" : "Depends on"} ${String(entry.title)}`));
-    const external = this.db.prepare("SELECT content FROM external_blockers WHERE work_item_id=? AND resolved_at IS NULL").all(id2);
-    if (external.length) reasons.push(...external.map((entry) => String(entry.content)));
-    return {
-      id: id2,
-      projectId: String(row.project_id),
-      phaseId: textOrNull(row.phase_id),
-      kind: String(row.kind),
-      title: String(row.title),
-      description: textOrNull(row.description),
-      status: String(row.status),
-      priority: textOrNull(row.priority),
-      labels,
-      version: Number(row.version),
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at),
-      stableKey: textOrNull(row.stable_key),
-      parentId: textOrNull(row.parent_id),
-      queueId: textOrNull(row.queue_id),
-      rank: textOrNull(row.rank),
-      effectiveBlocked: reasons.length > 0 || String(row.status) === "blocked",
-      blockerReasons: reasons
-    };
-  }
-  listWorkItems(projectId, queueId) {
-    this.project(projectId);
-    const rows = queueId ? this.db.prepare("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.project_id=? AND wqi.queue_id=? ORDER BY wqi.rank,wqi.work_item_id").all(projectId, queueId) : this.db.prepare("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi LEFT JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.project_id=? ORDER BY COALESCE(wqi.rank,'￿'),wi.updated_at DESC").all(projectId);
-    return rows.map((row) => this.workItemFromRow(row));
-  }
-  listWorkItemsPage(projectId, limit2, cursor, queueId) {
-    return pageOf(this.listWorkItems(projectId, queueId), limit2, cursor);
-  }
-  assertWorkPair(projectId, fromId, toId) {
-    if (fromId === toId) throw new ValidationError("A work item cannot relate to itself");
-    this.assertProjectEntity("work_items", fromId, projectId);
-    this.assertProjectEntity("work_items", toId, projectId);
-  }
-  dependencyWouldCycle(fromId, toId) {
-    const result2 = this.db.prepare(`WITH RECURSIVE dependencies(dependent,dependency) AS (
-      SELECT from_work_item_id,to_work_item_id FROM work_relations WHERE kind='depends_on'
-      UNION ALL
-      SELECT to_work_item_id,from_work_item_id FROM work_relations WHERE kind='blocks'
-    ), reachable(id) AS (
-      SELECT dependency FROM dependencies WHERE dependent=?
-      UNION
-      SELECT d.dependency FROM dependencies d JOIN reachable r ON r.id=d.dependent
-    ) SELECT 1 FROM reachable WHERE id=? LIMIT 1`).get(toId, fromId);
-    return Boolean(result2);
-  }
-  linkWorkItems(projectId, input) {
-    this.assertWorkPair(projectId, input.fromWorkItemId, input.toWorkItemId);
-    if (input.kind === "depends_on" && this.dependencyWouldCycle(input.fromWorkItemId, input.toWorkItemId)) throw new ValidationError("Dependency would create a cycle");
-    if (input.kind === "blocks" && this.dependencyWouldCycle(input.toWorkItemId, input.fromWorkItemId)) throw new ValidationError("Blocking relationship would create a cycle");
-    const id2 = randomUUID();
-    const timestamp = now();
-    try {
-      this.db.prepare("INSERT INTO work_relations(id,project_id,from_work_item_id,to_work_item_id,kind,created_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, input.fromWorkItemId, input.toWorkItemId, input.kind, timestamp);
-    } catch (error) {
-      throw new ValidationError(error instanceof Error ? error.message : "Could not create work relation");
-    }
-    this.event(projectId, "work_relation", id2, "work_relation.created", { ...input });
-    return { id: id2, projectId, fromWorkItemId: input.fromWorkItemId, toWorkItemId: input.toWorkItemId, kind: input.kind, createdAt: timestamp };
-  }
-  unlinkWorkItems(id2) {
-    const relation = this.db.prepare("SELECT * FROM work_relations WHERE id=?").get(id2);
-    this.db.prepare("DELETE FROM work_relations WHERE id=?").run(id2);
-    if (relation) this.event(String(relation.project_id), "work_relation", id2, "work_relation.deleted", { kind: relation.kind });
-  }
-  listWorkRelations(projectId) {
-    return this.db.prepare("SELECT * FROM work_relations WHERE project_id=? ORDER BY created_at,id").all(projectId).map((row) => ({ id: String(row.id), projectId: String(row.project_id), fromWorkItemId: String(row.from_work_item_id), toWorkItemId: String(row.to_work_item_id), kind: String(row.kind), createdAt: String(row.created_at) }));
-  }
-  createExternalBlocker(projectId, input) {
-    this.project(projectId);
-    if (input.workItemId) this.assertProjectEntity("work_items", input.workItemId, projectId);
-    const id2 = randomUUID();
-    const timestamp = now();
-    this.db.prepare("INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, projectId, input.workItemId ?? null, input.content, timestamp, timestamp);
-    this.event(projectId, "external_blocker", id2, "external_blocker.created", { workItemId: input.workItemId ?? null });
-    return { id: id2, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp };
-  }
-  listExternalBlockers(projectId, includeResolved = false) {
-    const rows = (includeResolved ? this.db.prepare("SELECT * FROM external_blockers WHERE project_id=? ORDER BY created_at DESC") : this.db.prepare("SELECT * FROM external_blockers WHERE project_id=? AND resolved_at IS NULL ORDER BY created_at DESC")).all(projectId);
-    return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workItemId: textOrNull(row.work_item_id), content: String(row.content), resolvedAt: textOrNull(row.resolved_at), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }));
-  }
-  resolveExternalBlocker(id2) {
-    const current = this.db.prepare("SELECT * FROM external_blockers WHERE id=?").get(id2);
-    if (!current) throw new NotFoundError("External blocker", id2);
-    const timestamp = now();
-    this.db.prepare("UPDATE external_blockers SET resolved_at=?,updated_at=? WHERE id=?").run(timestamp, timestamp, id2);
-    this.event(String(current.project_id), "external_blocker", id2, "external_blocker.resolved");
-    return { id: id2, projectId: String(current.project_id), workItemId: textOrNull(current.work_item_id), content: String(current.content), resolvedAt: timestamp, createdAt: String(current.created_at), updatedAt: timestamp };
-  }
-  createWorkspace(input) {
-    const id2 = randomUUID();
-    const timestamp = now();
-    const root = resolve$1(input.canonicalRoot);
-    const aliases = [...new Set((input.aliases ?? []).map((entry) => resolve$1(entry)))];
-    return this.transaction(() => {
-      try {
-        this.db.prepare("INSERT INTO workspaces(id,name,canonical_root,remote,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id2, input.name, root, input.remote ?? null, timestamp, timestamp);
-      } catch (error) {
-        throw new ValidationError(error instanceof Error ? error.message : "Could not create workspace");
-      }
-      for (const alias of aliases) this.db.prepare("INSERT INTO workspace_aliases(workspace_id,alias,created_at) VALUES (?,?,?)").run(id2, alias, timestamp);
-      this.event(null, "workspace", id2, "workspace.created", { name: input.name, canonicalRoot: root });
-      return { id: id2, name: input.name, canonicalRoot: root, aliases, remote: input.remote ?? null, createdAt: timestamp, updatedAt: timestamp };
-    });
-  }
-  linkProjectWorkspace(projectId, workspaceId) {
-    this.project(projectId);
-    if (!this.db.prepare("SELECT id FROM workspaces WHERE id=?").get(workspaceId)) throw new NotFoundError("Workspace", workspaceId);
-    this.db.prepare("INSERT OR IGNORE INTO project_workspaces(project_id,workspace_id,created_at) VALUES (?,?,?)").run(projectId, workspaceId, now());
-    this.event(projectId, "workspace", workspaceId, "workspace.linked", { projectId });
-  }
-  createWorkspaceRevision(input) {
-    if (!this.db.prepare("SELECT id FROM workspaces WHERE id=?").get(input.workspaceId)) throw new NotFoundError("Workspace", input.workspaceId);
-    const id2 = randomUUID();
-    const capturedAt = now();
-    this.db.prepare('INSERT INTO workspace_revisions(id,workspace_id,branch,"commit",dirty,diff_hash,captured_at) VALUES (?,?,?,?,?,?,?)').run(id2, input.workspaceId, input.branch ?? null, input.commit ?? null, input.dirty ? 1 : 0, input.diffHash ?? null, capturedAt);
-    const projects = this.db.prepare("SELECT project_id FROM project_workspaces WHERE workspace_id=?").all(input.workspaceId);
-    if (projects.length) for (const project of projects) this.event(String(project.project_id), "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
-    else this.event(null, "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
-    return { id: id2, workspaceId: input.workspaceId, branch: input.branch ?? null, commit: input.commit ?? null, dirty: input.dirty, diffHash: input.diffHash ?? null, capturedAt };
-  }
-  resolveProject(workspacePath) {
-    const target = resolve$1(workspacePath);
-    const rows = this.db.prepare(`SELECT p.* FROM projects p JOIN project_workspaces pw ON pw.project_id=p.id JOIN workspaces w ON w.id=pw.workspace_id WHERE w.canonical_root=? OR EXISTS (SELECT 1 FROM workspace_aliases wa WHERE wa.workspace_id=w.id AND wa.alias=?)`).all(target, target);
-    const enclosing = this.db.prepare(`SELECT p.*,w.canonical_root FROM projects p JOIN project_workspaces pw ON pw.project_id=p.id JOIN workspaces w ON w.id=pw.workspace_id WHERE ?=w.canonical_root OR ? LIKE w.canonical_root || '/%' ORDER BY length(w.canonical_root) DESC`).all(target, target);
-    const selected = enclosing.length ? enclosing.filter((row, index, all) => index === 0 || String(row.canonical_root).length === String(all[0]?.canonical_root).length) : rows;
-    return selected.map((row) => ({ id: String(row.id), title: String(row.title), description: textOrNull(row.description), intent: textOrNull(row.intent), deadline: textOrNull(row.deadline), completionCriteria: textOrNull(row.completion_criteria), state: String(row.state), currentFocus: textOrNull(row.current_focus), nextAction: textOrNull(row.next_action), blockers: json(row.blockers_json, []), currentCheckpointId: textOrNull(row.current_checkpoint_id), archivedAt: textOrNull(row.archived_at), version: Number(row.version), createdAt: String(row.created_at), updatedAt: String(row.updated_at), lastActivityAt: String(row.last_activity_at) }));
-  }
-  secretRedactor(projectId) {
-    const secretNames = projectId ? this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name)) : [];
-    return new SecretRedactor({ secretNames });
-  }
-  errorReportFromRow(row) {
-    return {
-      id: String(row.id),
-      kind: String(row.kind),
-      component: String(row.component),
-      summary: String(row.summary),
-      observation: String(row.observation),
-      expectedBehaviour: textOrNull(row.expected_behaviour),
-      actualBehaviour: textOrNull(row.actual_behaviour),
-      reproductionSteps: json(row.reproduction_steps_json, []),
-      impact: textOrNull(row.impact),
-      projectId: textOrNull(row.project_id),
-      workspacePath: textOrNull(row.workspace_path),
-      status: String(row.status),
-      triageNote: textOrNull(row.triage_note),
-      source: String(row.source),
-      client: textOrNull(row.client),
-      actor: String(row.actor),
-      redaction: json(row.redaction_json, { count: 0, fields: [] }),
-      version: Number(row.version),
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at)
-    };
-  }
-  createErrorReport(input) {
-    if (input.projectId) this.project(input.projectId);
-    const id2 = randomUUID();
-    const timestamp = now();
-    const context = this.mutationContext();
-    const redactor = this.secretRedactor(input.projectId);
-    const component = redactor.redact(input.component);
-    const summary = redactor.redact(input.summary);
-    const observation = redactor.redact(input.observation);
-    const expectedBehaviour = input.expectedBehaviour ? redactor.redact(input.expectedBehaviour) : null;
-    const actualBehaviour = input.actualBehaviour ? redactor.redact(input.actualBehaviour) : null;
-    const reproductionSteps = (input.reproductionSteps ?? []).map((step) => redactor.redact(step));
-    const impact = input.impact ? redactor.redact(input.impact) : null;
-    const workspacePath = input.workspacePath ? redactor.redact(input.workspacePath) : null;
-    const redaction = redactionMetadata([
-      { field: "component", result: component },
-      { field: "summary", result: summary },
-      { field: "observation", result: observation },
-      ...expectedBehaviour ? [{ field: "expectedBehaviour", result: expectedBehaviour }] : [],
-      ...actualBehaviour ? [{ field: "actualBehaviour", result: actualBehaviour }] : [],
-      ...reproductionSteps.map((result2, index) => ({ field: `reproductionSteps.${index}`, result: result2 })),
-      ...impact ? [{ field: "impact", result: impact }] : [],
-      ...workspacePath ? [{ field: "workspacePath", result: workspacePath }] : []
-    ]);
-    return this.transaction(() => {
-      this.db.prepare("INSERT INTO error_reports(id,kind,component,summary,observation,expected_behaviour,actual_behaviour,reproduction_steps_json,impact,project_id,workspace_path,status,triage_note,source,client,actor,redaction_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, input.kind, component.value, summary.value, observation.value, expectedBehaviour?.value ?? null, actualBehaviour?.value ?? null, JSON.stringify(reproductionSteps.map((result2) => result2.value)), impact?.value ?? null, input.projectId ?? null, workspacePath?.value ?? null, "open", null, context.source, context.client ?? null, context.actor, JSON.stringify(redaction), timestamp, timestamp);
-      this.event(null, "error_report", id2, "error_report.created", { kind: input.kind, component: component.value, redactionCount: redaction.count });
-      return this.errorReportFromRow(this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2));
-    });
-  }
-  listErrorReportsPage(limit2, cursor, statuses, kinds, component) {
-    const selectedStatuses = statuses ?? ["open", "acknowledged"];
-    const clauses = [];
-    const parameters = [];
-    clauses.push(`status IN (${selectedStatuses.map(() => "?").join(",")})`);
-    parameters.push(...selectedStatuses);
-    if (kinds?.length) {
-      clauses.push(`kind IN (${kinds.map(() => "?").join(",")})`);
-      parameters.push(...kinds);
-    }
-    if (component) {
-      clauses.push("component=?");
-      parameters.push(component);
-    }
-    const rows = this.db.prepare(`SELECT * FROM error_reports WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC,id DESC`).all(...parameters);
-    return pageOf(rows.map((row) => this.errorReportFromRow(row)), limit2, cursor);
-  }
-  getErrorReport(id2) {
-    const row = this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2);
-    if (!row) return null;
-    const history = this.db.prepare("SELECT * FROM activity_events WHERE entity_type='error_report' AND entity_id=? ORDER BY created_at DESC,id DESC").all(id2).map((event) => ({
-      id: String(event.id),
-      projectId: textOrNull(event.project_id),
-      entityType: String(event.entity_type),
-      entityId: String(event.entity_id),
-      eventType: String(event.event_type),
-      payload: json(event.payload_json, {}),
-      source: String(event.source),
-      client: textOrNull(event.client),
-      actor: String(event.actor),
-      idempotencyKey: textOrNull(event.idempotency_key),
-      createdAt: String(event.created_at)
-    }));
-    return { report: this.errorReportFromRow(row), history };
-  }
-  updateErrorReport(id2, input) {
-    const row = this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2);
-    if (!row) throw new NotFoundError("Error report", id2);
-    const current = this.errorReportFromRow(row);
-    const redactor = this.secretRedactor(current.projectId);
-    const triageNote = input.triageNote === void 0 ? void 0 : input.triageNote === null ? null : redactor.redact(input.triageNote);
-    const redaction = triageNote && triageNote !== null ? { count: current.redaction.count + triageNote.count, fields: [.../* @__PURE__ */ new Set([...current.redaction.fields, ...redactionMetadata([{ field: "triageNote", result: triageNote }]).fields])] } : current.redaction;
-    return this.transaction(() => {
-      const result2 = this.db.prepare("UPDATE error_reports SET status=?,triage_note=?,redaction_json=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(input.status, triageNote === void 0 ? current.triageNote : triageNote?.value ?? null, JSON.stringify(redaction), now(), id2, input.expectedVersion);
-      if (!Number(result2.changes)) throw new ConflictError("Error report", id2);
-      this.event(null, "error_report", id2, "error_report.status_updated", { from: current.status, to: input.status, triageNoteUpdated: triageNote !== void 0, redactionCount: redaction.count });
-      return this.errorReportFromRow(this.db.prepare("SELECT * FROM error_reports WHERE id=?").get(id2));
-    });
-  }
-  createRun(projectId, input) {
-    this.project(projectId);
-    if (input.workspaceRevisionId && !this.db.prepare("SELECT wr.id FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id WHERE wr.id=? AND pw.project_id=?").get(input.workspaceRevisionId, projectId)) throw new ValidationError("Workspace revision does not belong to the project");
-    const id2 = randomUUID();
-    const createdAt = now();
-    const startedAt = input.startedAt ?? createdAt;
-    const endedAt = input.endedAt ?? null;
-    const violations = validateRunInvariants({ ...input, startedAt, endedAt });
-    if (violations.length) throw new ValidationError("Run violates authoritative ledger invariants", { violations });
-    const durationMs = endedAt ? new Date(endedAt).getTime() - new Date(startedAt).getTime() : null;
-    const redactor = this.secretRedactor(projectId);
-    const commandResult = redactor.redact(stripAnsi(input.command));
-    const workingDirectoryResult = input.workingDirectory ? redactor.redact(input.workingDirectory) : null;
-    const stdoutResult = input.stdoutExcerpt ? redactor.redact(stripAnsi(input.stdoutExcerpt).slice(0, 32768)) : null;
-    const stderrResult = input.stderrExcerpt ? redactor.redact(stripAnsi(input.stderrExcerpt).slice(0, 32768)) : null;
-    const toolchainResults = Object.entries(input.toolchain ?? {}).map(([name, value]) => ({ name, result: redactor.redact(value) }));
-    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
-    const redactionEntries = [
-      { field: "command", result: commandResult },
-      ...workingDirectoryResult ? [{ field: "workingDirectory", result: workingDirectoryResult }] : [],
-      ...stdoutResult ? [{ field: "stdoutExcerpt", result: stdoutResult }] : [],
-      ...stderrResult ? [{ field: "stderrExcerpt", result: stderrResult }] : [],
-      ...toolchainResults.map(({ name, result: result2 }) => ({ field: `toolchain.${name}`, result: result2 })),
-      ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))
-    ];
-    const redaction = redactionMetadata(redactionEntries);
-    const toolchain = Object.fromEntries(toolchainResults.map(({ name, result: result2 }) => [name, result2.value]));
-    return this.transaction(() => {
-      this.db.prepare("INSERT INTO runs(id,project_id,workspace_revision_id,command,working_directory,started_at,ended_at,duration_ms,outcome,exit_code,toolchain_json,stdout_excerpt,stderr_excerpt,stdout_truncated,stderr_truncated,validation_status,redaction_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id2, projectId, input.workspaceRevisionId ?? null, commandResult.value, workingDirectoryResult?.value ?? null, startedAt, endedAt, durationMs, input.outcome, input.exitCode ?? null, JSON.stringify(toolchain), stdoutResult?.value ?? null, stderrResult?.value ?? null, input.stdoutTruncated ? 1 : 0, input.stderrTruncated ? 1 : 0, "validated", JSON.stringify(redaction), createdAt);
-      let testSummary = null;
-      if (input.testSummary) {
-        const summaryId = randomUUID();
-        this.db.prepare("INSERT INTO test_summaries(id,run_id,scope,passed,failed,skipped,target_count,created_at) VALUES (?,?,?,?,?,?,?,?)").run(summaryId, id2, input.testSummary.scope, input.testSummary.passed, input.testSummary.failed, input.testSummary.skipped, input.testSummary.targetCount, createdAt);
-        testSummary = { id: summaryId, runId: id2, ...input.testSummary, createdAt };
-      }
-      const artifacts = artifactResults.map(({ artifact, result: result2 }) => {
-        const artifactId = randomUUID();
-        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, id2, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, createdAt);
-        return { id: artifactId, runId: id2, uri: result2.value, mediaType: artifact.mediaType ?? null, byteCount: artifact.byteCount ?? null, digest: artifact.digest ?? null, createdAt };
-      });
-      const run = { id: id2, projectId, workspaceRevisionId: input.workspaceRevisionId ?? null, command: commandResult.value, workingDirectory: workingDirectoryResult?.value ?? null, startedAt, endedAt, durationMs, outcome: input.outcome, exitCode: input.exitCode ?? null, toolchain, stdoutExcerpt: stdoutResult?.value ?? null, stderrExcerpt: stderrResult?.value ?? null, stdoutTruncated: Boolean(input.stdoutTruncated), stderrTruncated: Boolean(input.stderrTruncated), artifacts, validationStatus: "validated", redaction, createdAt };
-      this.event(projectId, "run", id2, "run.created", { outcome: input.outcome, redactionCount: redaction.count });
-      return { run, testSummary, artifacts };
-    });
-  }
-  artifactsForRun(runId) {
-    return this.db.prepare("SELECT * FROM artifact_references WHERE run_id=? ORDER BY created_at,id").all(runId).map((row) => ({ id: String(row.id), runId: textOrNull(row.run_id), uri: String(row.uri), mediaType: textOrNull(row.media_type), byteCount: row.byte_count === null ? null : Number(row.byte_count), digest: textOrNull(row.digest), createdAt: String(row.created_at) }));
-  }
-  listRuns(projectId) {
-    const rows = this.db.prepare("SELECT * FROM runs WHERE project_id=? ORDER BY started_at DESC,id DESC").all(projectId);
-    return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workspaceRevisionId: textOrNull(row.workspace_revision_id), command: String(row.command), workingDirectory: textOrNull(row.working_directory), startedAt: String(row.started_at), endedAt: textOrNull(row.ended_at), durationMs: row.duration_ms === null ? null : Number(row.duration_ms), outcome: String(row.outcome), exitCode: row.exit_code === null ? null : Number(row.exit_code), toolchain: json(row.toolchain_json, {}), stdoutExcerpt: textOrNull(row.stdout_excerpt), stderrExcerpt: textOrNull(row.stderr_excerpt), stdoutTruncated: bool(row.stdout_truncated), stderrTruncated: bool(row.stderr_truncated), artifacts: this.artifactsForRun(String(row.id)), validationStatus: String(row.validation_status), redaction: json(row.redaction_json, { count: 0, fields: [] }), createdAt: String(row.created_at) }));
-  }
-  listRunsPage(projectId, limit2, cursor) {
-    return pageOf(this.listRuns(projectId), limit2, cursor);
-  }
-  createEvidence(projectId, input) {
-    this.project(projectId);
-    const id2 = randomUUID();
-    const timestamp = now();
-    const requirementIds = new Set(input.requirementIds ?? []);
-    for (const requirementId of requirementIds) this.assertProjectEntity("requirements", requirementId, projectId);
-    const criteria = (input.criterionIds ?? []).map((criterionId) => {
-      const row = this.db.prepare(`SELECT c.*,r.project_id FROM acceptance_criteria c JOIN requirements r ON r.id=c.requirement_id WHERE c.id=? AND r.project_id=? AND c.archived_at IS NULL`).get(criterionId, projectId);
-      if (!row) throw new ValidationError("Criterion must be active and belong to the project");
-      requirementIds.add(String(row.requirement_id));
-      return row;
-    });
-    for (const workItemId of input.workItemIds ?? []) this.assertProjectEntity("work_items", workItemId, projectId);
-    for (const updateId of [...input.updateIds ?? [], ...input.checkpointIds ?? []]) this.assertProjectEntity("updates", updateId, projectId);
-    const linkedRun = input.runId ? this.db.prepare("SELECT * FROM runs WHERE id=? AND project_id=?").get(input.runId, projectId) : void 0;
-    if (input.runId && !linkedRun) throw new ValidationError("Run does not belong to the project");
-    const context = this.mutationContext();
-    if (input.override && context.source === "mcp") throw new ValidationError("Verification overrides are unavailable through MCP");
-    const evidenceViolations = (() => {
-      try {
-        assertEvidenceInvariants({ result: input.result, runId: input.runId }, {
-          linkedRun: linkedRun ? { id: String(linkedRun.id), outcome: String(linkedRun.outcome), invariantsValid: String(linkedRun.validation_status) === "validated" } : null,
-          verifiedOverride: input.override
-        });
-        return [];
-      } catch (error) {
-        return error instanceof Error && "violations" in error ? error.violations : [String(error)];
-      }
-    })();
-    if (evidenceViolations.length) throw new ValidationError("Evidence violates authoritative ledger invariants", { violations: evidenceViolations });
-    const redactor = this.secretRedactor(projectId);
-    const summaryResult = redactor.redact(input.summary);
-    const artifactResults = (input.artifacts ?? []).map((artifact) => ({ artifact, result: redactor.redact(artifact.uri) }));
-    const redaction = redactionMetadata([{ field: "summary", result: summaryResult }, ...artifactResults.map(({ result: result2 }, index) => ({ field: `artifacts.${index}.uri`, result: result2 }))]);
-    const validationStatus = input.override ? "overridden" : "validated";
-    return this.transaction(() => {
-      const ordinal = Number(this.db.prepare("SELECT COALESCE(MAX(ordinal),0)+1 AS ordinal FROM evidence").get().ordinal);
-      this.db.prepare("INSERT INTO evidence(id,ordinal,project_id,run_id,result,summary,target_version,validation_status,redaction_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id2, ordinal, projectId, input.runId ?? null, input.result, summaryResult.value, input.targetVersion ?? null, validationStatus, JSON.stringify(redaction), timestamp, timestamp);
-      for (const requirementId of requirementIds) this.db.prepare("INSERT INTO evidence_requirement_links(evidence_id,requirement_id) VALUES (?,?)").run(id2, requirementId);
-      for (const criterion of criteria) this.db.prepare("INSERT INTO evidence_criterion_links(evidence_id,criterion_id,criterion_version,created_at) VALUES (?,?,?,?)").run(id2, String(criterion.id), Number(criterion.version), timestamp);
-      for (const workItemId of new Set(input.workItemIds ?? [])) this.db.prepare("INSERT INTO evidence_work_links(evidence_id,work_item_id) VALUES (?,?)").run(id2, workItemId);
-      for (const updateId of new Set(input.updateIds ?? [])) this.db.prepare("INSERT INTO evidence_update_links(evidence_id,update_id) VALUES (?,?)").run(id2, updateId);
-      for (const checkpointId of new Set(input.checkpointIds ?? [])) this.db.prepare("INSERT INTO evidence_checkpoint_links(evidence_id,checkpoint_id) VALUES (?,?)").run(id2, checkpointId);
-      for (const { artifact, result: result2 } of artifactResults) {
-        const artifactId = randomUUID();
-        this.db.prepare("INSERT INTO artifact_references(id,run_id,uri,media_type,byte_count,digest,created_at) VALUES (?,?,?,?,?,?,?)").run(artifactId, input.runId ?? null, result2.value, artifact.mediaType ?? null, artifact.byteCount ?? null, artifact.digest ?? null, timestamp);
-        this.db.prepare("INSERT INTO evidence_artifact_links(evidence_id,artifact_id) VALUES (?,?)").run(id2, artifactId);
-      }
-      if (input.override) this.db.prepare("INSERT INTO evidence_overrides(evidence_id,reason,actor,source,client,created_at) VALUES (?,?,?,?,?,?)").run(id2, input.override.reason, context.actor, context.source, context.client ?? null, timestamp);
-      this.event(projectId, "evidence", id2, "evidence.created", { result: input.result, criterionIds: criteria.map((criterion) => criterion.id), overridden: Boolean(input.override), redactionCount: redaction.count });
-      return this.evidenceFromRow(this.db.prepare("SELECT * FROM evidence WHERE id=?").get(id2));
-    });
-  }
-  artifactsForEvidence(evidenceId) {
-    return this.db.prepare("SELECT a.* FROM artifact_references a JOIN evidence_artifact_links l ON l.artifact_id=a.id WHERE l.evidence_id=? ORDER BY a.created_at,a.id").all(evidenceId).map((row) => ({
-      id: String(row.id),
-      runId: textOrNull(row.run_id),
-      uri: String(row.uri),
-      mediaType: textOrNull(row.media_type),
-      byteCount: row.byte_count === null ? null : Number(row.byte_count),
-      digest: textOrNull(row.digest),
-      createdAt: String(row.created_at)
-    }));
-  }
-  evidenceFromRow(row) {
-    const id2 = String(row.id);
-    const targetVersion = row.target_version === null ? null : Number(row.target_version);
-    const { stale, staleReason } = this.evidenceStaleness(row);
-    const criterionLinks = this.db.prepare(`SELECT l.criterion_id,l.criterion_version,c.version FROM evidence_criterion_links l JOIN acceptance_criteria c ON c.id=l.criterion_id WHERE l.evidence_id=? ORDER BY l.criterion_id`).all(id2).map((entry) => ({
-      criterionId: String(entry.criterion_id),
-      criterionVersion: Number(entry.criterion_version),
-      stale: Number(entry.criterion_version) !== Number(entry.version)
-    }));
-    const override = this.db.prepare("SELECT * FROM evidence_overrides WHERE evidence_id=?").get(id2);
-    return {
-      id: id2,
-      ordinal: Number(row.ordinal),
-      projectId: String(row.project_id),
-      runId: textOrNull(row.run_id),
-      result: String(row.result),
-      summary: String(row.summary),
-      targetVersion,
-      stale,
-      staleReason,
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at),
-      requirementIds: this.db.prepare("SELECT requirement_id FROM evidence_requirement_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.requirement_id)),
-      workItemIds: this.db.prepare("SELECT work_item_id FROM evidence_work_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.work_item_id)),
-      updateIds: this.db.prepare("SELECT update_id FROM evidence_update_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.update_id)),
-      checkpointIds: this.db.prepare("SELECT checkpoint_id FROM evidence_checkpoint_links WHERE evidence_id=?").all(id2).map((entry) => String(entry.checkpoint_id)),
-      artifacts: this.artifactsForEvidence(id2),
-      criterionLinks,
-      validationStatus: String(row.validation_status),
-      redaction: json(row.redaction_json, { count: 0, fields: [] }),
-      override: override ? { reason: String(override.reason), actor: String(override.actor), source: String(override.source), client: textOrNull(override.client), createdAt: String(override.created_at) } : null
-    };
-  }
-  listEvidence(projectId, includeStale = false) {
-    this.project(projectId);
-    const evidence = this.db.prepare("SELECT * FROM evidence WHERE project_id=? ORDER BY ordinal DESC").all(projectId).map((row) => this.evidenceFromRow(row));
-    return includeStale ? evidence : evidence.filter((entry) => !entry.stale);
-  }
-  listEvidencePage(projectId, limit2, cursor, includeStale = false) {
-    return pageOf(this.listEvidence(projectId, includeStale), limit2, cursor);
-  }
-  captureCheckpointSnapshot(projectId, checkpointId) {
-    this.project(projectId);
-    if (!this.db.prepare("SELECT id FROM updates WHERE id=? AND project_id=? AND kind='checkpoint'").get(checkpointId, projectId)) throw new ValidationError("Checkpoint does not belong to the project");
-    const existing = this.getCheckpointSnapshot(checkpointId);
-    if (existing) return existing;
-    const project = this.project(projectId);
-    const phases = this.db.prepare("SELECT * FROM phases WHERE project_id=? ORDER BY position,id").all(projectId);
-    const requirementStates = this.listRequirementStates(projectId);
-    const requirements = this.listRequirements(projectId);
-    const workItems = this.listWorkItems(projectId);
-    const queues = this.listWorkQueues(projectId);
-    const relations = this.listWorkRelations(projectId);
-    const blockers = this.listExternalBlockers(projectId, true);
-    const workspaces = this.db.prepare("SELECT w.*,pw.project_id FROM workspaces w JOIN project_workspaces pw ON pw.workspace_id=w.id WHERE pw.project_id=? ORDER BY w.canonical_root,w.id").all(projectId).map((workspace) => ({
-      ...workspace,
-      aliases: this.db.prepare("SELECT alias FROM workspace_aliases WHERE workspace_id=? ORDER BY alias").all(String(workspace.id)).map((alias) => String(alias.alias))
-    }));
-    const workspaceRevisions = this.db.prepare(`SELECT wr.* FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id
-      WHERE pw.project_id=? ORDER BY wr.captured_at,wr.id`).all(projectId);
-    const runs = this.listRuns(projectId);
-    const testSummaries = this.db.prepare(`SELECT ts.* FROM test_summaries ts JOIN runs r ON r.id=ts.run_id
-      WHERE r.project_id=? ORDER BY r.started_at,r.id`).all(projectId);
-    const evidence = this.listEvidence(projectId, true);
-    const updates = this.db.prepare("SELECT * FROM updates WHERE project_id=? ORDER BY created_at,id").all(projectId);
-    const updateRevisions = this.db.prepare(`SELECT ur.* FROM update_revisions ur JOIN updates u ON u.id=ur.update_id
-      WHERE u.project_id=? ORDER BY u.created_at,u.id,ur.revision`).all(projectId);
-    const labels = this.db.prepare(`SELECT DISTINCT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id JOIN work_items wi ON wi.id=wil.work_item_id
-      WHERE wi.project_id=? ORDER BY l.name COLLATE NOCASE,l.id`).all(projectId);
-    const links = {
-      requirementAliases: this.db.prepare(`SELECT a.* FROM requirement_key_aliases a JOIN requirements r ON r.id=a.requirement_id WHERE r.project_id=? ORDER BY a.requirement_id,a.alias`).all(projectId),
-      requirementPhases: this.db.prepare(`SELECT l.* FROM requirement_phase_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=? ORDER BY l.requirement_id,l.phase_id`).all(projectId),
-      requirementWork: this.db.prepare(`SELECT l.* FROM requirement_work_links l JOIN requirements r ON r.id=l.requirement_id WHERE r.project_id=? ORDER BY l.requirement_id,l.work_item_id`).all(projectId),
-      workPhases: this.db.prepare(`SELECT l.* FROM work_phase_links l JOIN work_items w ON w.id=l.work_item_id WHERE w.project_id=? ORDER BY l.work_item_id,l.phase_id`).all(projectId)
-    };
-    const projectSecretNames = this.db.prepare("SELECT name FROM project_secret_names WHERE project_id=? ORDER BY name").all(projectId).map((row) => String(row.name));
-    const document = canonicaliseJson({
-      project,
-      phases,
-      requirementStates,
-      requirements,
-      workItems,
-      queues,
-      relations,
-      blockers,
-      workspaces,
-      workspaceRevisions,
-      runs,
-      testSummaries,
-      evidence,
-      updates,
-      updateRevisions,
-      labels,
-      links,
-      projectSecretNames,
-      evidenceHeads: evidence.map((entry) => ({ id: entry.id, ordinal: entry.ordinal, result: entry.result, stale: entry.stale, updatedAt: entry.updatedAt }))
-    });
-    const encoded = canonicalJson(document);
-    const digest = createHash("sha256").update(encoded).digest("hex");
-    const id2 = randomUUID();
-    const capturedAt = now();
-    try {
-      this.db.prepare("INSERT INTO checkpoint_snapshots(id,checkpoint_id,schema_version,captured_at,document_json,digest) VALUES (?,?,?,?,?,?)").run(id2, checkpointId, 3, capturedAt, encoded, digest);
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("UNIQUE")) return this.getCheckpointSnapshot(checkpointId);
-      throw error;
-    }
-    this.event(projectId, "checkpoint_snapshot", id2, "checkpoint_snapshot.captured", { checkpointId, digest });
-    return { id: id2, checkpointId, schemaVersion: 3, capturedAt, document, digest };
-  }
-  getCheckpointSnapshot(checkpointId) {
-    const row = this.db.prepare("SELECT * FROM checkpoint_snapshots WHERE checkpoint_id=?").get(checkpointId);
-    if (!row) return null;
-    return { id: String(row.id), checkpointId: String(row.checkpoint_id), schemaVersion: 3, capturedAt: String(row.captured_at), document: json(row.document_json, {}), digest: String(row.digest) };
-  }
-  compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) {
-    const comparable = (checkpointId) => {
-      const structured = this.getCheckpointSnapshot(checkpointId);
-      if (structured) return { document: structured.document, digest: structured.digest, legacy: false };
-      const row = this.db.prepare(`SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id
-        WHERE u.id=? AND u.kind='checkpoint' AND u.deleted_at IS NULL`).get(checkpointId);
-      if (!row) return null;
-      const document = json(row.snapshot_json, null);
-      if (!document) return null;
-      return { document, digest: createHash("sha256").update(canonicalJson(document)).digest("hex"), legacy: true };
-    };
-    const left = comparable(leftCheckpointId);
-    const right = comparable(rightCheckpointId);
-    if (!left || !right) throw new NotFoundError("Checkpoint snapshot", !left ? leftCheckpointId : rightCheckpointId);
-    const sections = /* @__PURE__ */ new Set([...Object.keys(left.document), ...Object.keys(right.document)]);
-    const changedSections = [...sections].filter((section) => JSON.stringify(left.document[section]) !== JSON.stringify(right.document[section])).sort();
-    return { leftCheckpointId, rightCheckpointId, same: changedSections.length === 0, changedSections, leftDigest: left.digest, rightDigest: right.digest, leftLegacy: left.legacy, rightLegacy: right.legacy };
-  }
-  reconstructCheckpointState(checkpointId) {
-    const structured = this.getCheckpointSnapshot(checkpointId);
-    if (structured) return { ...structured.document, _snapshot: { legacy: false, schemaVersion: structured.schemaVersion, digest: structured.digest } };
-    const row = this.db.prepare(`SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id
-      WHERE u.id=? AND u.kind='checkpoint' AND u.deleted_at IS NULL`).get(checkpointId);
-    if (!row) return null;
-    const compactSnapshot = json(row.snapshot_json, null);
-    if (!compactSnapshot) return null;
-    return {
-      compactSnapshot,
-      _snapshot: { legacy: true, schemaVersion: 1, digest: createHash("sha256").update(canonicalJson(compactSnapshot)).digest("hex") }
-    };
-  }
-  getProjectPulseSummary(projectId) {
-    const projectRow = this.db.prepare("SELECT * FROM projects WHERE id=?").get(projectId);
-    if (!projectRow) return null;
-    const project = { id: String(projectRow.id), title: String(projectRow.title), description: textOrNull(projectRow.description), intent: textOrNull(projectRow.intent), deadline: textOrNull(projectRow.deadline), completionCriteria: textOrNull(projectRow.completion_criteria), state: String(projectRow.state), currentFocus: textOrNull(projectRow.current_focus), nextAction: textOrNull(projectRow.next_action), blockers: json(projectRow.blockers_json, []), currentCheckpointId: textOrNull(projectRow.current_checkpoint_id), archivedAt: textOrNull(projectRow.archived_at), version: Number(projectRow.version), createdAt: String(projectRow.created_at), updatedAt: String(projectRow.updated_at), lastActivityAt: String(projectRow.last_activity_at) };
-    const checkpoint = project.currentCheckpointId ? this.db.prepare("SELECT u.id,r.content,u.created_at FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id WHERE u.id=?").get(project.currentCheckpointId) : void 0;
-    const activePhases = this.db.prepare("SELECT id,name,status FROM phases WHERE project_id=? AND status='active' AND archived_at IS NULL ORDER BY position,id").all(projectId).map((row) => ({ id: String(row.id), name: String(row.name), status: String(row.status) }));
-    const queue = this.listWorkQueues(projectId)[0];
-    const queueHead = queue ? this.listWorkItems(projectId, queue.id).filter((item) => !["resolved", "dropped"].includes(item.status)).slice(0, 10) : [];
-    const blockers = this.listExternalBlockers(projectId);
-    const evidence = this.listEvidence(projectId, true);
-    return { project, currentCheckpoint: checkpoint ? { id: String(checkpoint.id), content: String(checkpoint.content), createdAt: String(checkpoint.created_at) } : null, activePhases, requirementRollup: this.getRequirementRollup(projectId), queueHead, blockers, staleEvidenceCount: evidence.filter((entry) => entry.stale).length, failedEvidenceCount: evidence.filter((entry) => entry.result === "failed").length };
-  }
-  search(query, limit2 = 50, filters = {}) {
-    const term = `%${query.trim()}%`;
-    if (!query.trim()) return [];
-    const types2 = filters.entityTypes ? new Set(filters.entityTypes) : null;
-    const results = [];
-    const projectClause = filters.projectId ? " AND r.project_id=?" : "";
-    const projectArgs = filters.projectId ? [filters.projectId] : [];
-    const searchRequirements = (!types2 || types2.has("requirement")) && !filters.requirementId && !filters.evidenceResult;
-    const searchWorkItems = (!types2 || types2.has("work_item")) && !filters.evidenceResult;
-    const searchRuns = (!types2 || types2.has("run")) && !filters.state && !filters.phaseId && !filters.requirementId && !filters.evidenceResult;
-    const searchEvidence = (!types2 || types2.has("evidence")) && !filters.state && !filters.phaseId && !filters.requirementId;
-    if (searchRequirements) {
-      const rows = this.db.prepare(`SELECT r.id,r.project_id,r.stable_key,r.title,r.description FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE (r.title LIKE ? OR COALESCE(r.description,'') LIKE ?)${projectClause}${filters.state ? " AND (s.semantic=? OR s.name=?)" : ""}${filters.phaseId ? " AND (r.responsible_phase_id=? OR EXISTS (SELECT 1 FROM requirement_phase_links l WHERE l.requirement_id=r.id AND l.phase_id=?))" : ""}${filters.from ? " AND r.created_at>=?" : ""}${filters.to ? " AND r.created_at<=?" : ""} ORDER BY r.updated_at DESC LIMIT ?`).all(term, term, ...projectArgs, ...filters.state ? [filters.state, filters.state] : [], ...filters.phaseId ? [filters.phaseId, filters.phaseId] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
-      for (const row of rows) results.push({ type: "requirement", id: String(row.id), projectId: String(row.project_id), title: `${String(row.stable_key)} ${String(row.title)}`, excerpt: textOrNull(row.description) ?? "", score: 0 });
-    }
-    if (searchWorkItems) {
-      const rows = this.db.prepare(`SELECT w.id,w.project_id,w.title,w.description FROM work_items w WHERE (w.title LIKE ? OR COALESCE(w.description,'') LIKE ?)${filters.projectId ? " AND w.project_id=?" : ""}${filters.state ? " AND w.status=?" : ""}${filters.phaseId ? " AND w.phase_id=?" : ""}${filters.requirementId ? " AND EXISTS (SELECT 1 FROM requirement_work_links l WHERE l.work_item_id=w.id AND l.requirement_id=?)" : ""}${filters.from ? " AND w.created_at>=?" : ""}${filters.to ? " AND w.created_at<=?" : ""} ORDER BY w.updated_at DESC LIMIT ?`).all(term, term, ...filters.projectId ? [filters.projectId] : [], ...filters.state ? [filters.state] : [], ...filters.phaseId ? [filters.phaseId] : [], ...filters.requirementId ? [filters.requirementId] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
-      for (const row of rows) results.push({ type: "work_item", id: String(row.id), projectId: String(row.project_id), title: String(row.title), excerpt: textOrNull(row.description) ?? "", score: 0 });
-    }
-    if (searchRuns) {
-      const rows = this.db.prepare(`SELECT id,project_id,command,stdout_excerpt,stderr_excerpt FROM runs WHERE (command LIKE ? OR COALESCE(stdout_excerpt,'') LIKE ? OR COALESCE(stderr_excerpt,'') LIKE ?)${filters.projectId ? " AND project_id=?" : ""}${filters.from ? " AND created_at>=?" : ""}${filters.to ? " AND created_at<=?" : ""} ORDER BY created_at DESC LIMIT ?`).all(term, term, term, ...filters.projectId ? [filters.projectId] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
-      for (const row of rows) results.push({ type: "run", id: String(row.id), projectId: String(row.project_id), title: String(row.command), excerpt: textOrNull(row.stderr_excerpt) ?? textOrNull(row.stdout_excerpt) ?? "", score: 0 });
-    }
-    if (searchEvidence) {
-      const rows = this.db.prepare(`SELECT id,project_id,summary,result FROM evidence WHERE summary LIKE ?${filters.projectId ? " AND project_id=?" : ""}${filters.evidenceResult ? " AND result=?" : ""}${filters.from ? " AND created_at>=?" : ""}${filters.to ? " AND created_at<=?" : ""} ORDER BY created_at DESC LIMIT ?`).all(term, ...filters.projectId ? [filters.projectId] : [], ...filters.evidenceResult ? [filters.evidenceResult] : [], ...filters.from ? [filters.from] : [], ...filters.to ? [filters.to] : [], limit2);
-      for (const row of rows) results.push({ type: "evidence", id: String(row.id), projectId: String(row.project_id), title: String(row.result), excerpt: String(row.summary), score: 0 });
-    }
-    return results.slice(0, Math.min(Math.max(limit2, 1), 200));
-  }
+  const databasePath = resolve$1(options.databasePath ?? join(dataDir, "istra.sqlite3"));
+  const backupDir = resolve$1(options.backupDir ?? environment.ISTRA_BACKUP_DIR ?? join(dirname(databasePath), "backups"));
+  return { backend, poolMax, dataDir: dirname(databasePath), databasePath, backupDir, configPath };
 }
 async function createRuntime(options = {}) {
-  const database = await openIstraDatabase(options);
+  const config2 = await resolveStorageConfig(options);
+  if (config2.backend === "postgresql") {
+    const database2 = await openPostgresDatabase({
+      connectionString: config2.databaseUrl,
+      max: config2.poolMax,
+      applicationName: "istra"
+    });
+    const repository2 = new PostgresIstraRepository(database2.executor);
+    const operationalRepository2 = new PostgresOperationalRepository(database2.executor);
+    const protection2 = postgresDataProtection();
+    const healthCheck2 = async () => {
+      const health = await database2.healthCheck();
+      if (!health.ready) throw new Error("PostgreSQL is not ready");
+    };
+    const storageStatus2 = async () => {
+      const health = await database2.healthCheck();
+      return {
+        backend: "postgresql",
+        target: database2.target,
+        schemaVersion: health.schemaVersion,
+        ready: health.ready,
+        automaticBackups: false,
+        importSupported: false
+      };
+    };
+    const service2 = new IstraService(repository2, protection2, operationalRepository2, storageStatus2);
+    return {
+      backend: "postgresql",
+      repository: repository2,
+      operationalRepository: operationalRepository2,
+      service: service2,
+      healthCheck: healthCheck2,
+      storageStatus: storageStatus2,
+      close: () => database2.close()
+    };
+  }
+  const database = await openIstraDatabase({
+    dataDir: config2.dataDir,
+    databasePath: config2.databasePath,
+    backupDir: config2.backupDir
+  });
   const repository = new SqliteIstraRepository(database.db);
   const operationalRepository = new SqliteOperationalRepository(database.db);
-  const service = new IstraService(repository, database.backupManager, operationalRepository);
-  return { ...database, repository, operationalRepository, service, close: () => database.db.close() };
+  const protection = sqliteDataProtection(database.backupManager);
+  const healthCheck = async () => {
+    database.db.prepare("SELECT 1").get();
+  };
+  const storageStatus = async () => {
+    let ready = true;
+    try {
+      await healthCheck();
+    } catch {
+      ready = false;
+    }
+    return {
+      backend: "sqlite",
+      target: database.paths.databasePath,
+      schemaVersion: migrations.at(-1)?.version ?? 0,
+      ready,
+      automaticBackups: true,
+      importSupported: true
+    };
+  };
+  const service = new IstraService(repository, protection, operationalRepository, storageStatus);
+  return {
+    backend: "sqlite",
+    repository,
+    operationalRepository,
+    service,
+    healthCheck,
+    storageStatus,
+    close: async () => database.db.close()
+  };
 }
 const ZodMiniType = /* @__PURE__ */ $constructor("ZodMiniType", (inst, def) => {
   if (!inst._zod)
@@ -15056,8 +22921,8 @@ class Protocol {
    */
   async _clearTaskQueue(taskId, sessionId) {
     if (this._taskMessageQueue) {
-      const messages = await this._taskMessageQueue.dequeueAll(taskId, sessionId);
-      for (const message of messages) {
+      const messages2 = await this._taskMessageQueue.dequeueAll(taskId, sessionId);
+      for (const message of messages2) {
         if (message.type === "request" && isJSONRPCRequest(message.message)) {
           const requestId = message.message.id;
           const resolver = this._requestResolvers.get(requestId);
@@ -15183,9 +23048,6 @@ function mergeCapabilities(base, additional) {
     }
   }
   return result2;
-}
-function getDefaultExportFromCjs(x) {
-  return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, "default") ? x["default"] : x;
 }
 var ajv = { exports: {} };
 var core$1 = {};
@@ -16243,12 +24105,12 @@ function requireUtil() {
   }
   util.alwaysValidSchema = alwaysValidSchema;
   function checkUnknownRules(it, schema = it.schema) {
-    const { opts, self } = it;
+    const { opts, self: self2 } = it;
     if (!opts.strictSchema)
       return;
     if (typeof schema === "boolean")
       return;
-    const rules2 = self.RULES.keywords;
+    const rules2 = self2.RULES.keywords;
     for (const key in schema) {
       if (!rules2[key])
         checkStrictMode(it, `unknown keyword: "${key}"`);
@@ -16635,8 +24497,8 @@ function requireApplicability() {
   hasRequiredApplicability = 1;
   Object.defineProperty(applicability, "__esModule", { value: true });
   applicability.shouldUseRule = applicability.shouldUseGroup = applicability.schemaHasRulesForType = void 0;
-  function schemaHasRulesForType({ schema, self }, type2) {
-    const group = self.RULES.types[type2];
+  function schemaHasRulesForType({ schema, self: self2 }, type2) {
+    const group = self2.RULES.types[type2];
     return group && group !== true && shouldUseGroup(schema, group);
   }
   applicability.schemaHasRulesForType = schemaHasRulesForType;
@@ -17100,7 +24962,7 @@ function requireKeyword() {
     return !schemaType.length || schemaType.some((st) => st === "array" ? Array.isArray(schema) : st === "object" ? schema && typeof schema == "object" && !Array.isArray(schema) : typeof schema == st || allowUndefined && typeof schema == "undefined");
   }
   keyword.validSchemaType = validSchemaType;
-  function validateKeywordUsage({ schema, opts, self, errSchemaPath }, def, keyword2) {
+  function validateKeywordUsage({ schema, opts, self: self2, errSchemaPath }, def, keyword2) {
     if (Array.isArray(def.keyword) ? !def.keyword.includes(keyword2) : def.keyword !== keyword2) {
       throw new Error("ajv implementation error");
     }
@@ -17111,9 +24973,9 @@ function requireKeyword() {
     if (def.validateSchema) {
       const valid = def.validateSchema(schema[keyword2]);
       if (!valid) {
-        const msg = `keyword "${keyword2}" value is invalid at path "${errSchemaPath}": ` + self.errorsText(def.validateSchema.errors);
+        const msg = `keyword "${keyword2}" value is invalid at path "${errSchemaPath}": ` + self2.errorsText(def.validateSchema.errors);
         if (opts.validateSchema === "log")
-          self.logger.error(msg);
+          self2.logger.error(msg);
         else
           throw new Error(msg);
       }
@@ -17579,11 +25441,11 @@ function requireValidate() {
     }
     (0, boolSchema_1.boolOrEmptySchema)(it, valid);
   }
-  function schemaCxtHasRules({ schema, self }) {
+  function schemaCxtHasRules({ schema, self: self2 }) {
     if (typeof schema == "boolean")
       return !schema;
     for (const key in schema)
-      if (self.RULES.all[key])
+      if (self2.RULES.all[key])
         return true;
     return false;
   }
@@ -17612,9 +25474,9 @@ function requireValidate() {
     schemaKeywords(it, types2, !checkedTypes, errsCount);
   }
   function checkRefsAndKeywords(it) {
-    const { schema, errSchemaPath, opts, self } = it;
-    if (schema.$ref && opts.ignoreKeywordsWithRef && (0, util_1.schemaHasRulesButRef)(schema, self.RULES)) {
-      self.logger.warn(`$ref: keywords ignored in schema at path "${errSchemaPath}"`);
+    const { schema, errSchemaPath, opts, self: self2 } = it;
+    if (schema.$ref && opts.ignoreKeywordsWithRef && (0, util_1.schemaHasRulesButRef)(schema, self2.RULES)) {
+      self2.logger.warn(`$ref: keywords ignored in schema at path "${errSchemaPath}"`);
     }
   }
   function checkNoDefault(it) {
@@ -17660,8 +25522,8 @@ function requireValidate() {
       gen.assign((0, codegen_1._)`${evaluated}.items`, items2);
   }
   function schemaKeywords(it, types2, typeErrors, errsCount) {
-    const { gen, schema, data, allErrors, opts, self } = it;
-    const { RULES } = self;
+    const { gen, schema, data, allErrors, opts, self: self2 } = it;
+    const { RULES } = self2;
     if (schema.$ref && (opts.ignoreKeywordsWithRef || !(0, util_1.schemaHasRulesButRef)(schema, RULES))) {
       gen.block(() => keywordCode(it, "$ref", RULES.all.$ref.definition));
       return;
@@ -18643,9 +26505,9 @@ function requireSchemes() {
       wsComponent.secure = void 0;
     }
     if (wsComponent.resourceName) {
-      const [path, query] = wsComponent.resourceName.split("?");
+      const [path, query2] = wsComponent.resourceName.split("?");
       wsComponent.path = path && path !== "/" ? path : void 0;
-      wsComponent.query = query;
+      wsComponent.query = query2;
       wsComponent.resourceName = void 0;
     }
     wsComponent.fragment = void 0;
@@ -19474,7 +27336,7 @@ function requireCore$1() {
       errorsText(errors2 = this.errors, { separator = ", ", dataVar = "data" } = {}) {
         if (!errors2 || errors2.length === 0)
           return "No errors";
-        return errors2.map((e) => `${dataVar}${e.instancePath} ${e.message}`).reduce((text, msg) => text + separator + msg);
+        return errors2.map((e) => `${dataVar}${e.instancePath} ${e.message}`).reduce((text2, msg) => text2 + separator + msg);
       }
       $dataMetaSchema(metaSchema, keywordsJsonPointers) {
         const rules2 = this.RULES.all;
@@ -19728,11 +27590,11 @@ function requireRef() {
     schemaType: "string",
     code(cxt) {
       const { gen, schema: $ref, it } = cxt;
-      const { baseId, schemaEnv: env, validateName, opts, self } = it;
+      const { baseId, schemaEnv: env, validateName, opts, self: self2 } = it;
       const { root } = env;
       if (($ref === "#" || $ref === "#/") && baseId === root.baseId)
         return callRootRef();
-      const schOrEnv = compile_1.resolveRef.call(self, root, baseId, $ref);
+      const schOrEnv = compile_1.resolveRef.call(self2, root, baseId, $ref);
       if (schOrEnv === void 0)
         throw new ref_error_1.default(it.opts.uriResolver, baseId, $ref);
       if (schOrEnv instanceof compile_1.SchemaEnv)
@@ -21262,7 +29124,7 @@ function requireFormat$1() {
     error,
     code(cxt, ruleType) {
       const { gen, data, $data, schema, schemaCode, it } = cxt;
-      const { opts, errSchemaPath, schemaEnv, self } = it;
+      const { opts, errSchemaPath, schemaEnv, self: self2 } = it;
       if (!opts.validateFormats)
         return;
       if ($data)
@@ -21271,7 +29133,7 @@ function requireFormat$1() {
         validateFormat();
       function validate$DataFormat() {
         const fmts = gen.scopeValue("formats", {
-          ref: self.formats,
+          ref: self2.formats,
           code: opts.code.formats
         });
         const fDef = gen.const("fDef", (0, codegen_1._)`${fmts}[${schemaCode}]`);
@@ -21291,7 +29153,7 @@ function requireFormat$1() {
         }
       }
       function validateFormat() {
-        const formatDef = self.formats[schema];
+        const formatDef = self2.formats[schema];
         if (!formatDef) {
           unknownFormat();
           return;
@@ -21303,7 +29165,7 @@ function requireFormat$1() {
           cxt.pass(validCondition());
         function unknownFormat() {
           if (opts.strictSchema === false) {
-            self.logger.warn(unknownMsg());
+            self2.logger.warn(unknownMsg());
             return;
           }
           throw new Error(unknownMsg());
@@ -21829,17 +29691,17 @@ function requireLimit() {
       error,
       code(cxt) {
         const { gen, data, schemaCode, keyword: keyword2, it } = cxt;
-        const { opts, self } = it;
+        const { opts, self: self2 } = it;
         if (!opts.validateFormats)
           return;
-        const fCxt = new ajv_1.KeywordCxt(it, self.RULES.all.format.definition, "format");
+        const fCxt = new ajv_1.KeywordCxt(it, self2.RULES.all.format.definition, "format");
         if (fCxt.$data)
           validate$DataFormat();
         else
           validateFormat();
         function validate$DataFormat() {
           const fmts = gen.scopeValue("formats", {
-            ref: self.formats,
+            ref: self2.formats,
             code: opts.code.formats
           });
           const fmt = gen.const("fmt", (0, codegen_1._)`${fmts}[${fCxt.schemaCode}]`);
@@ -21847,7 +29709,7 @@ function requireLimit() {
         }
         function validateFormat() {
           const format2 = fCxt.schema;
-          const fmtDef = self.formats[format2];
+          const fmtDef = self2.formats[format2];
           if (!fmtDef || fmtDef === true)
             return;
           if (typeof fmtDef != "object" || fmtDef instanceof RegExp || typeof fmtDef.compare != "function") {
@@ -23479,17 +31341,22 @@ function required(value, entity, id2) {
 }
 function createMcpServer(service) {
   const server2 = new McpServer({ name: "istra", version: "0.1.0" });
+  server2.registerTool("get_storage_status", {
+    description: "Read the active storage backend, redacted target, schema version, readiness and backup capabilities.",
+    inputSchema: objectType({}),
+    annotations: readOnly
+  }, async () => result(await service.storageStatus()));
   server2.registerTool("list_projects", {
     description: "List Istra projects, optionally filtered by lifecycle state or text.",
     inputSchema: objectType({ state: ProjectStateSchema.optional(), includeArchived: booleanType().default(false), query: stringType().max(500).optional() }),
     annotations: readOnly
-  }, async (args) => result(service.listProjects({ state: args.state, includeArchived: args.includeArchived, q: args.query })));
+  }, async (args) => result(await service.listProjects({ state: args.state, includeArchived: args.includeArchived, q: args.query })));
   server2.registerTool("get_project_pulse", {
     description: "Read a project’s current pulse, checkpoint, phases, unresolved work and recent activity before starting work.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
   }, async ({ projectId }) => {
-    const detail = service.getProject(projectId);
+    const detail = await service.getProject(projectId);
     if (!detail) throw new NotFoundError("Project", projectId);
     return result(detail);
   });
@@ -23497,12 +31364,12 @@ function createMcpServer(service) {
     description: "List work items for a project, optionally restricted to statuses.",
     inputSchema: objectType({ projectId: stringType().uuid(), statuses: arrayType(WorkItemStatusSchema).max(10).optional() }),
     annotations: readOnly
-  }, async ({ projectId, statuses }) => result(service.listWorkItems(projectId, statuses)));
+  }, async ({ projectId, statuses }) => result(await service.listWorkItems(projectId, statuses)));
   server2.registerTool("search", {
     description: "Search project descriptions, phases, work items and current journal revisions.",
     inputSchema: objectType({ query: stringType().trim().min(1).max(500), limit: numberType().int().min(1).max(200).default(50), projectId: stringType().uuid().optional(), entityTypes: arrayType(enumType(["project", "phase", "work_item", "update", "requirement", "run", "evidence"])).max(10).optional(), state: stringType().trim().max(100).optional(), phaseId: stringType().uuid().optional(), requirementId: stringType().uuid().optional(), evidenceResult: enumType(["recorded", "verified", "failed", "interrupted"]).optional(), from: stringType().datetime({ offset: true }).optional(), to: stringType().datetime({ offset: true }).optional() }),
     annotations: readOnly
-  }, async ({ query, limit: limit2, ...filters }) => result(service.search(query, limit2, filters)));
+  }, async ({ query: query2, limit: limit2, ...filters }) => result(await service.search(query2, limit2, filters)));
   server2.registerTool("report_error", {
     description: "Report a concrete or strongly suspected fault in Istra’s MCP tools, plugins, instructions or workflow. Report only Istra faults after a quick sanity check; do not report user-project bugs, expected validation errors, or failures of this tool itself. Keep evidence concise and sanitised, then continue the user’s task.",
     inputSchema: CreateErrorReportSchema.extend({
@@ -23515,12 +31382,12 @@ function createMcpServer(service) {
     description: "Read a bounded page of unresolved Istra error reports. Use only when explicitly asked to triage the inbox.",
     inputSchema: ErrorReportPageRequestSchema,
     annotations: readOnly
-  }, async (page) => result(service.listErrorReportsPage(page)));
+  }, async (page) => result(await service.listErrorReportsPage(page)));
   server2.registerTool("get_error_report", {
     description: "Read one Istra error report and its creation and triage history. Use only when explicitly asked to triage the inbox.",
     inputSchema: objectType({ reportId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ reportId }) => result(required(service.getErrorReport(reportId), "Error report", reportId)));
+  }, async ({ reportId }) => result(required(await service.getErrorReport(reportId), "Error report", reportId)));
   server2.registerTool("update_error_report", {
     description: "Set the triage status or note for an Istra error report using optimistic concurrency. Use only when explicitly asked to triage the inbox.",
     inputSchema: UpdateErrorReportSchema.extend({ reportId: stringType().uuid(), client }).strict(),
@@ -23530,7 +31397,7 @@ function createMcpServer(service) {
     description: "List labels available to work items.",
     inputSchema: objectType({}),
     annotations: readOnly
-  }, async () => result(service.listLabels()));
+  }, async () => result(await service.listLabels()));
   server2.registerTool("create_label", {
     description: "Create a reusable work-item label.",
     inputSchema: CreateLabelSchema.extend({ idempotencyKey: stringType().trim().min(1).max(200), client }),
@@ -23590,27 +31457,27 @@ function createMcpServer(service) {
     description: "Read all retained revisions for a journal update.",
     inputSchema: objectType({ updateId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ updateId }) => result(service.getUpdateRevisions(updateId)));
+  }, async ({ updateId }) => result(await service.getUpdateRevisions(updateId)));
   server2.registerTool("list_project_activity", {
     description: "Read recent project activity, bounded by a requested limit.",
     inputSchema: objectType({ projectId: stringType().uuid(), limit: numberType().int().min(1).max(1e3).default(200) }),
     annotations: readOnly
-  }, async ({ projectId, limit: limit2 }) => result(service.listActivity(projectId, limit2)));
+  }, async ({ projectId, limit: limit2 }) => result(await service.listActivity(projectId, limit2)));
   server2.registerTool("resolve_project", {
     description: "Resolve projects linked to a filesystem workspace path. Never matches by title.",
     inputSchema: objectType({ workspacePath: stringType().trim().min(1).max(4e3) }),
     annotations: readOnly
-  }, async ({ workspacePath }) => result(service.resolveProject(workspacePath)));
+  }, async ({ workspacePath }) => result(await service.resolveProject(workspacePath)));
   server2.registerTool("get_project_pulse_summary", {
     description: "Read a compact project pulse with requirement, queue, blocker and evidence summaries.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId }) => result(required(service.getProjectPulseSummary(projectId), "Project", projectId)));
+  }, async ({ projectId }) => result(required(await service.getProjectPulseSummary(projectId), "Project", projectId)));
   server2.registerTool("list_requirement_states", {
     description: "List configurable requirement states for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId }) => result(service.listRequirementStates(projectId)));
+  }, async ({ projectId }) => result(await service.listRequirementStates(projectId)));
   server2.registerTool("create_requirement_state", {
     description: "Create a semantic requirement state for a project.",
     inputSchema: CreateRequirementStateSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
@@ -23620,17 +31487,17 @@ function createMcpServer(service) {
     description: "List the hierarchical requirement ledger for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId }) => result(service.listRequirements(projectId)));
+  }, async ({ projectId }) => result(await service.listRequirements(projectId)));
   server2.registerTool("list_requirements_page", {
     description: "Read a bounded page of the requirement ledger.",
     inputSchema: PageRequestSchema.extend({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId, ...page }) => result(service.listRequirementsPage(projectId, page)));
+  }, async ({ projectId, ...page }) => result(await service.listRequirementsPage(projectId, page)));
   server2.registerTool("get_requirement", {
     description: "Read one requirement with criteria, links and gate status.",
     inputSchema: objectType({ requirementId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ requirementId }) => result(required(service.getRequirement(requirementId), "Requirement", requirementId)));
+  }, async ({ requirementId }) => result(required(await service.getRequirement(requirementId), "Requirement", requirementId)));
   server2.registerTool("create_requirement", {
     description: "Create a stable-keyed goal, capability or requirement.",
     inputSchema: CreateRequirementSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
@@ -23645,7 +31512,7 @@ function createMcpServer(service) {
     description: "Compute requirement counts and gate failures for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId }) => result(service.getRequirementRollup(projectId)));
+  }, async ({ projectId }) => result(await service.getRequirementRollup(projectId)));
   server2.registerTool("link_requirement_work", {
     description: "Link a requirement to a work item.",
     inputSchema: objectType({ projectId: stringType().uuid(), requirementId: stringType().uuid(), workItemId: stringType().uuid(), client }),
@@ -23660,7 +31527,7 @@ function createMcpServer(service) {
     description: "List ordered work queues for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId }) => result(service.listWorkQueues(projectId)));
+  }, async ({ projectId }) => result(await service.listWorkQueues(projectId)));
   server2.registerTool("create_work_queue", {
     description: "Create an ordered work queue.",
     inputSchema: CreateWorkQueueSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
@@ -23670,17 +31537,17 @@ function createMcpServer(service) {
     description: "List work items with queue rank and derived blocker reasons.",
     inputSchema: objectType({ projectId: stringType().uuid(), queueId: stringType().uuid().optional() }),
     annotations: readOnly
-  }, async ({ projectId, queueId }) => result(service.listOperationalWorkItems(projectId, queueId)));
+  }, async ({ projectId, queueId }) => result(await service.listOperationalWorkItems(projectId, queueId)));
   server2.registerTool("list_operational_work_items_page", {
     description: "Read a bounded page of ordered work with derived blockers.",
     inputSchema: PageRequestSchema.extend({ projectId: stringType().uuid(), queueId: stringType().uuid().optional() }),
     annotations: readOnly
-  }, async ({ projectId, ...page }) => result(service.listOperationalWorkItemsPage(projectId, page)));
+  }, async ({ projectId, ...page }) => result(await service.listOperationalWorkItemsPage(projectId, page)));
   server2.registerTool("list_work_relations", {
     description: "List dependency and related-work edges for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId }) => result(service.listWorkRelations(projectId)));
+  }, async ({ projectId }) => result(await service.listWorkRelations(projectId)));
   server2.registerTool("link_work_items", {
     description: "Create a dependency or related-work edge.",
     inputSchema: CreateWorkRelationSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
@@ -23695,7 +31562,7 @@ function createMcpServer(service) {
     description: "List unresolved or historical external blockers.",
     inputSchema: objectType({ projectId: stringType().uuid(), includeResolved: booleanType().default(false) }),
     annotations: readOnly
-  }, async ({ projectId, includeResolved }) => result(service.listExternalBlockers(projectId, includeResolved)));
+  }, async ({ projectId, includeResolved }) => result(await service.listExternalBlockers(projectId, includeResolved)));
   server2.registerTool("create_external_blocker", {
     description: "Record an external blocker for a project or work item.",
     inputSchema: CreateExternalBlockerSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
@@ -23730,12 +31597,12 @@ function createMcpServer(service) {
     description: "List structured runs for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId }) => result(service.listRuns(projectId)));
+  }, async ({ projectId }) => result(await service.listRuns(projectId)));
   server2.registerTool("list_runs_page", {
     description: "Read a bounded page of execution runs.",
     inputSchema: PageRequestSchema.extend({ projectId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ projectId, ...page }) => result(service.listRunsPage(projectId, page)));
+  }, async ({ projectId, ...page }) => result(await service.listRunsPage(projectId, page)));
   server2.registerTool("create_evidence", {
     description: "Record evidence linked to requirements, work, decisions or checkpoints.",
     inputSchema: CreateEvidenceSchema.omit({ override: true }).extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }).strict(),
@@ -23745,17 +31612,17 @@ function createMcpServer(service) {
     description: "List evidence and verification freshness for a project.",
     inputSchema: objectType({ projectId: stringType().uuid(), includeStale: booleanType().default(false) }),
     annotations: readOnly
-  }, async ({ projectId, includeStale }) => result(service.listEvidence(projectId, includeStale)));
+  }, async ({ projectId, includeStale }) => result(await service.listEvidence(projectId, includeStale)));
   server2.registerTool("list_evidence_page", {
     description: "Read a bounded page of evidence records.",
     inputSchema: PageRequestSchema.extend({ projectId: stringType().uuid(), includeStale: booleanType().default(false) }),
     annotations: readOnly
-  }, async ({ projectId, ...page }) => result(service.listEvidencePage(projectId, page)));
+  }, async ({ projectId, ...page }) => result(await service.listEvidencePage(projectId, page)));
   server2.registerTool("list_project_history_page", {
     description: "Read a bounded page of project updates or activity events.",
     inputSchema: PageRequestSchema.extend({ projectId: stringType().uuid(), entity: enumType(["updates", "activity"]) }),
     annotations: readOnly
-  }, async ({ projectId, entity, ...page }) => result(entity === "updates" ? service.listUpdatesPage(projectId, page) : service.listActivityPage(projectId, page)));
+  }, async ({ projectId, entity, ...page }) => result(await (entity === "updates" ? service.listUpdatesPage(projectId, page) : service.listActivityPage(projectId, page))));
   server2.registerTool("backfill_legacy_checkpoint_snapshot", {
     description: "Backfill an immutable structured snapshot for a legacy checkpoint that predates atomic checkpoint capture.",
     inputSchema: objectType({ projectId: stringType().uuid(), checkpointId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
@@ -23765,17 +31632,17 @@ function createMcpServer(service) {
     description: "Read an immutable checkpoint reconstruction document.",
     inputSchema: objectType({ checkpointId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ checkpointId }) => result(required(service.getCheckpointSnapshot(checkpointId), "Checkpoint snapshot", checkpointId)));
+  }, async ({ checkpointId }) => result(required(await service.getCheckpointSnapshot(checkpointId), "Checkpoint snapshot", checkpointId)));
   server2.registerTool("compare_checkpoint_snapshots", {
     description: "Compare two immutable checkpoint snapshots by structured section.",
     inputSchema: objectType({ leftCheckpointId: stringType().uuid(), rightCheckpointId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ leftCheckpointId, rightCheckpointId }) => result(service.compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId)));
+  }, async ({ leftCheckpointId, rightCheckpointId }) => result(await service.compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId)));
   server2.registerTool("reconstruct_checkpoint_state", {
     description: "Reconstruct project state from an immutable checkpoint snapshot.",
     inputSchema: objectType({ checkpointId: stringType().uuid() }),
     annotations: readOnly
-  }, async ({ checkpointId }) => result(required(service.reconstructCheckpointState(checkpointId), "Checkpoint snapshot", checkpointId)));
+  }, async ({ checkpointId }) => result(required(await service.reconstructCheckpointState(checkpointId), "Checkpoint snapshot", checkpointId)));
   return server2;
 }
 const runtime = await createRuntime();
@@ -23783,7 +31650,7 @@ const server = createMcpServer(runtime.service);
 const transport = new StdioServerTransport();
 const close = async () => {
   await server.close();
-  runtime.close();
+  await runtime.close();
 };
 process.once("SIGINT", () => void close());
 process.once("SIGTERM", () => void close());

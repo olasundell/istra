@@ -1,4 +1,24 @@
 services:
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-istra}
+      POSTGRES_USER: ${POSTGRES_USER:-istra}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${ISTRA_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - istra-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
   istra:
     build:
       context: .
@@ -10,9 +30,15 @@ services:
       PORT: "4317"
       ISTRA_HOST: 0.0.0.0
       ISTRA_LOG_LEVEL: info
+      ISTRA_STORAGE: postgresql
+      ISTRA_DATABASE_URL: ${ISTRA_COMPOSE_DATABASE_URL:-postgresql://${POSTGRES_USER:-istra}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-istra}}
+      ISTRA_POSTGRES_POOL_MAX: "${ISTRA_POSTGRES_POOL_MAX:-4}"
       ISTRA_DATA_DIR: /var/lib/istra
       ISTRA_BACKUP_DIR: /var/backups/istra
       ISTRA_STATIC_DIR: /app/dist-web
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${ISTRA_PORT:-4317}:4317"
     volumes:
@@ -38,5 +64,6 @@ services:
     stop_grace_period: 15s
 
 volumes:
+  istra-postgres-data:
   istra-data:
   istra-backups:

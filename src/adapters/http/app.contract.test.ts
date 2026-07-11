@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { FastifyInstance } from 'fastify'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ExportBundle } from '../../application/ports.js'
+import { IstraService } from '../../application/istra-service.js'
+import type { DataProtection, ExportBundle } from '../../application/ports.js'
 import { createRuntime } from '../../infrastructure/runtime.js'
 import { buildHttpApp } from './app.js'
 
@@ -17,17 +18,21 @@ describe('HTTP API contract', () => {
     runtime = await createRuntime({ dataDir })
     app = await buildHttpApp({
       service: runtime.service,
-      readinessCheck: () => { runtime.db.prepare('SELECT 1').get() },
+      readinessCheck: () => runtime.healthCheck(),
     })
   })
 
   afterEach(async () => {
     await app.close()
-    runtime.close()
+    await runtime.close()
     await rm(dataDir, { recursive: true, force: true })
   })
 
   const jsonHeaders = { host: '127.0.0.1:4317', 'content-type': 'application/json' }
+
+  function serviceDataProtection() {
+    return (runtime.service as unknown as { dataProtection: { beforeWrite(): Promise<void> } }).dataProtection
+  }
 
   async function createProject(title = 'Memory project') {
     const response = await app.inject({
@@ -55,6 +60,22 @@ describe('HTTP API contract', () => {
     expect(response.statusCode).toBe(503)
     expect(response.json()).toEqual({ error: { code: 'NOT_READY', message: 'Istra is not ready' } })
     await unavailable.close()
+  })
+
+  it('reports backend-neutral storage status', async () => {
+    const response = await app.inject({ method: 'GET', url: '/api/v1/storage', headers: { host: 'localhost:4317' } })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toMatchObject({
+      data: {
+        backend: 'sqlite',
+        target: expect.stringContaining('istra.sqlite3'),
+        schemaVersion: expect.any(Number),
+        ready: true,
+        automaticBackups: true,
+        importSupported: true,
+      },
+    })
   })
 
   it('rejects foreign hosts, foreign origins and non-JSON mutations', async () => {
@@ -252,6 +273,35 @@ describe('HTTP API contract', () => {
     expect(detail.json()).toMatchObject({ data: { project: { title: 'Must survive' } } })
   })
 
+  it('returns 501 when full replacement import is unavailable for the active backend', async () => {
+    const protection: DataProtection = {
+      backend: 'postgresql',
+      automatic: false,
+      importSupported: false,
+      beforeWrite: async () => undefined,
+      create: async () => { throw new Error('PostgreSQL backups are unavailable') },
+      list: async () => [],
+    }
+    const service = new IstraService(runtime.repository, protection, runtime.operationalRepository, async () => ({
+      backend: 'postgresql', target: 'postgresql://localhost/istra', schemaVersion: 2, ready: true, automaticBackups: false, importSupported: false,
+    }))
+    const postgresApp = await buildHttpApp({ service })
+
+    try {
+      const response = await postgresApp.inject({
+        method: 'POST',
+        url: '/api/v1/import',
+        headers: jsonHeaders,
+        payload: {},
+      })
+
+      expect(response.statusCode).toBe(501)
+      expect(response.json()).toMatchObject({ error: { code: 'UNSUPPORTED_OPERATION' } })
+    } finally {
+      await postgresApp.close()
+    }
+  })
+
   it('returns structured backup status without exposing a restore mutation', async () => {
     await createProject()
     const statusResponse = await app.inject({
@@ -306,7 +356,7 @@ describe('HTTP API contract', () => {
 
   it('backs up operational writes', async () => {
     const project = await createProject('Backed-up operational project')
-    const beforeWrite = vi.spyOn(runtime.backupManager, 'beforeWrite').mockResolvedValue()
+    const beforeWrite = vi.spyOn(serviceDataProtection(), 'beforeWrite').mockResolvedValue()
     const response = await app.inject({
       method: 'POST',
       url: `/api/v1/projects/${project.id}/requirements`,
@@ -323,7 +373,7 @@ describe('HTTP API contract', () => {
     const firstWorkItem = await runtime.service.createWorkItem(project.id, { kind: 'task', title: 'First linked task' })
     const secondWorkItem = await runtime.service.createWorkItem(project.id, { kind: 'task', title: 'Second linked task' })
     const checkpoint = await runtime.service.saveCheckpoint(project.id, { expectedVersion: project.version, content: 'Snapshot source' })
-    const beforeWrite = vi.spyOn(runtime.backupManager, 'beforeWrite').mockResolvedValue()
+    const beforeWrite = vi.spyOn(serviceDataProtection(), 'beforeWrite').mockResolvedValue()
 
     const state = await runtime.service.createRequirementState(project.id, { name: 'Reviewing', semantic: 'partial' }, 'state-key', 'test')
     const requirement = await runtime.service.createRequirement(project.id, { stableKey: 'REQ-ALL', kind: 'requirement', title: 'Covered requirement', stateId: state.id })

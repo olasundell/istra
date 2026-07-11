@@ -35,6 +35,7 @@ import { decodeCursor, encodeCursor, pageOf } from '../../application/pagination
 import { validateEvidenceInvariants, validateRunInvariants } from '../../domain/run-invariants.js'
 import { canonicalJson } from '../../domain/canonical-json.js'
 import { SecretRedactor } from '../../application/secret-redactor.js'
+import { deterministicRows, exportTables } from '../export-format.js'
 
 type SqlRow = Record<string, unknown>
 const now = () => new Date().toISOString()
@@ -76,47 +77,6 @@ function revisionFromRow(row: SqlRow): UpdateRevision {
     id: String(row.id), updateId: String(row.update_id), revision: Number(row.revision), content: String(row.content),
     snapshot: parseJson<PulseSnapshot | null>(row.snapshot_json, null), source: String(row.source), client: textOrNull(row.client), createdAt: String(row.created_at),
   }
-}
-
-const exportTables: Record<string, string[]> = {
-  projects: ['id','title','description','intent','deadline','completion_criteria','state','current_focus','next_action','blockers_json','current_checkpoint_id','archived_at','version','created_at','updated_at','last_activity_at'],
-  error_reports: ['id','kind','component','summary','observation','expected_behaviour','actual_behaviour','reproduction_steps_json','impact','project_id','workspace_path','status','triage_note','source','client','actor','redaction_json','version','created_at','updated_at'],
-  phases: ['id','project_id','name','description','status','position','archived_at','version','created_at','updated_at'],
-  work_items: ['id','project_id','phase_id','stable_key','parent_id','kind','title','description','status','priority','version','created_at','updated_at'],
-  labels: ['id','name','colour','version','created_at','updated_at'],
-  work_item_labels: ['work_item_id','label_id','created_at'],
-  updates: ['id','project_id','kind','current_revision_id','deleted_at','version','created_at','updated_at'],
-  update_revisions: ['id','update_id','revision','content','snapshot_json','source','client','created_at'],
-  activity_events: ['id','project_id','entity_type','entity_id','event_type','payload_json','source','client','actor','idempotency_key','created_at'],
-  requirement_states: ['id','project_id','name','semantic','position','colour','created_at','updated_at'],
-  requirements: ['id','project_id','stable_key','kind','parent_id','title','description','state_id','responsible_phase_id','version','created_at','updated_at'],
-  requirement_key_aliases: ['requirement_id','alias','created_at'],
-  acceptance_criteria: ['id','requirement_id','title','description','position','required','version','archived_at','created_at','updated_at'],
-  requirement_phase_links: ['requirement_id','phase_id','role','created_at'],
-  work_queues: ['id','project_id','name','description','version','created_at','updated_at'],
-  work_queue_items: ['queue_id','work_item_id','rank','created_at'],
-  requirement_work_links: ['requirement_id','work_item_id','created_at'],
-  work_phase_links: ['work_item_id','phase_id','role','created_at'],
-  work_relations: ['id','project_id','from_work_item_id','to_work_item_id','kind','created_at'],
-  external_blockers: ['id','project_id','work_item_id','content','resolved_at','created_at','updated_at'],
-  workspaces: ['id','name','canonical_root','remote','created_at','updated_at'],
-  workspace_aliases: ['workspace_id','alias','created_at'],
-  project_workspaces: ['project_id','workspace_id','created_at'],
-  workspace_revisions: ['id','workspace_id','branch','"commit"','dirty','diff_hash','captured_at'],
-  project_secret_names: ['project_id','name','created_at'],
-  runs: ['id','project_id','workspace_revision_id','command','working_directory','started_at','ended_at','duration_ms','outcome','exit_code','toolchain_json','stdout_excerpt','stderr_excerpt','stdout_truncated','stderr_truncated','validation_status','redaction_json','created_at'],
-  test_summaries: ['id','run_id','scope','passed','failed','skipped','target_count','created_at'],
-  artifact_references: ['id','run_id','uri','media_type','byte_count','digest','created_at'],
-  evidence: ['id','ordinal','project_id','run_id','result','summary','target_version','stale','stale_reason','validation_status','redaction_json','created_at','updated_at'],
-  evidence_artifact_links: ['evidence_id','artifact_id'],
-  evidence_requirement_links: ['evidence_id','requirement_id'],
-  evidence_criterion_links: ['evidence_id','criterion_id','criterion_version','created_at'],
-  evidence_work_links: ['evidence_id','work_item_id'],
-  evidence_update_links: ['evidence_id','update_id'],
-  evidence_checkpoint_links: ['evidence_id','checkpoint_id'],
-  evidence_overrides: ['evidence_id','reason','actor','source','client','created_at'],
-  checkpoint_snapshots: ['id','checkpoint_id','schema_version','captured_at','document_json','digest'],
-  idempotency_records: ['client','idempotency_key','operation','request_hash','result_json','created_at'],
 }
 
 export class SqliteIstraRepository implements IstraRepository {
@@ -615,7 +575,9 @@ export class SqliteIstraRepository implements IstraRepository {
 
   exportAll(): ExportBundle {
     const tables: ExportBundle['tables'] = {}
-    for (const [table, columns] of Object.entries(exportTables)) tables[table] = this.db.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all() as Array<Record<string, unknown>>
+    for (const [table, columns] of Object.entries(exportTables)) {
+      tables[table] = deterministicRows(table, this.db.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all() as Array<Record<string, unknown>>)
+    }
     return { format: 'istra-export', formatVersion: 4, exportedAt: now(), tables }
   }
 

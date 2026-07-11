@@ -12,7 +12,7 @@ const app = await buildHttpApp({
   service: runtime.service,
   staticDir,
   logger: { level: config.logLevel },
-  readinessCheck: () => { runtime.db.prepare('SELECT 1').get() },
+  readinessCheck: () => runtime.healthCheck(),
 })
 
 let shutdown: Promise<void> | undefined
@@ -27,7 +27,7 @@ const close = (signal: NodeJS.Signals) => {
     deadline.unref()
     try {
       await app.close()
-      runtime.close()
+      await runtime.close()
       app.log.info({ signal }, 'Istra stopped cleanly')
     } finally {
       clearTimeout(deadline)

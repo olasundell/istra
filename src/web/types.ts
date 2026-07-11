@@ -58,6 +58,9 @@ export type {
 } from "../domain/contracts";
 
 export interface BackupStatus {
+  backend?: "sqlite" | "postgresql";
+  automaticBackups?: boolean;
+  importSupported?: boolean;
   databasePath?: string;
   lastBackupAt?: string | null;
   nextBackupKind?: string;

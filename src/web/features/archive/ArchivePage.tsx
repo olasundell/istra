@@ -54,6 +54,8 @@ function DataDialog({ backup, onClose, onImported }: { backup: Awaited<ReturnTyp
   const inputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const isPostgres = backup?.backend === "postgresql";
+  const importSupported = backup?.importSupported !== false;
 
   async function importFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -74,23 +76,27 @@ function DataDialog({ backup, onClose, onImported }: { backup: Awaited<ReturnTyp
   }
 
   return (
-    <Overlay title="Data & backups" description="Your complete project memory lives in one local SQLite database." onClose={onClose}>
+    <Overlay
+      title="Data & backups"
+      description={isPostgres ? "Your complete project memory lives in the configured PostgreSQL database." : "Your complete project memory lives in one local SQLite database."}
+      onClose={onClose}
+    >
       <div className="data-actions">
         <a className="data-action" download href={api.exportUrl}><Icon name="download" /><span><strong>Export all data</strong><small>Download a versioned JSON document with current and historical records.</small></span></a>
-        <button className="data-action" disabled={importing} onClick={() => inputRef.current?.click()}><Icon name="upload" /><span><strong>{importing ? "Importing…" : "Import an export"}</strong><small>Validate and replace the current data after creating a safety backup.</small></span></button>
+        <button className="data-action" disabled={importing || !importSupported} onClick={() => inputRef.current?.click()}><Icon name="upload" /><span><strong>{importing ? "Importing…" : "Import an export"}</strong><small>{importSupported ? "Validate and replace the current data after creating a safety backup." : "Unavailable for PostgreSQL until backup and restore support is configured."}</small></span></button>
         <input accept="application/json,.json" className="sr-only" onChange={(event) => void importFile(event)} ref={inputRef} type="file" />
       </div>
       {status ? <p className="notice" role="status">{status}</p> : null}
       <section className="backup-summary">
         <h3>Backup status</h3>
         <dl>
+          <div><dt>Backend</dt><dd>{isPostgres ? "PostgreSQL" : "SQLite"}</dd></div>
           <div><dt>Last backup</dt><dd>{formatDate(backup?.lastBackupAt)}</dd></div>
           <div><dt>Stored snapshots</dt><dd>{backup?.backups?.length ?? 0}</dd></div>
           {backup?.databasePath ? <div><dt>Database</dt><dd className="path-value">{backup.databasePath}</dd></div> : null}
         </dl>
-        {backup?.backups?.length ? <ol className="backup-list">{backup.backups.slice(0, 5).map((item) => <li key={item.name}><span>{item.kind}</span><time dateTime={item.createdAt}>{formatDate(item.createdAt)}</time></li>)}</ol> : <p className="muted">The first daily backup is created before the next write.</p>}
+        {backup?.backups?.length ? <ol className="backup-list">{backup.backups.slice(0, 5).map((item) => <li key={item.name}><span>{item.kind}</span><time dateTime={item.createdAt}>{formatDate(item.createdAt)}</time></li>)}</ol> : <p className="muted">{isPostgres ? "Automated PostgreSQL backups are not configured yet." : "The first daily backup is created before the next write."}</p>}
       </section>
     </Overlay>
   );
 }
-

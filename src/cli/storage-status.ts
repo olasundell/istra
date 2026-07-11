@@ -2,8 +2,7 @@ import { createRuntime } from '../infrastructure/runtime.js'
 
 const runtime = await createRuntime()
 try {
-  const status = await runtime.storageStatus()
-  console.log(`Istra ${status.backend} storage is migrated: ${status.target}`)
+  console.log(JSON.stringify(await runtime.storageStatus(), null, 2))
 } finally {
   await runtime.close()
 }

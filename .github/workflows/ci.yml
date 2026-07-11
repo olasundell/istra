@@ -41,6 +41,9 @@ jobs:
   container:
     runs-on: ubuntu-latest
     needs: verify
+    env:
+      POSTGRES_PASSWORD: istra-ci-only
+      ISTRA_COMPOSE_DATABASE_URL: postgresql://istra:istra-ci-only@postgres:5432/istra
     steps:
       - uses: actions/checkout@v4
       - name: Build and start the production service

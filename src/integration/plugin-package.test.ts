@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -58,17 +58,19 @@ describe("Codex plugin package", () => {
     expect(skill).toContain("Do not bypass it through REST, direct SQLite access or a second persistence mechanism.");
   });
 
-  it("runs the bundled stdio server and shares the application database", async () => {
+  it("runs the bundled stdio server outside the checkout and shares the application database", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "istra-plugin-test-"));
-    temporaryDirectories.push(dataDir);
+    const isolatedRoot = await mkdtemp(join(tmpdir(), "istra-plugin-package-"));
+    temporaryDirectories.push(dataDir, isolatedRoot);
+    await cp(pluginRoot, isolatedRoot, { recursive: true });
     const environment = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
     );
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: ["./dist/mcp/stdio.mjs"],
-      cwd: pluginRoot,
-      env: { ...environment, ISTRA_DATA_DIR: dataDir },
+      cwd: isolatedRoot,
+      env: { ...environment, ISTRA_STORAGE: "sqlite", ISTRA_DATABASE_URL: "", ISTRA_DATA_DIR: dataDir },
       stderr: "pipe",
     });
     const client = new Client({ name: "istra-plugin-test", version: "1.0.0" });
@@ -82,6 +84,7 @@ describe("Codex plugin package", () => {
         "create_run",
         "get_project_pulse_summary",
         "get_project_pulse",
+        "get_storage_status",
         "list_evidence_page",
         "list_operational_work_items_page",
         "list_requirements_page",
@@ -141,9 +144,58 @@ describe("Codex plugin package", () => {
       expect(report).toMatchObject({ kind: "design", status: "open" });
 
       const application = await createRuntime({ dataDir });
-      expect(application.service.getProject(project.id)?.project.title).toBe("Plugin-visible project");
-      expect(application.service.getErrorReport(report.id)?.report).toMatchObject({ id: report.id, kind: "design" });
-      application.close();
+      expect((await application.service.getProject(project.id))?.project.title).toBe("Plugin-visible project");
+      expect((await application.service.getErrorReport(report.id))?.report).toMatchObject({ id: report.id, kind: "design" });
+      await application.close();
+    } finally {
+      await client.close();
+      await transport.close();
+    }
+  });
+
+  it.runIf(Boolean(process.env.TEST_DATABASE_URL))("runs the isolated bundled MCP against PostgreSQL", async () => {
+    const isolatedRoot = await mkdtemp(join(tmpdir(), "istra-plugin-postgres-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "istra-plugin-postgres-config-"));
+    temporaryDirectories.push(isolatedRoot, dataDir);
+    await cp(pluginRoot, isolatedRoot, { recursive: true });
+    const environment = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    );
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["./dist/mcp/stdio.mjs"],
+      cwd: isolatedRoot,
+      env: {
+        ...environment,
+        ISTRA_STORAGE: "postgresql",
+        ISTRA_DATABASE_URL: process.env.TEST_DATABASE_URL!,
+        ISTRA_DATA_DIR: dataDir,
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "istra-plugin-postgres-test", version: "1.0.0" });
+
+    try {
+      await client.connect(transport);
+      const response = await client.callTool({ name: "get_storage_status", arguments: {} });
+      expect(response.isError).not.toBe(true);
+      expect(response.structuredContent).toMatchObject({
+        result: {
+          backend: "postgresql",
+          target: expect.stringMatching(/^postgres(?:ql)?:\/\//),
+          schemaVersion: expect.any(Number),
+          ready: true,
+          automaticBackups: false,
+          importSupported: false,
+        },
+      });
+      const target = new URL((response.structuredContent as { result: { target: string } }).result.target);
+      expect({ username: target.username, password: target.password, search: target.search, hash: target.hash }).toEqual({
+        username: "",
+        password: "",
+        search: "",
+        hash: "",
+      });
     } finally {
       await client.close();
       await transport.close();

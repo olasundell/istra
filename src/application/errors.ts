@@ -32,3 +32,9 @@ export class IdempotencyConflictError extends AppError {
     super('IDEMPOTENCY_CONFLICT', `Idempotency key ${key} was already used with different input`, 409)
   }
 }
+
+export class UnsupportedOperationError extends AppError {
+  constructor(message: string) {
+    super('UNSUPPORTED_OPERATION', message, 501)
+  }
+}

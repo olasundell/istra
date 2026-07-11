@@ -1,5 +1,4 @@
 import { z } from 'zod'
-import type { BackupManager } from '../infrastructure/sqlite/database.js'
 import {
   CheckpointSchema,
   CreateLabelSchema,
@@ -31,9 +30,8 @@ import {
   type MutationContext,
   type SearchFilters,
 } from '../domain/contracts.js'
-import { ValidationError } from './errors.js'
-import type { ExportBundle, IstraRepository } from './ports.js'
-import type { OperationalRepository } from '../infrastructure/sqlite/operational-repository.js'
+import { UnsupportedOperationError, ValidationError } from './errors.js'
+import type { Awaitable, DataProtection, ExportBundle, IstraRepository, OperationalRepository, StorageStatus } from './ports.js'
 
 const ExportBundleSchema = z.object({
   format: z.literal('istra-export'),
@@ -45,8 +43,17 @@ const ExportBundleSchema = z.object({
 const queryBoolean = (value: unknown): boolean => value === true || value === 'true'
 type OperationalCaller = Partial<Provenance> | string
 
+function flatMapAwaitable<T, U>(value: Awaitable<T>, map: (resolved: T) => Awaitable<U>): Awaitable<U> {
+  return value instanceof Promise ? value.then(map) : map(value)
+}
+
 export class IstraService {
-  constructor(private readonly repository: IstraRepository, private readonly backups: BackupManager, private readonly operational?: OperationalRepository) {}
+  constructor(
+    private readonly repository: IstraRepository,
+    private readonly dataProtection: DataProtection,
+    private readonly operational?: OperationalRepository,
+    private readonly readStorageStatus?: () => Awaitable<StorageStatus>,
+  ) {}
 
   private operations(): OperationalRepository {
     if (!this.operational) throw new ValidationError('Operational memory is not configured')
@@ -68,55 +75,68 @@ export class IstraService {
     }
   }
 
-  private async writeOperational<T>(caller: OperationalCaller, key: string | undefined, operationName: string, payload: unknown, operation: () => T): Promise<T> {
-    await this.backups.beforeWrite()
-    return this.operations().runMutation(this.mutationContext(caller, key), operationName, payload, operation)
+  private async writeOperational<T>(caller: OperationalCaller, key: string | undefined, operationName: string, payload: unknown, operation: () => Awaitable<T>): Promise<T> {
+    await this.dataProtection.beforeWrite()
+    return await this.operations().runMutation(this.mutationContext(caller, key), operationName, payload, operation)
   }
 
-  private async writeCore<T>(source: Partial<Provenance> | undefined, key: string | undefined, operationName: string, payload: unknown, operation: (context: MutationContext) => T): Promise<T> {
-    await this.backups.beforeWrite()
+  private async writeCore<T>(source: Partial<Provenance> | undefined, key: string | undefined, operationName: string, payload: unknown, operation: (context: MutationContext) => Awaitable<T>): Promise<T> {
+    await this.dataProtection.beforeWrite()
     const context = this.mutationContext(source, key)
-    return this.operations().runMutation(context, operationName, payload, () => operation(context))
+    return await this.operations().runMutation(context, operationName, payload, () => operation(context))
   }
 
-  listProjects(filters: unknown = {}) {
+  async listProjects(filters: unknown = {}) {
     const parsed = this.parse(z.object({ state: ProjectStateSchema.optional(), includeArchived: z.boolean().optional(), q: z.string().max(500).optional() }), filters)
-    return this.repository.listProjects(parsed)
+    return await this.repository.listProjects(parsed)
   }
 
-  getProject(id: string) { return this.repository.getProjectDetail(id) }
-  listPhases(projectId: string, includeArchived = false) { return this.repository.listPhases(projectId, includeArchived) }
-  listWorkItems(projectId: string, statuses?: string[]) {
+  async getProject(id: string) { return await this.repository.getProjectDetail(id) }
+  async listPhases(projectId: string, includeArchived = false) { return await this.repository.listPhases(projectId, includeArchived) }
+  async listWorkItems(projectId: string, statuses?: string[]) {
     const parsed = this.parse(z.array(WorkItemStatusSchema).max(10).optional(), statuses)
-    return this.repository.listWorkItems(projectId, parsed)
+    return await this.repository.listWorkItems(projectId, parsed)
   }
-  listWorkItemsPage(projectId: string, input: unknown = {}) {
+  async listWorkItemsPage(projectId: string, input: unknown = {}) {
     const parsed = this.parse(PageRequestSchema, input)
-    return this.repository.listWorkItemsPage(projectId, parsed.limit, parsed.cursor, this.parse(z.array(WorkItemStatusSchema).max(10).optional(), (input as { statuses?: unknown })?.statuses))
+    return await this.repository.listWorkItemsPage(projectId, parsed.limit, parsed.cursor, this.parse(z.array(WorkItemStatusSchema).max(10).optional(), (input as { statuses?: unknown })?.statuses))
   }
-  listUpdates(projectId: string, includeDeleted = false) { return this.repository.listUpdates(projectId, includeDeleted) }
-  listUpdatesPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.repository.listUpdatesPage(projectId, parsed.limit, parsed.cursor, queryBoolean((input as { includeDeleted?: unknown })?.includeDeleted)) }
-  listActivity(projectId: string, limit?: number) { return this.repository.listActivity(projectId, limit) }
-  listActivityPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.repository.listActivityPage(projectId, parsed.limit, parsed.cursor) }
-  listRecentActivity(limit?: number) { return this.repository.listRecentActivity(limit) }
-  getUpdateRevisions(updateId: string) { return this.repository.getUpdateRevisions(updateId) }
-  listLabels() { return this.repository.listLabels() }
-  listErrorReportsPage(input: unknown = {}) {
+  async listUpdates(projectId: string, includeDeleted = false) { return await this.repository.listUpdates(projectId, includeDeleted) }
+  async listUpdatesPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return await this.repository.listUpdatesPage(projectId, parsed.limit, parsed.cursor, queryBoolean((input as { includeDeleted?: unknown })?.includeDeleted)) }
+  async listActivity(projectId: string, limit?: number) { return await this.repository.listActivity(projectId, limit) }
+  async listActivityPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return await this.repository.listActivityPage(projectId, parsed.limit, parsed.cursor) }
+  async listRecentActivity(limit?: number) { return await this.repository.listRecentActivity(limit) }
+  async getUpdateRevisions(updateId: string) { return await this.repository.getUpdateRevisions(updateId) }
+  async listLabels() { return await this.repository.listLabels() }
+  async listErrorReportsPage(input: unknown = {}) {
     const parsed = this.parse(ErrorReportPageRequestSchema, input)
-    return this.operations().listErrorReportsPage(parsed.limit, parsed.cursor, parsed.statuses, parsed.kinds, parsed.component)
+    return await this.operations().listErrorReportsPage(parsed.limit, parsed.cursor, parsed.statuses, parsed.kinds, parsed.component)
   }
-  getErrorReport(id: string) { return this.operations().getErrorReport(id) }
-  search(query: string, limit?: number, filters: unknown = {}) {
+  async getErrorReport(id: string) { return await this.operations().getErrorReport(id) }
+  async search(query: string, limit?: number, filters: unknown = {}) {
     const parsed = this.parse(z.object({ projectId: z.string().uuid().optional(), entityTypes: z.array(z.enum(['project', 'phase', 'work_item', 'update', 'requirement', 'run', 'evidence'])).max(10).optional(), state: z.string().trim().max(100).optional(), phaseId: z.string().uuid().optional(), requirementId: z.string().uuid().optional(), evidenceResult: z.enum(['recorded', 'verified', 'failed', 'interrupted']).optional(), from: z.string().datetime({ offset: true }).optional(), to: z.string().datetime({ offset: true }).optional() }), filters) as SearchFilters
     const max = this.parse(z.number().int().min(1).max(200), limit ?? 50)
-    const core = this.repository.search(query, 200, parsed)
-    const operational = this.operational ? this.operations().search(query, 200, parsed) : []
+    const [core, operational] = await Promise.all([
+      this.repository.search(query, 200, parsed),
+      this.operations().search(query, 200, parsed),
+    ])
     const merged = new Map([...core, ...operational].map((entry) => [`${entry.type}:${entry.id}`, entry]))
     return [...merged.values()].slice(0, max)
   }
-  exportAll() { return this.repository.exportAll() }
+  async exportAll() { return await this.repository.exportAll() }
+  async storageStatus(): Promise<StorageStatus> {
+    if (this.readStorageStatus) return await this.readStorageStatus()
+    return {
+      backend: this.dataProtection.backend,
+      target: this.dataProtection.databasePath ?? this.dataProtection.backend,
+      schemaVersion: 0,
+      ready: true,
+      automaticBackups: this.dataProtection.automatic,
+      importSupported: this.dataProtection.importSupported,
+    }
+  }
   async backupStatus() {
-    const files = await this.backups.list()
+    const files = await this.dataProtection.list()
     const backups = files.map((file) => ({
       name: file.name,
       kind: file.name.startsWith('pre-import-') ? 'pre-import' : file.name.startsWith('pre-migration-') ? 'pre-migration' : file.name.startsWith('weekly-') ? 'weekly' : 'daily',
@@ -125,9 +145,12 @@ export class IstraService {
     })).sort((left, right) => right.createdAt.localeCompare(left.createdAt))
     const lastBackupAt = backups.reduce<string | null>((latest, file) => !latest || file.createdAt > latest ? file.createdAt : latest, null)
     return {
-      databasePath: this.backups.paths.databasePath,
+      backend: this.dataProtection.backend,
+      automaticBackups: this.dataProtection.automatic,
+      importSupported: this.dataProtection.importSupported,
+      databasePath: this.dataProtection.databasePath,
       lastBackupAt,
-      nextBackupKind: 'daily',
+      ...(this.dataProtection.automatic ? { nextBackupKind: 'daily' } : {}),
       backups,
     }
   }
@@ -183,12 +206,15 @@ export class IstraService {
   async saveCheckpoint(projectId: string, input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CheckpointSchema, input)
     const context = this.mutationContext(source, idempotencyKey)
-    await this.backups.beforeWrite()
-    return this.operations().runMutation(context, 'save_checkpoint', { projectId, parsed }, () => {
-      const checkpoint = this.repository.saveCheckpoint(projectId, parsed, context)
-      const snapshot = this.operations().captureCheckpointSnapshot(projectId, checkpoint.id)
-      return { checkpoint, snapshot: { id: snapshot.id, digest: snapshot.digest, schemaVersion: snapshot.schemaVersion, capturedAt: snapshot.capturedAt } }
-    })
+    await this.dataProtection.beforeWrite()
+    return await this.operations().runMutation(context, 'save_checkpoint', { projectId, parsed }, () => (
+      flatMapAwaitable(this.repository.saveCheckpoint(projectId, parsed, context), (checkpoint) => (
+        flatMapAwaitable(this.operations().captureCheckpointSnapshot(projectId, checkpoint.id), (snapshot) => ({
+          checkpoint,
+          snapshot: { id: snapshot.id, digest: snapshot.digest, schemaVersion: snapshot.schemaVersion, capturedAt: snapshot.capturedAt },
+        }))
+      ))
+    ))
   }
   createLabel(input: unknown, source?: Partial<Provenance>, idempotencyKey?: string) {
     const parsed = this.parse(CreateLabelSchema, input)
@@ -204,45 +230,48 @@ export class IstraService {
   }
 
   async importAll(value: unknown): Promise<void> {
+    if (!this.dataProtection.importSupported) {
+      throw new UnsupportedOperationError('Full replacement import is unavailable for PostgreSQL until backup and restore support is configured')
+    }
     const bundle = this.parse(ExportBundleSchema, value) as ExportBundle
-    this.repository.validateImport(bundle)
-    await this.backups.create('pre-import')
-    this.repository.importAll(bundle)
+    await this.repository.validateImport(bundle)
+    await this.dataProtection.create('pre-import')
+    await this.repository.importAll(bundle)
   }
 
-  listRequirementStates(projectId: string) { return this.operations().listRequirementStates(projectId) }
+  async listRequirementStates(projectId: string) { return await this.operations().listRequirementStates(projectId) }
   createRequirementState(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateRequirementStateSchema, input); const operation = () => this.operations().createRequirementState(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_requirement_state', { projectId, parsed }, operation) }
-  listRequirements(projectId: string) { return this.operations().listRequirements(projectId) }
-  listRequirementsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listRequirementsPage(projectId, parsed.limit, parsed.cursor) }
-  getRequirement(id: string) { return this.operations().getRequirement(id) }
+  async listRequirements(projectId: string) { return await this.operations().listRequirements(projectId) }
+  async listRequirementsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return await this.operations().listRequirementsPage(projectId, parsed.limit, parsed.cursor) }
+  async getRequirement(id: string) { return await this.operations().getRequirement(id) }
   createRequirement(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateRequirementSchema, input); const operation = () => this.operations().createRequirement(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_requirement', { projectId, parsed }, operation) }
   updateRequirement(id: string, input: unknown, caller: OperationalCaller = 'ui') { const parsed = this.parse(UpdateRequirementSchema, input); return this.writeOperational(caller, undefined, 'update_requirement', { id, parsed }, () => this.operations().updateRequirement(id, parsed)) }
   linkRequirementWork(projectId: string, requirementId: string, workItemId: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'link_requirement_work', { projectId, requirementId, workItemId }, () => this.operations().linkRequirementWork(projectId, requirementId, workItemId)) }
   unlinkRequirementWork(requirementId: string, workItemId: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'unlink_requirement_work', { requirementId, workItemId }, () => this.operations().unlinkRequirementWork(requirementId, workItemId)) }
-  getRequirementRollup(projectId: string) { return this.operations().getRequirementRollup(projectId) }
-  listWorkQueues(projectId: string) { return this.operations().listWorkQueues(projectId) }
+  async getRequirementRollup(projectId: string) { return await this.operations().getRequirementRollup(projectId) }
+  async listWorkQueues(projectId: string) { return await this.operations().listWorkQueues(projectId) }
   createWorkQueue(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkQueueSchema, input); const operation = () => this.operations().createWorkQueue(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_work_queue', { projectId, parsed }, operation) }
-  listOperationalWorkItems(projectId: string, queueId?: string) { return this.operations().listWorkItems(projectId, queueId) }
-  listOperationalWorkItemsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listWorkItemsPage(projectId, parsed.limit, parsed.cursor, (input as { queueId?: string })?.queueId) }
+  async listOperationalWorkItems(projectId: string, queueId?: string) { return await this.operations().listWorkItems(projectId, queueId) }
+  async listOperationalWorkItemsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return await this.operations().listWorkItemsPage(projectId, parsed.limit, parsed.cursor, (input as { queueId?: string })?.queueId) }
   linkWorkItems(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkRelationSchema, input); const operation = () => this.operations().linkWorkItems(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'link_work_items', { projectId, parsed }, operation) }
   unlinkWorkItems(id: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'unlink_work_items', { id }, () => this.operations().unlinkWorkItems(id)) }
-  listWorkRelations(projectId: string) { return this.operations().listWorkRelations(projectId) }
+  async listWorkRelations(projectId: string) { return await this.operations().listWorkRelations(projectId) }
   createExternalBlocker(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateExternalBlockerSchema, input); const operation = () => this.operations().createExternalBlocker(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_external_blocker', { projectId, parsed }, operation) }
-  listExternalBlockers(projectId: string, includeResolved = false) { return this.operations().listExternalBlockers(projectId, includeResolved) }
+  async listExternalBlockers(projectId: string, includeResolved = false) { return await this.operations().listExternalBlockers(projectId, includeResolved) }
   resolveExternalBlocker(id: string, caller: OperationalCaller = 'ui') { return this.writeOperational(caller, undefined, 'resolve_external_blocker', { id }, () => this.operations().resolveExternalBlocker(id)) }
   createWorkspace(input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkspaceSchema, input); const operation = () => this.operations().createWorkspace(parsed); return this.writeOperational(caller, idempotencyKey, 'create_workspace', parsed, operation) }
   linkProjectWorkspace(projectId: string, workspaceId: string, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const operation = () => this.operations().linkProjectWorkspace(projectId, workspaceId); return this.writeOperational(caller, idempotencyKey, 'link_project_workspace', { projectId, workspaceId }, operation) }
   createWorkspaceRevision(input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkspaceRevisionSchema, input); const operation = () => this.operations().createWorkspaceRevision(parsed); return this.writeOperational(caller, idempotencyKey, 'create_workspace_revision', parsed, operation) }
-  resolveProject(workspacePath: string) { return this.operations().resolveProject(workspacePath) }
+  async resolveProject(workspacePath: string) { return await this.operations().resolveProject(workspacePath) }
   createRun(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateRunSchema, input); const operation = () => this.operations().createRun(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_run', { projectId, parsed }, operation) }
-  listRuns(projectId: string) { return this.operations().listRuns(projectId) }
-  listRunsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listRunsPage(projectId, parsed.limit, parsed.cursor) }
+  async listRuns(projectId: string) { return await this.operations().listRuns(projectId) }
+  async listRunsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return await this.operations().listRunsPage(projectId, parsed.limit, parsed.cursor) }
   createEvidence(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateEvidenceSchema, input); const operation = () => this.operations().createEvidence(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_evidence', { projectId, parsed }, operation) }
-  listEvidence(projectId: string, includeStale = false) { return this.operations().listEvidence(projectId, includeStale) }
-  listEvidencePage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return this.operations().listEvidencePage(projectId, parsed.limit, parsed.cursor, queryBoolean((input as { includeStale?: unknown })?.includeStale)) }
+  async listEvidence(projectId: string, includeStale = false) { return await this.operations().listEvidence(projectId, includeStale) }
+  async listEvidencePage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return await this.operations().listEvidencePage(projectId, parsed.limit, parsed.cursor, queryBoolean((input as { includeStale?: unknown })?.includeStale)) }
   backfillLegacyCheckpointSnapshot(projectId: string, checkpointId: string, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const operation = () => this.operations().captureCheckpointSnapshot(projectId, checkpointId); return this.writeOperational(caller, idempotencyKey, 'legacy_backfill_checkpoint_snapshot', { projectId, checkpointId }, operation) }
-  getCheckpointSnapshot(checkpointId: string) { return this.operations().getCheckpointSnapshot(checkpointId) }
-  compareCheckpointSnapshots(leftCheckpointId: string, rightCheckpointId: string) { return this.operations().compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) }
-  reconstructCheckpointState(checkpointId: string) { return this.operations().reconstructCheckpointState(checkpointId) }
-  getProjectPulseSummary(projectId: string) { return this.operations().getProjectPulseSummary(projectId) }
+  async getCheckpointSnapshot(checkpointId: string) { return await this.operations().getCheckpointSnapshot(checkpointId) }
+  async compareCheckpointSnapshots(leftCheckpointId: string, rightCheckpointId: string) { return await this.operations().compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) }
+  async reconstructCheckpointState(checkpointId: string) { return await this.operations().reconstructCheckpointState(checkpointId) }
+  async getProjectPulseSummary(projectId: string) { return await this.operations().getProjectPulseSummary(projectId) }
 }

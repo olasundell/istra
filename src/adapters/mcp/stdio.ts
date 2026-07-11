@@ -8,7 +8,7 @@ const transport = new StdioServerTransport()
 
 const close = async () => {
   await server.close()
-  runtime.close()
+  await runtime.close()
 }
 process.once('SIGINT', () => void close())
 process.once('SIGTERM', () => void close())
