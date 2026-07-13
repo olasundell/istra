@@ -1,3 +1,5 @@
+import { postgresAutomationMigration } from './automation-migration.js'
+
 export interface PostgresMigration {
   version: number
   name: string
@@ -570,6 +572,10 @@ export const postgresMigrations: PostgresMigration[] = [{
     ) STORED;
     CREATE INDEX search_index_vector ON search_index USING GIN(search_vector);
   `,
+}, {
+  version: 4,
+  name: 'agent_queue_automation',
+  sql: postgresAutomationMigration,
 }]
 
 export const latestPostgresSchemaVersion = postgresMigrations.at(-1)?.version ?? 0

@@ -28,8 +28,10 @@ import type {
   WorkRelation,
   Page,
 } from "./types";
+import type { AutomationQueueFeed, QueueAutomationOverview, QueueAutomationPolicy, ReleaseAutomatedWorkResult, UpdateQueueAutomationPolicyInput } from "../domain/automation";
 
 const API_ROOT = "/api/v1";
+const mutationHeaders = (idempotencyKey: string = crypto.randomUUID()) => ({ "x-istra-client": "istra-web", "idempotency-key": idempotencyKey });
 
 export class ApiError extends Error {
   readonly status: number;
@@ -134,6 +136,10 @@ export const api = {
   listRequirementsPage: (projectId: string, limit = 50, cursor?: string) => request<Page<Requirement>>(`/projects/${projectId}/requirements/page${queryString({ limit: String(limit), cursor })}`),
   getRequirementRollup: (projectId: string) => request<RequirementRollup>(`/projects/${projectId}/requirements/rollup`),
   listWorkQueues: (projectId: string) => request<WorkQueue[]>(`/projects/${projectId}/work-queues`),
+  getQueueAutomationOverview: (projectId: string, queueId: string, signal?: AbortSignal) => request<QueueAutomationOverview>(`/projects/${projectId}/work-queues/${queueId}/automation`, { signal }),
+  waitForQueueAutomationChanges: (projectId: string, queueId: string, cursor: string, signal?: AbortSignal) => request<AutomationQueueFeed>(`/projects/${projectId}/work-queues/${queueId}/automation/wait${queryString({ cursor, timeoutSeconds: "30" })}`, { signal }),
+  updateQueueAutomationPolicy: (projectId: string, queueId: string, payload: UpdateQueueAutomationPolicyInput) => request<QueueAutomationPolicy>(`/projects/${projectId}/work-queues/${queueId}/automation-policy`, { method: "PUT", headers: mutationHeaders(), body: JSON.stringify(payload) }),
+  releaseAutomatedWork: (leaseId: string, expectedLeaseVersion: number, idempotencyKey: string) => request<ReleaseAutomatedWorkResult>(`/automation-leases/${leaseId}/operator-release`, { method: "POST", headers: mutationHeaders(idempotencyKey), body: JSON.stringify({ reason: "manual", expectedLeaseVersion }) }),
   listOperationalWorkItems: (projectId: string, queueId?: string) => request<WorkItem[]>(`/projects/${projectId}/operational-work-items${queryString({ queueId })}`),
   listOperationalWorkItemsPage: (projectId: string, limit = 50, cursor?: string, queueId?: string) => request<Page<WorkItem>>(`/projects/${projectId}/operational-work-items/page${queryString({ limit: String(limit), cursor, queueId })}`),
   listWorkRelations: (projectId: string) => request<WorkRelation[]>(`/projects/${projectId}/work-relations`),

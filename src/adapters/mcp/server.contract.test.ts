@@ -62,6 +62,15 @@ describe('MCP server contract', () => {
       'update_phase',
       'update_project',
       'update_work_item',
+      'get_queue_automation_policy',
+      'get_queue_automation_overview',
+      'update_queue_automation_policy',
+      'claim_next_automated_work',
+      'heartbeat_automated_work',
+      'record_automation_attempt',
+      'complete_automated_work',
+      'release_automated_work',
+      'wait_for_queue_changes',
     ]))
     expect(byName.has('import')).toBe(false)
     expect(byName.has('restore_backup')).toBe(false)
@@ -99,6 +108,18 @@ describe('MCP server contract', () => {
     ]))
     expect(createRunSchema.properties?.toolchain).toMatchObject({ type: 'object' })
     expect(createRunSchema.properties?.testSummary).toMatchObject({ type: 'object' })
+
+    for (const name of ['update_queue_automation_policy','claim_next_automated_work','heartbeat_automated_work','record_automation_attempt','complete_automated_work','release_automated_work']) {
+      const schema = byName.get(name)?.inputSchema as { required?: string[]; properties?: Record<string, { enum?: string[] }> }
+      expect(schema.required).toEqual(expect.arrayContaining(['client', 'idempotencyKey']))
+      expect(byName.get(name)?.annotations?.idempotentHint).toBe(true)
+    }
+    const releaseSchema = byName.get('release_automated_work')?.inputSchema as { required?: string[]; properties?: Record<string, { enum?: string[] }> }
+    expect(releaseSchema.required).toEqual(expect.arrayContaining(['leaseToken']))
+    expect(releaseSchema.properties?.reason?.enum).toEqual(['runner_shutdown', 'abandoned'])
+    expect(byName.has('operator_release_automated_work')).toBe(false)
+    const waitSchema = byName.get('wait_for_queue_changes')?.inputSchema as { properties?: Record<string, { type?: string; minimum?: number; maximum?: number; default?: number }> }
+    expect(waitSchema.properties?.timeoutSeconds).toMatchObject({ type: 'integer', minimum: 0, maximum: 60, default: 30 })
 
     for (const tool of tools) expect(tool.annotations?.destructiveHint).toBe(false)
     for (const readTool of ['get_storage_status', 'list_projects', 'get_project_pulse', 'list_work_items', 'search']) {

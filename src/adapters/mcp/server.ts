@@ -30,10 +30,21 @@ import {
   ErrorReportPageRequestSchema,
   UpdateErrorReportSchema,
 } from '../../domain/contracts.js'
+import {
+  ClaimNextAutomatedWorkSchema,
+  CompleteAutomatedWorkSchema,
+  HeartbeatAutomatedWorkSchema,
+  RecordAutomationAttemptSchema,
+  RunnerReleaseAutomatedWorkSchema,
+  UpdateQueueAutomationPolicySchema,
+  WaitForQueueChangesSchema,
+} from '../../domain/automation.js'
 
 const client = z.string().trim().max(200).optional().describe('Name of the MCP client recording this change')
+const automationClient = z.string().trim().min(1).max(200).describe('Stable operator-visible name of the automation client')
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
 const write = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+const idempotentWrite = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
 const source = (name?: string) => ({ source: 'mcp' as const, client: name ?? 'istra-mcp' })
 
 function result(data: unknown) {
@@ -263,6 +274,42 @@ export function createMcpServer(service: IstraService): McpServer {
     inputSchema: CreateWorkQueueSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }),
     annotations: write,
   }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createWorkQueue(projectId, input, idempotencyKey, source(clientName))))
+  server.registerTool('get_queue_automation_policy', {
+    description: 'Read the disabled-by-default automation policy for one work queue.',
+    inputSchema: z.object({ projectId: z.string().uuid(), queueId: z.string().uuid() }), annotations: readOnly,
+  }, async ({ projectId, queueId }) => result(await service.getQueueAutomationPolicy(projectId, queueId)))
+  server.registerTool('get_queue_automation_overview', {
+    description: 'Read queue automation policy, active and recently expired leases, the latest attempt and a scoped cursor without exposing lease tokens.',
+    inputSchema: z.object({ projectId: z.string().uuid(), queueId: z.string().uuid() }), annotations: readOnly,
+  }, async ({ projectId, queueId }) => result(await service.getQueueAutomationOverview(projectId, queueId)))
+  server.registerTool('update_queue_automation_policy', {
+    description: 'Explicitly enable, disable or configure automated claiming for one queue.',
+    inputSchema: UpdateQueueAutomationPolicySchema.extend({ projectId: z.string().uuid(), queueId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client: automationClient }), annotations: idempotentWrite,
+  }, async ({ projectId, queueId, idempotencyKey, client: clientName, ...input }) => result(await service.updateQueueAutomationPolicy(projectId, queueId, input, idempotencyKey, source(clientName))))
+  server.registerTool('claim_next_automated_work', {
+    description: 'Atomically claim the highest-ranked eligible work item under the queue policy.',
+    inputSchema: ClaimNextAutomatedWorkSchema.extend({ projectId: z.string().uuid(), queueId: z.string().uuid(), client: automationClient }), annotations: idempotentWrite,
+  }, async ({ projectId, queueId, client: clientName, ...input }) => result(await service.claimNextAutomatedWork(projectId, queueId, input, source(clientName))))
+  server.registerTool('heartbeat_automated_work', {
+    description: 'Extend a current automation lease using its opaque token.',
+    inputSchema: HeartbeatAutomatedWorkSchema.extend({ leaseId: z.string().uuid(), client: automationClient }), annotations: idempotentWrite,
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.heartbeatAutomatedWork(leaseId, input, source(clientName))))
+  server.registerTool('record_automation_attempt', {
+    description: 'Append a bounded observation, proof link or structured delivery reference to an automation attempt.',
+    inputSchema: RecordAutomationAttemptSchema.extend({ leaseId: z.string().uuid(), client: automationClient }), annotations: idempotentWrite,
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.recordAutomationAttempt(leaseId, input, source(clientName))))
+  server.registerTool('complete_automated_work', {
+    description: 'Token-check and atomically complete a lease without overwriting human-changed work state.',
+    inputSchema: CompleteAutomatedWorkSchema.extend({ leaseId: z.string().uuid(), client: automationClient }), annotations: idempotentWrite,
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.completeAutomatedWork(leaseId, input, source(clientName))))
+  server.registerTool('release_automated_work', {
+    description: 'Release a runner-owned automation lease using its opaque token. Operator release is available only through the local web control surface.',
+    inputSchema: RunnerReleaseAutomatedWorkSchema.extend({ leaseId: z.string().uuid(), client: automationClient }), annotations: idempotentWrite,
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.releaseAutomatedWork(leaseId, input, source(clientName))))
+  server.registerTool('wait_for_queue_changes', {
+    description: 'Long-poll a durable queue cursor for eligibility changes or lease expiry.',
+    inputSchema: WaitForQueueChangesSchema.extend({ projectId: z.string().uuid(), queueId: z.string().uuid() }), annotations: readOnly,
+  }, async ({ projectId, queueId, ...input }) => result(await service.waitForQueueChanges(projectId, queueId, input)))
   server.registerTool('list_operational_work_items', {
     description: 'List work items with queue rank and derived blocker reasons.',
     inputSchema: z.object({ projectId: z.string().uuid(), queueId: z.string().uuid().optional() }),

@@ -1,3 +1,5 @@
+import { sqliteAutomationMigration } from './automation-migration.js'
+
 export interface Migration {
   version: number
   name: string
@@ -432,4 +434,8 @@ export const migrations: Migration[] = [{
     CREATE INDEX error_reports_component_created ON error_reports(component, created_at DESC, id DESC);
     CREATE INDEX error_reports_project_created ON error_reports(project_id, created_at DESC, id DESC);
   `,
+}, {
+  version: 3,
+  name: 'agent_queue_automation',
+  sql: sqliteAutomationMigration,
 }]

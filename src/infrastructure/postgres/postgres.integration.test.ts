@@ -273,7 +273,7 @@ describe.skipIf(!testDatabaseUrl)('PostgreSQL storage integration', () => {
       .toEqual(expect.arrayContaining([expect.objectContaining({ type: 'requirement', id: requirement.id })]))
 
     const exported = await repository.exportAll()
-    expect(exported.formatVersion).toBe(4)
+    expect(exported.formatVersion).toBe(5)
     expect(exported.tables.projects).toHaveLength(1)
     expect(exported.tables.checkpoint_snapshots).toHaveLength(1)
   }, 30_000)
@@ -291,6 +291,23 @@ describe.skipIf(!testDatabaseUrl)('PostgreSQL storage integration', () => {
     const rejection = updates.find(({ status }) => status === 'rejected')
     expect(rejection).toMatchObject({ status: 'rejected', reason: expect.any(ConflictError) })
     await expect(repository.getProject(project.id)).resolves.toMatchObject({ version: project.version + 1 })
+  }, 30_000)
+
+  it('allows exactly one concurrent automation claimant for a work item', async () => {
+    const { repository, operational } = harness!
+    const project = await repository.createProject({ title: 'Claim concurrency' }, provenance)
+    const item = await repository.createWorkItem(project.id, { kind: 'task', title: 'Claim exactly once' }, provenance)
+    await operational.updateQueueAutomationPolicy(project.id, item.queueId!, {
+      expectedVersion: null, enabled: true, allowedKinds: ['task'], maxActiveClaims: 1, leaseSeconds: 60, requiresManualApproval: false, allowSameWorkerRecovery: true,
+    })
+
+    const results = await Promise.all([
+      operational.claimNextAutomatedWork(project.id, item.queueId!, { workerId: 'worker-left', idempotencyKey: 'claim-left' }),
+      operational.claimNextAutomatedWork(project.id, item.queueId!, { workerId: 'worker-right', idempotencyKey: 'claim-right' }),
+    ])
+    expect(results.filter(({ outcome }) => outcome === 'claimed')).toHaveLength(1)
+    expect(results.filter(({ outcome }) => outcome === 'capacity_reached')).toHaveLength(1)
+    await expect(operational.getQueueAutomationOverview(project.id, item.queueId!)).resolves.toMatchObject({ activeLeases: [expect.objectContaining({ workItemId: item.id })] })
   }, 30_000)
 
   it('serialises opposite requirement-parent mutations', async () => {
@@ -487,6 +504,10 @@ describe.skipIf(!testDatabaseUrl)('PostgreSQL storage integration', () => {
         title: 'Compare portable tables',
         requirementIds: [requirement.id],
       }, provenance)
+      sourceOperational.updateQueueAutomationPolicy(project.id, workItem.queueId!, {
+        expectedVersion: null, enabled: true, allowedKinds: ['task'], maxActiveClaims: 1, leaseSeconds: 60,
+        requiresManualApproval: false, allowSameWorkerRecovery: true,
+      })
       const checkpoint = sourceRepository.saveCheckpoint(project.id, {
         expectedVersion: project.version,
         content: 'SQLite migration fixture checkpoint',
@@ -514,6 +535,7 @@ describe.skipIf(!testDatabaseUrl)('PostgreSQL storage integration', () => {
 
       const result = await repository.importForMigration(sourceBundle)
       expect(result.tableCounts.projects).toBe(1)
+      expect(result.tableCounts.work_queue_automation_policies).toBe(1)
       const targetBundle = await repository.exportAll()
       expect(canonicalJson(targetBundle.tables)).toBe(canonicalJson(sourceBundle.tables))
       expect(await repository.search('migration fixture', 20, { projectId: project.id })).toEqual(expect.arrayContaining([

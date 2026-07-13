@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { UnsupportedOperationError, ValidationError } from '../application/errors.js'
 import type { IstraRepository, OperationalRepository } from '../application/ports.js'
 import { canonicalJson } from '../domain/canonical-json.js'
-import type { Provenance } from '../domain/contracts.js'
+import type { MutationContext, Provenance } from '../domain/contracts.js'
 import { openPostgresDatabase } from './postgres/database.js'
 import { PostgresOperationalRepository } from './postgres/operational-repository.js'
 import { PostgresIstraRepository } from './postgres/repository.js'
@@ -18,6 +18,7 @@ import { SqliteOperationalRepository } from './sqlite/operational-repository.js'
 import { SqliteIstraRepository } from './sqlite/repository.js'
 
 const provenance: Provenance = { source: 'system', client: 'repository-contract' }
+const mutationContext = (key: string): MutationContext => ({ source: 'mcp', client: 'repository-contract', actor: 'repository-contract', idempotencyKey: key, occurredAt: new Date().toISOString() })
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 
 interface RepositoryHarness {
@@ -278,7 +279,7 @@ function repositoryBehaviourContract(name: string, factory: RepositoryFactory, s
       const first = await harness.repository.exportAll()
       const second = await harness.repository.exportAll()
 
-      expect(first).toMatchObject({ format: 'istra-export', formatVersion: 4 })
+      expect(first).toMatchObject({ format: 'istra-export', formatVersion: 5 })
       expect(canonicalJson(second.tables)).toBe(canonicalJson(first.tables))
       for (const rows of Object.values(first.tables)) {
         expect(rows).toEqual([...rows].sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right))))
@@ -313,6 +314,24 @@ function repositoryBehaviourContract(name: string, factory: RepositoryFactory, s
       } else {
         await expect(validate(first)).rejects.toBeInstanceOf(UnsupportedOperationError)
       }
+    }, 30_000)
+
+    it('keeps automation claim, lease, attempt and completion semantics backend-neutral', async () => {
+      const { repository, operational } = harness
+      const project = await repository.createProject({ title: 'Automation parity' }, provenance)
+      const item = await repository.createWorkItem(project.id, { kind: 'task', title: 'Backend-neutral claim' }, provenance)
+      const queueId = item.queueId!
+      expect(await operational.getQueueAutomationPolicy(project.id, queueId)).toMatchObject({ enabled: false, version: 0 })
+      await operational.runMutation(mutationContext('policy'), 'update_queue_automation_policy', {}, () => operational.updateQueueAutomationPolicy(project.id, queueId, {
+        expectedVersion: null, enabled: true, allowedKinds: ['task'], maxActiveClaims: 1, leaseSeconds: 60, requiresManualApproval: false, allowSameWorkerRecovery: true,
+      }))
+      const claim = await operational.runMutation(mutationContext('claim'), 'claim_next_automated_work', {}, () => operational.claimNextAutomatedWork(project.id, queueId, { workerId: 'contract-worker', idempotencyKey: 'claim' }))
+      expect(claim).toMatchObject({ outcome: 'claimed', item: { id: item.id, status: 'in_progress' }, attempt: { ordinal: 1 } })
+      if (claim.outcome !== 'claimed') throw new Error('Expected a claim')
+      await operational.runMutation(mutationContext('observation'), 'record_automation_attempt', {}, () => operational.recordAutomationAttempt(claim.lease.id, { leaseToken: claim.lease.leaseToken, idempotencyKey: 'observation', kind: 'verification', summary: 'Backend contract passed.' }))
+      const completed = await operational.runMutation(mutationContext('complete'), 'complete_automated_work', {}, () => operational.completeAutomatedWork(claim.lease.id, { leaseToken: claim.lease.leaseToken, idempotencyKey: 'complete', outcome: 'resolved', expectedWorkItemVersion: claim.item.version }))
+      expect(completed).toMatchObject({ outcome: 'resolved', item: { status: 'resolved' }, lease: { releasedAt: expect.any(String), terminalOutcome: 'resolved' } })
+      expect(await operational.getQueueAutomationOverview(project.id, queueId)).toMatchObject({ activeLeases: [], lastAttempt: { outcome: 'resolved', observations: [expect.objectContaining({ kind: 'verification' })] } })
     }, 30_000)
   })
 }

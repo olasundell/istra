@@ -78,6 +78,70 @@ describe('HTTP API contract', () => {
     })
   })
 
+  it('configures, claims, observes and manually releases queue automation over HTTP', async () => {
+    const project = await createProject('HTTP automation')
+    const itemResponse = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.id}/work-items`, headers: jsonHeaders, payload: { kind: 'task', title: 'HTTP claimed task' } })
+    expect(itemResponse.statusCode).toBe(200)
+    const item = itemResponse.json().data as { id: string; queueId: string; version: number }
+    const automationHeaders = { ...jsonHeaders, 'x-istra-client': 'http-automation-test', 'idempotency-key': 'policy-1' }
+
+    const initial = await app.inject({ method: 'GET', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation`, headers: { host: 'localhost:4317' } })
+    expect(initial.json()).toMatchObject({ data: { policy: { enabled: false, version: 0 }, activeLeases: [], expiredLeases: [], cursor: expect.any(String) } })
+    const policy = await app.inject({ method: 'PUT', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation-policy`, headers: automationHeaders, payload: { expectedVersion: null, enabled: true, allowedKinds: ['task'], maxActiveClaims: 1, leaseSeconds: 60, requiresManualApproval: false, allowSameWorkerRecovery: true } })
+    expect(policy.statusCode).toBe(200)
+    expect(policy.json()).toMatchObject({ data: { enabled: true, allowedKinds: ['task'] } })
+
+    const claim = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation/claim`, headers: { ...automationHeaders, 'idempotency-key': 'claim-1' }, payload: { workerId: 'http-worker' } })
+    expect(claim.statusCode).toBe(200)
+    const claimed = claim.json().data as { outcome: string; lease: { id: string; leaseToken: string; version: number } }
+    expect(claimed).toMatchObject({ outcome: 'claimed', lease: { leaseToken: expect.any(String) } })
+    const overview = await app.inject({ method: 'GET', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation`, headers: { host: 'localhost:4317' } })
+    expect(overview.json()).toMatchObject({ data: { activeLeases: [{ id: claimed.lease.id, workerId: 'http-worker' }] } })
+    expect(JSON.stringify(overview.json())).not.toContain(claimed.lease.leaseToken)
+
+    const wait = await app.inject({ method: 'GET', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation/wait?cursor=${encodeURIComponent((claim.json().data as { feed: { cursor: string } }).feed.cursor)}&timeoutSeconds=0`, headers: { host: 'localhost:4317' } })
+    expect(wait.statusCode).toBe(200)
+    expect(wait.json()).toMatchObject({ data: { timedOut: true, changes: [] } })
+
+    const invalidWait = await app.inject({ method: 'GET', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation/wait?timeoutSeconds=invalid`, headers: { host: 'localhost:4317' } })
+    expect(invalidWait.statusCode).toBe(400)
+
+    const tokenlessRunnerRelease = await app.inject({ method: 'POST', url: `/api/v1/automation-leases/${claimed.lease.id}/release`, headers: { ...automationHeaders, 'idempotency-key': 'runner-release-1' }, payload: { reason: 'runner_shutdown' } })
+    expect(tokenlessRunnerRelease.statusCode).toBe(400)
+
+    const release = await app.inject({ method: 'POST', url: `/api/v1/automation-leases/${claimed.lease.id}/operator-release`, headers: { ...automationHeaders, 'idempotency-key': 'operator-release-1' }, payload: { reason: 'manual', expectedLeaseVersion: claimed.lease.version } })
+    expect(release.statusCode).toBe(200)
+    expect(release.json()).toMatchObject({ data: { outcome: 'released', item: { status: 'open' } } })
+  })
+
+  it('requires explicit, bounded provenance and idempotency for automation mutations', async () => {
+    const project = await createProject('HTTP automation provenance')
+    const itemResponse = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.id}/work-items`, headers: jsonHeaders, payload: { kind: 'task', title: 'Provenance task' } })
+    const item = itemResponse.json().data as { queueId: string }
+    const url = `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation-policy`
+    const payload = { expectedVersion: null, enabled: true, allowedKinds: ['task'], maxActiveClaims: 1, leaseSeconds: 60, requiresManualApproval: false, allowSameWorkerRecovery: true }
+
+    const missingClient = await app.inject({ method: 'PUT', url, headers: { ...jsonHeaders, 'idempotency-key': 'missing-client' }, payload })
+    expect(missingClient.statusCode).toBe(400)
+    expect(missingClient.json()).toMatchObject({ error: { code: 'VALIDATION_ERROR', message: expect.stringContaining('x-istra-client') } })
+
+    const blankClient = await app.inject({ method: 'PUT', url, headers: { ...jsonHeaders, 'x-istra-client': '   ', 'idempotency-key': 'blank-client' }, payload })
+    expect(blankClient.statusCode).toBe(400)
+
+    const missingIdempotency = await app.inject({ method: 'PUT', url, headers: { ...jsonHeaders, 'x-istra-client': 'provenance-test' }, payload })
+    expect(missingIdempotency.statusCode).toBe(400)
+    expect(missingIdempotency.json()).toMatchObject({ error: { code: 'VALIDATION_ERROR', message: expect.stringContaining('Idempotency-Key') } })
+
+    const blankIdempotency = await app.inject({ method: 'PUT', url, headers: { ...jsonHeaders, 'x-istra-client': 'provenance-test', 'idempotency-key': '   ' }, payload })
+    expect(blankIdempotency.statusCode).toBe(400)
+
+    const overlongClient = await app.inject({ method: 'PUT', url, headers: { ...jsonHeaders, 'x-istra-client': 'x'.repeat(201), 'idempotency-key': 'overlong-client' }, payload })
+    expect(overlongClient.statusCode).toBe(400)
+
+    const overlongIdempotency = await app.inject({ method: 'PUT', url, headers: { ...jsonHeaders, 'x-istra-client': 'provenance-test', 'idempotency-key': 'x'.repeat(201) }, payload })
+    expect(overlongIdempotency.statusCode).toBe(400)
+  })
+
   it('rejects foreign hosts, foreign origins and non-JSON mutations', async () => {
     const foreignHost = await app.inject({ method: 'GET', url: '/api/v1/health', headers: { host: 'istra.example.com' } })
     expect(foreignHost.statusCode).toBe(403)
@@ -208,7 +272,7 @@ describe('HTTP API contract', () => {
     expect(exportResponse.statusCode).toBe(200)
     expect(exportResponse.headers['content-disposition']).toContain('attachment;')
     const exported = exportResponse.json() as ExportBundle
-    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 4 })
+    expect(exported).toMatchObject({ format: 'istra-export', formatVersion: 5 })
     expect(exported).not.toHaveProperty('data')
 
     const importResponse = await app.inject({

@@ -95,3 +95,57 @@ test("dashboard and project detail remain usable on a narrow viewport", async ({
   await expect(page.getByRole("navigation", { name: "Main navigation" })).toBeVisible();
   await expect(page.locator("body")).not.toHaveCSS("overflow-x", "scroll");
 });
+
+test("operator can enable queue automation and release a runner lease", async ({ page }) => {
+  const suffix = Date.now();
+  const projectResponse = await page.request.post("/api/v1/projects", {
+    data: {
+      title: `Automation Garden ${suffix}`,
+      description: "Browser coverage for operator-controlled queue automation.",
+    },
+  });
+  expect(projectResponse.ok()).toBeTruthy();
+  const project = (await projectResponse.json()).data as { id: string };
+
+  const itemResponse = await page.request.post(`/api/v1/projects/${project.id}/work-items`, {
+    data: { kind: "task", title: `Automate calibration ${suffix}` },
+  });
+  expect(itemResponse.ok()).toBeTruthy();
+  const item = (await itemResponse.json()).data as { id: string; queueId: string; title: string };
+
+  await page.goto(`/projects/${project.id}`);
+  const automation = page.getByRole("region", { name: "Automation" });
+  await automation.getByRole("button", { name: "Configure policy" }).click();
+  const policyDialog = page.getByRole("dialog");
+  await policyDialog.getByLabel("Enable automated claiming").check();
+  await policyDialog.getByRole("button", { name: "Save policy" }).click();
+  await expect(policyDialog).toBeHidden();
+  await expect(automation.getByText("Enabled", { exact: true })).toBeVisible();
+
+  const workerId = `e2e-${"w".repeat(170)}-${suffix}`;
+  const claimResponse = await page.request.post(
+    `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation/claim`,
+    {
+      headers: {
+        "x-istra-client": "istra-e2e",
+        "idempotency-key": `e2e-claim-${suffix}`,
+      },
+      data: { workerId },
+    },
+  );
+  expect(claimResponse.ok()).toBeTruthy();
+  await expect(claimResponse.json()).resolves.toMatchObject({ data: { outcome: "claimed" } });
+
+  const releaseButton = automation.getByRole("button", { name: `Release lease for ${item.title} held by ${workerId}` });
+  await expect(releaseButton).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  page.once("dialog", (dialog) => void dialog.accept());
+  await releaseButton.click();
+  await expect(automation.getByText("No unreleased runner lease.", { exact: true })).toBeVisible();
+
+  const operationalResponse = await page.request.get(`/api/v1/projects/${project.id}/operational-work-items`);
+  expect(operationalResponse.ok()).toBeTruthy();
+  const operationalItems = (await operationalResponse.json()).data as Array<{ id: string; status: string }>;
+  expect(operationalItems.find((candidate) => candidate.id === item.id)?.status).toBe("open");
+});

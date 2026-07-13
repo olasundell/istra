@@ -10,6 +10,7 @@ import { formatDate, humanise, toActivityView, updateContent } from "../../forma
 import { projectStates, type Phase, type ProjectPulseSummary, type ProjectState, type ProjectUpdate, type Requirement, type WorkItem } from "../../types";
 import { useResource } from "../../useResource";
 import { CheckpointDrawer, EditProjectDialog, PhaseDialog, UpdateDialog, WorkItemDialog } from "./ProjectForms";
+import { QueueAutomationPanel } from "./QueueAutomationPanel";
 
 type Panel =
   | { type: "checkpoint" }
@@ -25,6 +26,7 @@ export function ProjectPage() {
   const detail = useResource(() => api.getProject(projectId), [projectId]);
   const operationalPulse = useResource(() => api.getPulseSummary(projectId), [projectId]);
   const requirements = useResource(() => api.listRequirementsPage(projectId, 8), [projectId]);
+  const workQueues = useResource(() => api.listWorkQueues(projectId), [projectId]);
   const allPhases = useResource(() => api.listPhases(projectId, true), [projectId]);
   const globalLabels = useResource(() => api.listLabels(), []);
   const [panel, setPanel] = useState<Panel>(null);
@@ -39,7 +41,7 @@ export function ProjectPage() {
     return items.filter((item) => item.status === "open" || item.status === "in_progress");
   }, [detail.data?.workItems, workFilter]);
 
-  if (detail.loading) return <ProjectSkeleton />;
+  if (detail.loading || (detail.data && detail.data.project.id !== projectId)) return <ProjectSkeleton />;
   if (detail.error) {
     if (detail.error instanceof ApiError && detail.error.status === 404) {
       return <div className="page"><EmptyState title="Project not found" action={<Link className="text-button" to="/">Back to projects</Link>}>It may have been removed or the address is no longer valid.</EmptyState></div>;
@@ -135,6 +137,14 @@ export function ProjectPage() {
         pulse={operationalPulse.data}
         requirements={requirements.data?.items ?? []}
         requirementsLoading={requirements.loading}
+      />
+
+      <QueueAutomationPanel
+        onEligibilityChanged={() => operationalPulse.reload()}
+        projectId={project.id}
+        queues={workQueues.data ?? []}
+        queuesError={workQueues.error}
+        queuesLoading={workQueues.loading}
       />
 
       <section aria-labelledby="phases-heading" className="phases-section">

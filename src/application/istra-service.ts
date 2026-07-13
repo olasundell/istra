@@ -30,12 +30,23 @@ import {
   type MutationContext,
   type SearchFilters,
 } from '../domain/contracts.js'
+import {
+  ClaimNextAutomatedWorkSchema,
+  CompleteAutomatedWorkSchema,
+  HeartbeatAutomatedWorkSchema,
+  OperatorReleaseAutomatedWorkSchema,
+  RecordAutomationAttemptSchema,
+  RunnerReleaseAutomatedWorkSchema,
+  UpdateQueueAutomationPolicySchema,
+  WaitForQueueChangesSchema,
+} from '../domain/automation.js'
+import { decodeAutomationCursor, encodeAutomationCursor } from './automation-cursor.js'
 import { UnsupportedOperationError, ValidationError } from './errors.js'
 import type { Awaitable, DataProtection, ExportBundle, IstraRepository, OperationalRepository, StorageStatus } from './ports.js'
 
 const ExportBundleSchema = z.object({
   format: z.literal('istra-export'),
-  formatVersion: z.union([z.literal(3), z.literal(4)]),
+  formatVersion: z.union([z.literal(3), z.literal(4), z.literal(5)]),
   exportedAt: z.string().datetime({ offset: true }),
   tables: z.record(z.array(z.record(z.unknown()))),
 }).strict()
@@ -73,6 +84,15 @@ export class IstraService {
       source: provenance.source ?? 'ui', actor: (provenance.actor ?? client) || 'local-user', client,
       idempotencyKey: key ?? provenance.idempotencyKey ?? null, occurredAt: provenance.occurredAt ?? new Date().toISOString(),
     }
+  }
+
+  private automationCaller(caller: OperationalCaller): OperationalCaller {
+    if (typeof caller === 'string') {
+      if (!caller.trim()) throw new ValidationError('Automation mutations require a client name')
+      return caller
+    }
+    if (!caller.client?.trim()) throw new ValidationError('Automation mutations require a client name')
+    return caller
   }
 
   private async writeOperational<T>(caller: OperationalCaller, key: string | undefined, operationName: string, payload: unknown, operation: () => Awaitable<T>): Promise<T> {
@@ -251,6 +271,31 @@ export class IstraService {
   async getRequirementRollup(projectId: string) { return await this.operations().getRequirementRollup(projectId) }
   async listWorkQueues(projectId: string) { return await this.operations().listWorkQueues(projectId) }
   createWorkQueue(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkQueueSchema, input); const operation = () => this.operations().createWorkQueue(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'create_work_queue', { projectId, parsed }, operation) }
+  async getQueueAutomationPolicy(projectId: string, queueId: string) { return await this.operations().getQueueAutomationPolicy(projectId, queueId) }
+  async getQueueAutomationOverview(projectId: string, queueId: string) { return await this.operations().getQueueAutomationOverview(projectId, queueId) }
+  updateQueueAutomationPolicy(projectId: string, queueId: string, input: unknown, idempotencyKey: string | undefined, caller: OperationalCaller) { const parsed = this.parse(UpdateQueueAutomationPolicySchema, input); if (!idempotencyKey) throw new ValidationError('Automation mutations require an idempotency key'); const operation = () => this.operations().updateQueueAutomationPolicy(projectId, queueId, parsed); return this.writeOperational(this.automationCaller(caller), idempotencyKey, 'update_queue_automation_policy', { projectId, queueId, parsed }, operation) }
+  claimNextAutomatedWork(projectId: string, queueId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(ClaimNextAutomatedWorkSchema, input); const operation = () => this.operations().claimNextAutomatedWork(projectId, queueId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'claim_next_automated_work', { projectId, queueId, parsed }, operation) }
+  heartbeatAutomatedWork(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(HeartbeatAutomatedWorkSchema, input); const operation = () => this.operations().heartbeatAutomatedWork(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'heartbeat_automated_work', { leaseId, parsed }, operation) }
+  recordAutomationAttempt(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(RecordAutomationAttemptSchema, input); const operation = () => this.operations().recordAutomationAttempt(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'record_automation_attempt', { leaseId, parsed }, operation) }
+  completeAutomatedWork(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(CompleteAutomatedWorkSchema, input); const operation = () => this.operations().completeAutomatedWork(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'complete_automated_work', { leaseId, parsed }, operation) }
+  releaseAutomatedWork(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(RunnerReleaseAutomatedWorkSchema, input); const operation = () => this.operations().releaseAutomatedWork(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'release_automated_work', { leaseId, parsed }, operation) }
+  operatorReleaseAutomatedWork(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(OperatorReleaseAutomatedWorkSchema, input); const operation = () => this.operations().operatorReleaseAutomatedWork(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'operator_release_automated_work', { leaseId, parsed }, operation) }
+  async waitForQueueChanges(projectId: string, queueId: string, input: unknown = {}) {
+    const parsed = this.parse(WaitForQueueChangesSchema, input)
+    const started = Date.now(); const deadline = started + parsed.timeoutSeconds * 1_000
+    const initial = new Date(started).toISOString(); const cursor = decodeAutomationCursor(parsed.cursor, initial, { projectId, queueId })
+    for (;;) {
+      const checkedAt = new Date().toISOString()
+      const probe = await this.operations().readAutomationQueueChanges(projectId, queueId, cursor.sequence, cursor.checkedAt, checkedAt)
+      const expiryChanges = probe.expiredLeases.map((lease) => ({ sequence: probe.cursorSequence, projectId, queueId, eventType: 'work_lease.expired', entityType: 'work_lease', entityId: lease.id, createdAt: lease.expiresAt }))
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.entityId.localeCompare(right.entityId))
+      if (probe.changes.length || expiryChanges.length) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [...probe.changes, ...expiryChanges], timedOut: false }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [], timedOut: true }
+      const untilExpiry = probe.nextExpiryAt ? Math.max(0, Date.parse(probe.nextExpiryAt) - Date.now()) : remaining
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, remaining, untilExpiry)))
+    }
+  }
   async listOperationalWorkItems(projectId: string, queueId?: string) { return await this.operations().listWorkItems(projectId, queueId) }
   async listOperationalWorkItemsPage(projectId: string, input: unknown = {}) { const parsed = this.parse(PageRequestSchema, input); return await this.operations().listWorkItemsPage(projectId, parsed.limit, parsed.cursor, (input as { queueId?: string })?.queueId) }
   linkWorkItems(projectId: string, input: unknown, idempotencyKey?: string, caller: OperationalCaller = 'ui') { const parsed = this.parse(CreateWorkRelationSchema, input); const operation = () => this.operations().linkWorkItems(projectId, parsed); return this.writeOperational(caller, idempotencyKey, 'link_work_items', { projectId, parsed }, operation) }

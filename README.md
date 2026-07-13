@@ -102,7 +102,7 @@ Set `ISTRA_DATA_DIR` to keep SQLite elsewhere and `ISTRA_BACKUP_DIR` to separate
 
 Use the Data management view for a portable, versioned JSON export. SQLite supports validated full-replacement import and creates a pre-import snapshot. PostgreSQL automated backups and destructive full-replacement imports are deferred; export remains available, but PostgreSQL reports backups as unavailable and rejects replacement import.
 
-The authoritative ledger starts at migration v1 and adds the global error-report inbox in v2; PostgreSQL v3 adds indexed accent-insensitive search parity. Existing databases with matching migration history upgrade transactionally; SQLite takes a pre-migration snapshot first, while incompatible legacy histories fail closed and are never deleted automatically. Istra exports format v4, accepts v3 and v4 SQLite imports, and treats a v3 import as a full replacement with an empty error inbox.
+The authoritative ledger starts at migration v1 and adds the global error-report inbox in v2; SQLite v3 and PostgreSQL v4 add agent queue automation, while PostgreSQL v3 adds indexed accent-insensitive search parity. Existing databases with matching migration history upgrade transactionally; SQLite takes a pre-migration snapshot first, while incompatible legacy histories fail closed and are never deleted automatically. Istra exports format v5, accepts v3–v5 SQLite imports, and treats older imports as full replacements with disabled automation policies and no lease or attempt history. Portable v5 exports omit automation idempotency responses so lease bearer tokens are never exported; unreleased leases are restored expired with invalidated tokens and must be recovered or released explicitly.
 
 ## MCP
 

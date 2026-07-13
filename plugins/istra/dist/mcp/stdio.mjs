@@ -11,7 +11,7 @@ import require$$1$2 from "tls";
 import require$$0$6 from "path";
 import require$$0$5 from "stream";
 import require$$1$3 from "string_decoder";
-import { randomUUID, createHash } from "node:crypto";
+import { createHash, randomUUID, randomBytes } from "node:crypto";
 import { resolve as resolve$1, join, dirname, basename } from "node:path";
 import { mkdir, stat, open, readFile, rm, copyFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -3548,8 +3548,8 @@ const ZodType$1 = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
   inst.superRefine = (refinement) => inst.check(superRefine(refinement));
   inst.overwrite = (fn) => inst.check(_overwrite(fn));
   inst.optional = () => optional(inst);
-  inst.nullable = () => nullable(inst);
-  inst.nullish = () => optional(nullable(inst));
+  inst.nullable = () => nullable$2(inst);
+  inst.nullish = () => optional(nullable$2(inst));
   inst.nonoptional = (params) => nonoptional(inst, params);
   inst.array = () => array(inst);
   inst.or = (arg) => union([inst, arg]);
@@ -4001,7 +4001,7 @@ const ZodNullable$1 = /* @__PURE__ */ $constructor("ZodNullable", (inst, def) =>
   ZodType$1.init(inst, def);
   inst.unwrap = () => inst._zod.def.innerType;
 });
-function nullable(innerType) {
+function nullable$2(innerType) {
   return new ZodNullable$1({
     type: "nullable",
     innerType
@@ -9715,6 +9715,73 @@ const ErrorReportPageRequestSchema = PageRequestSchema.extend({
   kinds: arrayType(ErrorReportKindSchema).min(1).max(errorReportKinds.length).optional(),
   component: stringType().trim().min(1).max(200).optional()
 }).strict();
+const automationWorkItemKinds = ["issue", "task"];
+const automationAttemptObservationKinds = ["progress", "verification", "delivery", "note"];
+const automationCompletionOutcomes = ["resolved", "awaiting_approval", "retryable", "blocked", "interrupted"];
+const automationReleaseReasons = ["manual", "runner_shutdown", "recovery", "abandoned", "expired"];
+const runnerAutomationReleaseReasons = ["runner_shutdown", "abandoned"];
+const AutomationWorkItemKindSchema = enumType(automationWorkItemKinds);
+const AutomationAttemptObservationKindSchema = enumType(automationAttemptObservationKinds);
+const AutomationCompletionOutcomeSchema = enumType(automationCompletionOutcomes);
+enumType(automationReleaseReasons);
+const RunnerAutomationReleaseReasonSchema = enumType(runnerAutomationReleaseReasons);
+const boundedIdempotencyKey = stringType().trim().min(1).max(200);
+const leaseToken = stringType().trim().min(32).max(500);
+const UpdateQueueAutomationPolicySchema = objectType({
+  expectedVersion: numberType().int().positive().nullable(),
+  enabled: booleanType(),
+  allowedKinds: arrayType(AutomationWorkItemKindSchema).min(1).max(automationWorkItemKinds.length),
+  maxActiveClaims: numberType().int().min(1).max(32),
+  leaseSeconds: numberType().int().min(30).max(5400),
+  requiresManualApproval: booleanType(),
+  allowSameWorkerRecovery: booleanType()
+}).strict();
+const ClaimNextAutomatedWorkSchema = objectType({
+  workerId: stringType().trim().min(1).max(200),
+  allowedKinds: arrayType(AutomationWorkItemKindSchema).min(1).max(automationWorkItemKinds.length).optional(),
+  leaseSeconds: numberType().int().min(30).max(5400).optional(),
+  idempotencyKey: boundedIdempotencyKey
+}).strict();
+const HeartbeatAutomatedWorkSchema = objectType({
+  leaseToken,
+  idempotencyKey: boundedIdempotencyKey
+}).strict();
+const AutomationDeliverySchema = objectType({
+  repositoryPath: stringType().trim().min(1).max(4e3),
+  integrationBranch: stringType().trim().min(1).max(500),
+  commitSha: stringType().trim().regex(/^[0-9a-f]{7,64}$/i),
+  commitMessage: stringType().trim().min(1).max(2e3),
+  artefactUri: stringType().trim().min(1).max(4e3).nullable().optional()
+}).strict();
+const RecordAutomationAttemptSchema = objectType({
+  leaseToken,
+  kind: AutomationAttemptObservationKindSchema,
+  summary: stringType().trim().min(1).max(2e4),
+  runId: stringType().uuid().nullable().optional(),
+  evidenceId: stringType().uuid().nullable().optional(),
+  delivery: AutomationDeliverySchema.nullable().optional(),
+  idempotencyKey: boundedIdempotencyKey
+}).strict();
+const CompleteAutomatedWorkSchema = objectType({
+  leaseToken,
+  outcome: AutomationCompletionOutcomeSchema,
+  expectedWorkItemVersion: numberType().int().positive(),
+  idempotencyKey: boundedIdempotencyKey
+}).strict();
+const RunnerReleaseAutomatedWorkSchema = objectType({
+  leaseToken,
+  reason: RunnerAutomationReleaseReasonSchema,
+  idempotencyKey: boundedIdempotencyKey
+}).strict();
+const OperatorReleaseAutomatedWorkSchema = objectType({
+  expectedLeaseVersion: numberType().int().positive(),
+  reason: literalType("manual").default("manual"),
+  idempotencyKey: boundedIdempotencyKey
+}).strict();
+const WaitForQueueChangesSchema = objectType({
+  cursor: stringType().trim().min(1).max(2e3).optional(),
+  timeoutSeconds: numberType().int().min(0).max(60).default(30)
+}).strict();
 class AppError extends Error {
   constructor(code2, message, statusCode, details) {
     super(message);
@@ -9751,9 +9818,27 @@ class UnsupportedOperationError extends AppError {
     super("UNSUPPORTED_OPERATION", message, 501);
   }
 }
+function encodeAutomationCursor(state) {
+  return Buffer.from(JSON.stringify({ version: 1, ...state }), "utf8").toString("base64url");
+}
+function decodeAutomationCursor(cursor, now2, scope2) {
+  if (!cursor) return { version: 1, ...scope2, sequence: 0, checkedAt: now2 };
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (value.version !== 1) throw new Error("Unsupported cursor version");
+    if (value.projectId !== scope2.projectId || value.queueId !== scope2.queueId) throw new Error("Invalid scope");
+    if (!Number.isSafeInteger(value.sequence) || Number(value.sequence) < 0) throw new Error("Invalid sequence");
+    if (typeof value.checkedAt !== "string" || Number.isNaN(Date.parse(value.checkedAt))) throw new Error("Invalid timestamp");
+    const checkedAt = new Date(value.checkedAt).toISOString();
+    if (Date.parse(checkedAt) > Date.parse(now2)) throw new Error("Future cursor");
+    return { version: 1, ...scope2, sequence: Number(value.sequence), checkedAt };
+  } catch {
+    throw new ValidationError("Invalid automation queue cursor");
+  }
+}
 const ExportBundleSchema = objectType({
   format: literalType("istra-export"),
-  formatVersion: unionType([literalType(3), literalType(4)]),
+  formatVersion: unionType([literalType(3), literalType(4), literalType(5)]),
   exportedAt: stringType().datetime({ offset: true }),
   tables: recordType(arrayType(recordType(unknownType())))
 }).strict();
@@ -9791,6 +9876,14 @@ class IstraService {
       idempotencyKey: key ?? provenance.idempotencyKey ?? null,
       occurredAt: provenance.occurredAt ?? (/* @__PURE__ */ new Date()).toISOString()
     };
+  }
+  automationCaller(caller) {
+    if (typeof caller === "string") {
+      if (!caller.trim()) throw new ValidationError("Automation mutations require a client name");
+      return caller;
+    }
+    if (!caller.client?.trim()) throw new ValidationError("Automation mutations require a client name");
+    return caller;
   }
   async writeOperational(caller, key, operationName, payload, operation) {
     await this.dataProtection.beforeWrite();
@@ -10013,6 +10106,65 @@ class IstraService {
     const parsed = this.parse(CreateWorkQueueSchema, input);
     const operation = () => this.operations().createWorkQueue(projectId, parsed);
     return this.writeOperational(caller, idempotencyKey, "create_work_queue", { projectId, parsed }, operation);
+  }
+  async getQueueAutomationPolicy(projectId, queueId) {
+    return await this.operations().getQueueAutomationPolicy(projectId, queueId);
+  }
+  async getQueueAutomationOverview(projectId, queueId) {
+    return await this.operations().getQueueAutomationOverview(projectId, queueId);
+  }
+  updateQueueAutomationPolicy(projectId, queueId, input, idempotencyKey, caller) {
+    const parsed = this.parse(UpdateQueueAutomationPolicySchema, input);
+    if (!idempotencyKey) throw new ValidationError("Automation mutations require an idempotency key");
+    const operation = () => this.operations().updateQueueAutomationPolicy(projectId, queueId, parsed);
+    return this.writeOperational(this.automationCaller(caller), idempotencyKey, "update_queue_automation_policy", { projectId, queueId, parsed }, operation);
+  }
+  claimNextAutomatedWork(projectId, queueId, input, caller) {
+    const parsed = this.parse(ClaimNextAutomatedWorkSchema, input);
+    const operation = () => this.operations().claimNextAutomatedWork(projectId, queueId, parsed);
+    return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, "claim_next_automated_work", { projectId, queueId, parsed }, operation);
+  }
+  heartbeatAutomatedWork(leaseId, input, caller) {
+    const parsed = this.parse(HeartbeatAutomatedWorkSchema, input);
+    const operation = () => this.operations().heartbeatAutomatedWork(leaseId, parsed);
+    return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, "heartbeat_automated_work", { leaseId, parsed }, operation);
+  }
+  recordAutomationAttempt(leaseId, input, caller) {
+    const parsed = this.parse(RecordAutomationAttemptSchema, input);
+    const operation = () => this.operations().recordAutomationAttempt(leaseId, parsed);
+    return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, "record_automation_attempt", { leaseId, parsed }, operation);
+  }
+  completeAutomatedWork(leaseId, input, caller) {
+    const parsed = this.parse(CompleteAutomatedWorkSchema, input);
+    const operation = () => this.operations().completeAutomatedWork(leaseId, parsed);
+    return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, "complete_automated_work", { leaseId, parsed }, operation);
+  }
+  releaseAutomatedWork(leaseId, input, caller) {
+    const parsed = this.parse(RunnerReleaseAutomatedWorkSchema, input);
+    const operation = () => this.operations().releaseAutomatedWork(leaseId, parsed);
+    return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, "release_automated_work", { leaseId, parsed }, operation);
+  }
+  operatorReleaseAutomatedWork(leaseId, input, caller) {
+    const parsed = this.parse(OperatorReleaseAutomatedWorkSchema, input);
+    const operation = () => this.operations().operatorReleaseAutomatedWork(leaseId, parsed);
+    return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, "operator_release_automated_work", { leaseId, parsed }, operation);
+  }
+  async waitForQueueChanges(projectId, queueId, input = {}) {
+    const parsed = this.parse(WaitForQueueChangesSchema, input);
+    const started = Date.now();
+    const deadline = started + parsed.timeoutSeconds * 1e3;
+    const initial = new Date(started).toISOString();
+    const cursor = decodeAutomationCursor(parsed.cursor, initial, { projectId, queueId });
+    for (; ; ) {
+      const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
+      const probe = await this.operations().readAutomationQueueChanges(projectId, queueId, cursor.sequence, cursor.checkedAt, checkedAt);
+      const expiryChanges = probe.expiredLeases.map((lease) => ({ sequence: probe.cursorSequence, projectId, queueId, eventType: "work_lease.expired", entityType: "work_lease", entityId: lease.id, createdAt: lease.expiresAt })).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.entityId.localeCompare(right.entityId));
+      if (probe.changes.length || expiryChanges.length) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [...probe.changes, ...expiryChanges], timedOut: false };
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [], timedOut: true };
+      const untilExpiry = probe.nextExpiryAt ? Math.max(0, Date.parse(probe.nextExpiryAt) - Date.now()) : remaining;
+      await new Promise((resolve2) => setTimeout(resolve2, Math.min(250, remaining, untilExpiry)));
+    }
   }
   async listOperationalWorkItems(projectId, queueId) {
     return await this.operations().listWorkItems(projectId, queueId);
@@ -11322,7 +11474,7 @@ function requireUtils$1() {
   const nodeCrypto = require$$0;
   utils$1 = {
     postgresMd5PasswordHash,
-    randomBytes,
+    randomBytes: randomBytes2,
     deriveKey,
     sha256,
     hashByName,
@@ -11332,7 +11484,7 @@ function requireUtils$1() {
   const webCrypto = nodeCrypto.webcrypto || globalThis.crypto;
   const subtleCrypto = webCrypto.subtle;
   const textEncoder = new TextEncoder();
-  function randomBytes(length) {
+  function randomBytes2(length) {
     return webCrypto.getRandomValues(Buffer.alloc(length));
   }
   async function md5(string2) {
@@ -15329,6 +15481,185 @@ pg.escapeLiteral;
 pg.Result;
 pg.TypeOverrides;
 pg.defaults;
+const postgresAutomationMigration = `
+  CREATE TABLE work_queue_automation_policies (
+    queue_id UUID PRIMARY KEY REFERENCES work_queues(id) ON DELETE CASCADE,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    allowed_kinds_json JSONB NOT NULL DEFAULT '["issue","task"]'::jsonb CHECK(
+      jsonb_typeof(allowed_kinds_json)='array' AND jsonb_array_length(allowed_kinds_json) BETWEEN 1 AND 2
+      AND allowed_kinds_json <@ '["issue","task"]'::jsonb
+      AND (jsonb_array_length(allowed_kinds_json)=1 OR (allowed_kinds_json @> '["issue"]'::jsonb AND allowed_kinds_json @> '["task"]'::jsonb))
+    ),
+    max_active_claims INTEGER NOT NULL DEFAULT 1 CHECK(max_active_claims BETWEEN 1 AND 32),
+    lease_seconds INTEGER NOT NULL DEFAULT 900 CHECK(lease_seconds BETWEEN 30 AND 5400),
+    requires_manual_approval BOOLEAN NOT NULL DEFAULT TRUE,
+    allow_same_worker_recovery BOOLEAN NOT NULL DEFAULT TRUE,
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+  );
+  CREATE INDEX automation_policies_project ON work_queue_automation_policies(project_id, queue_id);
+
+  CREATE TABLE work_leases (
+    id UUID PRIMARY KEY,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    queue_id UUID NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+    work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    worker_id TEXT NOT NULL CHECK(length(trim(worker_id)) BETWEEN 1 AND 200),
+    token_hash TEXT NOT NULL CHECK(length(token_hash)=64),
+    claimed_work_item_version INTEGER NOT NULL CHECK(claimed_work_item_version > 0),
+    acquired_at TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    released_at TIMESTAMPTZ,
+    release_reason TEXT CHECK(release_reason IS NULL OR release_reason IN ('manual','runner_shutdown','recovery','abandoned','expired')),
+    terminal_outcome TEXT CHECK(terminal_outcome IS NULL OR terminal_outcome IN ('resolved','awaiting_approval','retryable','blocked','interrupted')),
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0)
+  );
+  CREATE UNIQUE INDEX work_leases_one_active_item ON work_leases(work_item_id) WHERE released_at IS NULL;
+  CREATE INDEX work_leases_queue_active ON work_leases(queue_id, released_at, expires_at);
+  CREATE INDEX work_leases_worker ON work_leases(queue_id, worker_id, released_at, expires_at);
+  CREATE INDEX work_leases_project ON work_leases(project_id);
+
+  CREATE TABLE automation_attempts (
+    id UUID PRIMARY KEY,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    queue_id UUID NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+    work_item_id UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    lease_id UUID NOT NULL UNIQUE REFERENCES work_leases(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    started_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(work_item_id, ordinal)
+  );
+  CREATE INDEX automation_attempts_queue_started ON automation_attempts(queue_id, started_at DESC, id DESC);
+  CREATE INDEX automation_attempts_project ON automation_attempts(project_id);
+
+  CREATE TABLE automation_attempt_observations (
+    id UUID PRIMARY KEY,
+    attempt_id UUID NOT NULL REFERENCES automation_attempts(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK(sequence > 0),
+    kind TEXT NOT NULL CHECK(kind IN ('progress','verification','delivery','note')),
+    summary TEXT NOT NULL CHECK(length(trim(summary)) BETWEEN 1 AND 20000),
+    run_id UUID REFERENCES runs(id) ON DELETE SET NULL,
+    evidence_id UUID REFERENCES evidence(id) ON DELETE SET NULL,
+    delivery_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(attempt_id, sequence)
+  );
+  CREATE INDEX automation_observations_attempt ON automation_attempt_observations(attempt_id, sequence);
+  CREATE INDEX automation_observations_run ON automation_attempt_observations(run_id);
+  CREATE INDEX automation_observations_evidence ON automation_attempt_observations(evidence_id);
+
+  CREATE TABLE automation_queue_changes (
+    sequence BIGSERIAL PRIMARY KEY,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    queue_id UUID NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+  );
+  CREATE INDEX automation_queue_changes_read ON automation_queue_changes(project_id, queue_id, sequence);
+  CREATE INDEX automation_queue_changes_queue ON automation_queue_changes(queue_id);
+
+  CREATE FUNCTION istra_automation_policy_integrity() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM work_queues q WHERE q.id=NEW.queue_id AND q.project_id=NEW.project_id) THEN
+      RAISE EXCEPTION 'automation policy queue must belong to its project';
+    END IF;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_policy_integrity BEFORE INSERT OR UPDATE ON work_queue_automation_policies FOR EACH ROW EXECUTE FUNCTION istra_automation_policy_integrity();
+
+  CREATE FUNCTION istra_automation_lease_integrity() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM work_queues q WHERE q.id=NEW.queue_id AND q.project_id=NEW.project_id)
+      OR NOT EXISTS (SELECT 1 FROM work_items wi WHERE wi.id=NEW.work_item_id AND wi.project_id=NEW.project_id) THEN
+      RAISE EXCEPTION 'automation lease entities must belong to one project';
+    END IF;
+    IF NEW.token_hash !~ '^[0-9a-f]{64}$' THEN RAISE EXCEPTION 'automation lease token hash must be lowercase hexadecimal'; END IF;
+    IF NEW.acquired_at>NEW.heartbeat_at OR NEW.heartbeat_at>NEW.expires_at OR (NEW.released_at IS NOT NULL AND NEW.released_at<NEW.acquired_at)
+      OR NOT ((NEW.released_at IS NULL AND NEW.release_reason IS NULL AND NEW.terminal_outcome IS NULL)
+        OR (NEW.released_at IS NOT NULL AND NEW.release_reason IS NOT NULL AND NEW.terminal_outcome IS NOT NULL)) THEN
+      RAISE EXCEPTION 'automation lease state is inconsistent';
+    END IF;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_lease_integrity BEFORE INSERT OR UPDATE ON work_leases FOR EACH ROW EXECUTE FUNCTION istra_automation_lease_integrity();
+
+  CREATE FUNCTION istra_automation_attempt_integrity() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM work_leases l WHERE l.id=NEW.lease_id AND l.project_id=NEW.project_id AND l.queue_id=NEW.queue_id AND l.work_item_id=NEW.work_item_id) THEN
+      RAISE EXCEPTION 'automation attempt must match its lease';
+    END IF;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_attempt_integrity BEFORE INSERT OR UPDATE ON automation_attempts FOR EACH ROW EXECUTE FUNCTION istra_automation_attempt_integrity();
+
+  CREATE FUNCTION istra_automation_observation_integrity() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM automation_attempts a JOIN runs r ON r.id=NEW.run_id WHERE a.id=NEW.attempt_id AND r.project_id=a.project_id) THEN
+      RAISE EXCEPTION 'automation observation run must belong to its project';
+    END IF;
+    IF NEW.evidence_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM automation_attempts a JOIN evidence e ON e.id=NEW.evidence_id WHERE a.id=NEW.attempt_id AND e.project_id=a.project_id) THEN
+      RAISE EXCEPTION 'automation observation evidence must belong to its project';
+    END IF;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_observation_integrity BEFORE INSERT OR UPDATE ON automation_attempt_observations FOR EACH ROW EXECUTE FUNCTION istra_automation_observation_integrity();
+
+  CREATE FUNCTION istra_automation_project_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF OLD.state IS DISTINCT FROM NEW.state THEN
+      INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+      SELECT NEW.id,id,'project.state_changed','project',NEW.id,NEW.updated_at FROM work_queues WHERE project_id=NEW.id;
+    END IF;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_change_project_state AFTER UPDATE OF state ON projects FOR EACH ROW EXECUTE FUNCTION istra_automation_project_change();
+
+  CREATE FUNCTION istra_automation_work_item_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT NEW.project_id,queue_id,'work_item.updated','work_item',NEW.id,NEW.updated_at FROM work_queue_items WHERE work_item_id=NEW.id;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_change_work_item AFTER UPDATE ON work_items FOR EACH ROW EXECUTE FUNCTION istra_automation_work_item_change();
+
+  CREATE FUNCTION istra_automation_queue_item_change() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE item work_queue_items%ROWTYPE; BEGIN
+    item := CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT project_id,item.queue_id,CASE WHEN TG_OP='DELETE' THEN 'queue_item.deleted' ELSE 'queue_item.created' END,'work_item',item.work_item_id,clock_timestamp() FROM work_queues WHERE id=item.queue_id;
+    RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+  END $$;
+  CREATE TRIGGER automation_change_queue_item AFTER INSERT OR DELETE ON work_queue_items FOR EACH ROW EXECUTE FUNCTION istra_automation_queue_item_change();
+
+  CREATE FUNCTION istra_automation_relation_change() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE relation work_relations%ROWTYPE; BEGIN
+    relation := CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT relation.project_id,wqi.queue_id,CASE WHEN TG_OP='DELETE' THEN 'work_relation.deleted' ELSE 'work_relation.created' END,'work_relation',relation.id,clock_timestamp() FROM work_queue_items wqi WHERE wqi.work_item_id IN (relation.from_work_item_id,relation.to_work_item_id);
+    RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+  END $$;
+  CREATE TRIGGER automation_change_relation AFTER INSERT OR DELETE ON work_relations FOR EACH ROW EXECUTE FUNCTION istra_automation_relation_change();
+
+  CREATE FUNCTION istra_automation_blocker_change() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE blocker external_blockers%ROWTYPE; BEGIN
+    blocker := CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT blocker.project_id,q.id,'external_blocker.' || lower(TG_OP),'external_blocker',blocker.id,clock_timestamp() FROM work_queues q
+    WHERE q.project_id=blocker.project_id AND (blocker.work_item_id IS NULL OR EXISTS (SELECT 1 FROM work_queue_items wqi WHERE wqi.queue_id=q.id AND wqi.work_item_id=blocker.work_item_id));
+    RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+  END $$;
+  CREATE TRIGGER automation_change_blocker AFTER INSERT OR UPDATE OR DELETE ON external_blockers FOR EACH ROW EXECUTE FUNCTION istra_automation_blocker_change();
+
+  CREATE FUNCTION istra_automation_policy_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    VALUES (NEW.project_id,NEW.queue_id,CASE WHEN TG_OP='INSERT' THEN 'automation_policy.created' ELSE 'automation_policy.updated' END,'automation_policy',NEW.queue_id,NEW.updated_at);
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_change_policy AFTER INSERT OR UPDATE ON work_queue_automation_policies FOR EACH ROW EXECUTE FUNCTION istra_automation_policy_change();
+
+  CREATE FUNCTION istra_automation_lease_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    VALUES (NEW.project_id,NEW.queue_id,CASE WHEN TG_OP='INSERT' THEN 'work_lease.created' WHEN NEW.released_at IS NULL THEN 'work_lease.heartbeat' ELSE 'work_lease.released' END,'work_lease',NEW.id,COALESCE(NEW.released_at,NEW.heartbeat_at));
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_change_lease AFTER INSERT OR UPDATE ON work_leases FOR EACH ROW EXECUTE FUNCTION istra_automation_lease_change();
+`;
 const postgresMigrations = [{
   version: 1,
   name: "authoritative_ledger",
@@ -15895,6 +16226,10 @@ const postgresMigrations = [{
     ) STORED;
     CREATE INDEX search_index_vector ON search_index USING GIN(search_vector);
   `
+}, {
+  version: 4,
+  name: "agent_queue_automation",
+  sql: postgresAutomationMigration
 }];
 const latestPostgresSchemaVersion = postgresMigrations.at(-1)?.version ?? 0;
 const migrationLockId = "5283936332345650";
@@ -16145,7 +16480,10 @@ const exportTables = {
   acceptance_criteria: ["id", "requirement_id", "title", "description", "position", "required", "version", "archived_at", "created_at", "updated_at"],
   requirement_phase_links: ["requirement_id", "phase_id", "role", "created_at"],
   work_queues: ["id", "project_id", "name", "description", "version", "created_at", "updated_at"],
+  work_queue_automation_policies: ["queue_id", "project_id", "enabled", "allowed_kinds_json", "max_active_claims", "lease_seconds", "requires_manual_approval", "allow_same_worker_recovery", "version", "created_at", "updated_at"],
   work_queue_items: ["queue_id", "work_item_id", "rank", "created_at"],
+  work_leases: ["id", "project_id", "queue_id", "work_item_id", "worker_id", "token_hash", "claimed_work_item_version", "acquired_at", "heartbeat_at", "expires_at", "released_at", "release_reason", "terminal_outcome", "version"],
+  automation_attempts: ["id", "project_id", "queue_id", "work_item_id", "lease_id", "ordinal", "started_at"],
   requirement_work_links: ["requirement_id", "work_item_id", "created_at"],
   work_phase_links: ["work_item_id", "phase_id", "role", "created_at"],
   work_relations: ["id", "project_id", "from_work_item_id", "to_work_item_id", "kind", "created_at"],
@@ -16166,6 +16504,7 @@ const exportTables = {
   evidence_update_links: ["evidence_id", "update_id"],
   evidence_checkpoint_links: ["evidence_id", "checkpoint_id"],
   evidence_overrides: ["evidence_id", "reason", "actor", "source", "client", "created_at"],
+  automation_attempt_observations: ["id", "attempt_id", "sequence", "kind", "summary", "run_id", "evidence_id", "delivery_json", "created_at"],
   checkpoint_snapshots: ["id", "checkpoint_id", "schema_version", "captured_at", "document_json", "digest"],
   idempotency_records: ["client", "idempotency_key", "operation", "request_hash", "result_json", "created_at"]
 };
@@ -16179,18 +16518,26 @@ const jsonColumns = /* @__PURE__ */ new Set([
   "runs.redaction_json",
   "evidence.redaction_json",
   "checkpoint_snapshots.document_json",
-  "idempotency_records.result_json"
+  "idempotency_records.result_json",
+  "work_queue_automation_policies.allowed_kinds_json",
+  "automation_attempt_observations.delivery_json"
 ]);
 function isJsonExportColumn(table, column) {
   return jsonColumns.has(`${table}.${column.replaceAll('"', "")}`);
 }
-const booleanColumns$1 = /* @__PURE__ */ new Set([
+const booleanColumns = /* @__PURE__ */ new Set([
   "acceptance_criteria.required",
   "workspace_revisions.dirty",
   "runs.stdout_truncated",
   "runs.stderr_truncated",
-  "evidence.stale"
+  "evidence.stale",
+  "work_queue_automation_policies.enabled",
+  "work_queue_automation_policies.requires_manual_approval",
+  "work_queue_automation_policies.allow_same_worker_recovery"
 ]);
+function isBooleanExportColumn(table, column) {
+  return booleanColumns.has(`${table}.${column.replaceAll('"', "")}`);
+}
 const integer64Columns = /* @__PURE__ */ new Set(["runs.duration_ms", "artifact_references.byte_count", "evidence.ordinal"]);
 function normaliseJson(table, column, value) {
   if (typeof value !== "string") return canonicalJson(value);
@@ -16213,7 +16560,7 @@ function normaliseExportRow(table, row) {
     const value = row[column];
     if (value === null || value === void 0) return [column, null];
     if (jsonColumns.has(`${table}.${column}`)) return [column, normaliseJson(table, column, value)];
-    if (booleanColumns$1.has(`${table}.${column}`)) return [column, value === true || value === 1 || value === "1" ? 1 : 0];
+    if (booleanColumns.has(`${table}.${column}`)) return [column, value === true || value === 1 || value === "1" ? 1 : 0];
     if (integer64Columns.has(`${table}.${column}`)) {
       const number2 = Number(value);
       if (!Number.isSafeInteger(number2)) throw new Error(`${table}.${column} exceeds JavaScript's safe integer range`);
@@ -16226,6 +16573,89 @@ function normaliseExportRow(table, row) {
 function deterministicRows(table, rows) {
   return rows.map((row) => normaliseExportRow(table, row)).sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
 }
+const automationIdempotencyOperations = /* @__PURE__ */ new Set([
+  "update_queue_automation_policy",
+  "claim_next_automated_work",
+  "heartbeat_automated_work",
+  "record_automation_attempt",
+  "complete_automated_work",
+  "release_automated_work",
+  "operator_release_automated_work"
+]);
+function portableExportRows(table, rows) {
+  const safeRows = table === "idempotency_records" ? rows.filter((row) => !automationIdempotencyOperations.has(String(row.operation))) : table === "work_leases" ? rows.map((row) => row.released_at == null ? {
+    ...row,
+    token_hash: createHash("sha256").update(String(row.token_hash)).digest("hex"),
+    expires_at: row.heartbeat_at
+  } : row) : rows;
+  return deterministicRows(table, safeRows);
+}
+function automationExportViolations(formatVersion, tables) {
+  if (formatVersion < 5) return [];
+  const required2 = ["work_queue_automation_policies", "work_leases", "automation_attempts", "automation_attempt_observations"];
+  const violations = required2.filter((table) => !Array.isArray(tables[table])).map((table) => `missing ${table}`);
+  if (violations.length) return violations;
+  const byId = (table, column = "id") => new Map((tables[table] ?? []).map((row) => [String(row[column]), row]));
+  const queues = byId("work_queues");
+  const items2 = byId("work_items");
+  const runs = byId("runs");
+  const evidence = byId("evidence");
+  const leases = byId("work_leases");
+  const attempts = byId("automation_attempts");
+  const completionOutcomes = new Set(automationCompletionOutcomes);
+  const releaseReasons = new Set(automationReleaseReasons);
+  for (const policy of tables.work_queue_automation_policies ?? []) {
+    const queue = queues.get(String(policy.queue_id));
+    if (!queue || String(queue.project_id) !== String(policy.project_id)) violations.push(`policy ${String(policy.queue_id)} has cross-project ownership`);
+    let kinds = null;
+    try {
+      kinds = JSON.parse(String(policy.allowed_kinds_json));
+    } catch {
+    }
+    if (!Array.isArray(kinds) || kinds.length < 1 || kinds.length > 2 || new Set(kinds).size !== kinds.length || kinds.some((kind) => !["issue", "task"].includes(String(kind)))) {
+      violations.push(`policy ${String(policy.queue_id)} has invalid allowed kinds`);
+    }
+  }
+  for (const lease of tables.work_leases ?? []) {
+    const id2 = String(lease.id);
+    const queue = queues.get(String(lease.queue_id));
+    const item = items2.get(String(lease.work_item_id));
+    if (!queue || !item || String(queue.project_id) !== String(lease.project_id) || String(item.project_id) !== String(lease.project_id)) violations.push(`lease ${id2} has cross-project ownership`);
+    if (!/^[0-9a-f]{64}$/.test(String(lease.token_hash))) violations.push(`lease ${id2} has an invalid token hash`);
+    const acquired = Date.parse(String(lease.acquired_at));
+    const heartbeat = Date.parse(String(lease.heartbeat_at));
+    const expiry = Date.parse(String(lease.expires_at));
+    if ([acquired, heartbeat, expiry].some(Number.isNaN) || acquired > heartbeat || heartbeat > expiry) violations.push(`lease ${id2} has invalid timestamps`);
+    const active = lease.released_at == null;
+    const released = active ? null : Date.parse(String(lease.released_at));
+    if (released !== null && (Number.isNaN(released) || released < acquired)) violations.push(`lease ${id2} has an invalid release timestamp`);
+    if (active ? lease.release_reason != null || lease.terminal_outcome != null : lease.release_reason == null || lease.terminal_outcome == null) violations.push(`lease ${id2} has inconsistent release state`);
+    if (lease.release_reason != null && !releaseReasons.has(String(lease.release_reason))) violations.push(`lease ${id2} has an invalid release reason`);
+    if (lease.terminal_outcome != null && !completionOutcomes.has(String(lease.terminal_outcome))) violations.push(`lease ${id2} has an invalid terminal outcome`);
+  }
+  for (const attempt of tables.automation_attempts ?? []) {
+    const lease = leases.get(String(attempt.lease_id));
+    if (!lease || ["project_id", "queue_id", "work_item_id"].some((column) => String(lease[column]) !== String(attempt[column]))) violations.push(`attempt ${String(attempt.id)} does not match its lease`);
+  }
+  for (const observation of tables.automation_attempt_observations ?? []) {
+    const attempt = attempts.get(String(observation.attempt_id));
+    if (!attempt) {
+      violations.push(`observation ${String(observation.id)} has no attempt`);
+      continue;
+    }
+    if (observation.run_id != null && String(runs.get(String(observation.run_id))?.project_id) !== String(attempt.project_id)) violations.push(`observation ${String(observation.id)} has a cross-project run`);
+    if (observation.evidence_id != null && String(evidence.get(String(observation.evidence_id))?.project_id) !== String(attempt.project_id)) violations.push(`observation ${String(observation.id)} has cross-project evidence`);
+    if (observation.delivery_json != null) {
+      let delivery = null;
+      try {
+        delivery = JSON.parse(String(observation.delivery_json));
+      } catch {
+      }
+      if (!AutomationDeliverySchema.safeParse(delivery).success) violations.push(`observation ${String(observation.id)} has invalid delivery data`);
+    }
+  }
+  return violations;
+}
 async function lockProjectGraph(executor, projectId) {
   if (!executor.inTransaction) throw new Error("Project graph locks require an active PostgreSQL transaction");
   await executor.query(
@@ -16233,10 +16663,10 @@ async function lockProjectGraph(executor, projectId) {
     [projectId]
   );
 }
-const now$3 = () => (/* @__PURE__ */ new Date()).toISOString();
+const now$5 = () => (/* @__PURE__ */ new Date()).toISOString();
 const textOrNull$2 = (value) => value == null ? null : String(value);
-const iso$1 = (value) => value instanceof Date ? value.toISOString() : String(value);
-function json$2(value, fallback) {
+const iso$2 = (value) => value instanceof Date ? value.toISOString() : String(value);
+function json$4(value, fallback) {
   if (value === null || value === void 0) return fallback;
   if (typeof value !== "string") return value;
   try {
@@ -16257,18 +16687,18 @@ function projectFromRow$2(row) {
     title: String(row.title),
     description: textOrNull$2(row.description),
     intent: textOrNull$2(row.intent),
-    deadline: row.deadline == null ? null : iso$1(row.deadline),
+    deadline: row.deadline == null ? null : iso$2(row.deadline),
     completionCriteria: textOrNull$2(row.completion_criteria),
     state: String(row.state),
     currentFocus: textOrNull$2(row.current_focus),
     nextAction: textOrNull$2(row.next_action),
-    blockers: json$2(row.blockers_json, []),
+    blockers: json$4(row.blockers_json, []),
     currentCheckpointId: textOrNull$2(row.current_checkpoint_id),
-    archivedAt: row.archived_at == null ? null : iso$1(row.archived_at),
+    archivedAt: row.archived_at == null ? null : iso$2(row.archived_at),
     version: Number(row.version),
-    createdAt: iso$1(row.created_at),
-    updatedAt: iso$1(row.updated_at),
-    lastActivityAt: iso$1(row.last_activity_at)
+    createdAt: iso$2(row.created_at),
+    updatedAt: iso$2(row.updated_at),
+    lastActivityAt: iso$2(row.last_activity_at)
   };
 }
 function phaseFromRow$1(row) {
@@ -16279,10 +16709,10 @@ function phaseFromRow$1(row) {
     description: textOrNull$2(row.description),
     status: String(row.status),
     position: Number(row.position),
-    archivedAt: row.archived_at == null ? null : iso$1(row.archived_at),
+    archivedAt: row.archived_at == null ? null : iso$2(row.archived_at),
     version: Number(row.version),
-    createdAt: iso$1(row.created_at),
-    updatedAt: iso$1(row.updated_at)
+    createdAt: iso$2(row.created_at),
+    updatedAt: iso$2(row.updated_at)
   };
 }
 function labelFromRow$1(row) {
@@ -16291,8 +16721,8 @@ function labelFromRow$1(row) {
     name: String(row.name),
     colour: textOrNull$2(row.colour),
     version: Number(row.version),
-    createdAt: iso$1(row.created_at),
-    updatedAt: iso$1(row.updated_at)
+    createdAt: iso$2(row.created_at),
+    updatedAt: iso$2(row.updated_at)
   };
 }
 function revisionFromRow$1(row) {
@@ -16301,10 +16731,10 @@ function revisionFromRow$1(row) {
     updateId: String(row.update_id),
     revision: Number(row.revision),
     content: String(row.content),
-    snapshot: json$2(row.snapshot_json, null),
+    snapshot: json$4(row.snapshot_json, null),
     source: String(row.source),
     client: textOrNull$2(row.client),
-    createdAt: iso$1(row.created_at)
+    createdAt: iso$2(row.created_at)
   };
 }
 function activityFromRow(row) {
@@ -16314,21 +16744,14 @@ function activityFromRow(row) {
     entityType: String(row.entity_type),
     entityId: String(row.entity_id),
     eventType: String(row.event_type),
-    payload: json$2(row.payload_json, {}),
+    payload: json$4(row.payload_json, {}),
     source: String(row.source),
     client: textOrNull$2(row.client),
     actor: String(row.actor),
     idempotencyKey: textOrNull$2(row.idempotency_key),
-    createdAt: iso$1(row.created_at)
+    createdAt: iso$2(row.created_at)
   };
 }
-const booleanColumns = /* @__PURE__ */ new Set([
-  "acceptance_criteria.required",
-  "workspace_revisions.dirty",
-  "runs.stdout_truncated",
-  "runs.stderr_truncated",
-  "evidence.stale"
-]);
 function parentFirst(table, rows) {
   const parentColumn = table === "work_items" || table === "requirements" ? "parent_id" : null;
   if (!parentColumn) return rows;
@@ -16355,7 +16778,7 @@ class PostgresIstraRepository {
   async transaction(work) {
     return this.executor.transaction(async () => work());
   }
-  async seedOperationalDefaults(projectId, timestamp = now$3()) {
+  async seedOperationalDefaults(projectId, timestamp = now$5()) {
     const defaults2 = [
       ["Missing", "open", 0, "#7A8594"],
       ["Partial", "partial", 1, "#C18401"],
@@ -16379,7 +16802,7 @@ class PostgresIstraRepository {
     }
   }
   async event(projectId, entityType, entityId, eventType, payload, provenance) {
-    const occurredAt = provenance.occurredAt ?? now$3();
+    const occurredAt = provenance.occurredAt ?? now$5();
     await this.executor.execute(`
       INSERT INTO activity_events(id,project_id,entity_type,entity_id,event_type,payload_json,source,client,actor,idempotency_key,created_at)
       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11)
@@ -16422,8 +16845,8 @@ class PostgresIstraRepository {
       priority: textOrNull$2(row.priority),
       labels: labels.map(labelFromRow$1),
       version: Number(row.version),
-      createdAt: iso$1(row.created_at),
-      updatedAt: iso$1(row.updated_at),
+      createdAt: iso$2(row.created_at),
+      updatedAt: iso$2(row.updated_at),
       stableKey: textOrNull$2(row.stable_key),
       parentId: textOrNull$2(row.parent_id),
       queueId: textOrNull$2(queue?.queue_id),
@@ -16440,10 +16863,10 @@ class PostgresIstraRepository {
       projectId: String(row.project_id),
       kind: String(row.kind),
       currentRevision: revisionFromRow$1(revision),
-      deletedAt: row.deleted_at == null ? null : iso$1(row.deleted_at),
+      deletedAt: row.deleted_at == null ? null : iso$2(row.deleted_at),
       version: Number(row.version),
-      createdAt: iso$1(row.created_at),
-      updatedAt: iso$1(row.updated_at)
+      createdAt: iso$2(row.created_at),
+      updatedAt: iso$2(row.updated_at)
     };
   }
   async listProjects(filters = {}) {
@@ -16505,7 +16928,7 @@ class PostgresIstraRepository {
   }
   async createProject(input, provenance) {
     const id2 = randomUUID();
-    const timestamp = now$3();
+    const timestamp = now$5();
     return this.transaction(async () => {
       await this.executor.execute(`
         INSERT INTO projects(id,title,description,intent,deadline,completion_criteria,state,created_at,updated_at,last_activity_at)
@@ -16522,11 +16945,12 @@ class PostgresIstraRepository {
     if (!current) throw new NotFoundError("Project", id2);
     const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([key, value]) => key !== "expectedVersion" && value !== void 0)) };
     return this.transaction(async () => {
+      await lockProjectGraph(this.executor, id2);
       const result2 = await this.executor.query(`
         UPDATE projects SET title=$1,description=$2,intent=$3,deadline=$4,completion_criteria=$5,state=$6,current_focus=$7,next_action=$8,
           blockers_json=$9::jsonb,version=version+1,updated_at=$10
         WHERE id=$11 AND version=$12 RETURNING *
-      `, [next.title, next.description, next.intent, next.deadline, next.completionCriteria, next.state, next.currentFocus, next.nextAction, JSON.stringify(next.blockers), now$3(), id2, input.expectedVersion]);
+      `, [next.title, next.description, next.intent, next.deadline, next.completionCriteria, next.state, next.currentFocus, next.nextAction, JSON.stringify(next.blockers), now$5(), id2, input.expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Project", id2);
       await this.replaceSearch("project", id2, id2, next.title, [next.description, next.intent, next.completionCriteria].filter(Boolean).join("\n"));
       const changes = beforeAfter$1(current, next, ["title", "description", "intent", "deadline", "completionCriteria", "state", "currentFocus", "nextAction", "blockers"]);
@@ -16538,7 +16962,8 @@ class PostgresIstraRepository {
     const current = await this.getProject(id2);
     if (!current) throw new NotFoundError("Project", id2);
     return this.transaction(async () => {
-      const result2 = await this.executor.query("UPDATE projects SET archived_at=$1,version=version+1,updated_at=$2 WHERE id=$3 AND version=$4 RETURNING *", [archived ? now$3() : null, now$3(), id2, expectedVersion]);
+      await lockProjectGraph(this.executor, id2);
+      const result2 = await this.executor.query("UPDATE projects SET archived_at=$1,version=version+1,updated_at=$2 WHERE id=$3 AND version=$4 RETURNING *", [archived ? now$5() : null, now$5(), id2, expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Project", id2);
       const updated = projectFromRow$2(result2.rows[0]);
       await this.event(id2, "project", id2, archived ? "project.archived" : "project.unarchived", { changes: { archivedAt: { before: current.archivedAt, after: updated.archivedAt } } }, provenance);
@@ -16552,7 +16977,7 @@ class PostgresIstraRepository {
   async createPhase(projectId, input, provenance) {
     if (!await this.getProject(projectId)) throw new NotFoundError("Project", projectId);
     const id2 = randomUUID();
-    const timestamp = now$3();
+    const timestamp = now$5();
     return this.transaction(async () => {
       const positionRow = await this.executor.one("SELECT COALESCE(MAX(position),-1)+1 AS position FROM phases WHERE project_id=$1", [projectId]);
       const row = await this.executor.one(`
@@ -16573,7 +16998,7 @@ class PostgresIstraRepository {
       const result2 = await this.executor.query(`
         UPDATE phases SET name=$1,description=$2,status=$3,position=$4,archived_at=$5,version=version+1,updated_at=$6
         WHERE id=$7 AND version=$8 RETURNING *
-      `, [next.name, next.description, next.status, next.position, input.archived === void 0 ? current.archivedAt : input.archived ? now$3() : null, now$3(), id2, input.expectedVersion]);
+      `, [next.name, next.description, next.status, next.position, input.archived === void 0 ? current.archivedAt : input.archived ? now$5() : null, now$5(), id2, input.expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Phase", id2);
       const updated = phaseFromRow$1(result2.rows[0]);
       await this.replaceSearch("phase", id2, current.projectId, updated.name, updated.description ?? "");
@@ -16623,7 +17048,7 @@ class PostgresIstraRepository {
     const existing = await this.executor.maybeOne("SELECT id FROM work_queues WHERE project_id=$1 ORDER BY created_at,id LIMIT 1", [projectId]);
     if (existing) return String(existing.id);
     const id2 = randomUUID();
-    const timestamp = now$3();
+    const timestamp = now$5();
     const inserted = await this.executor.maybeOne(`
       INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at)
       VALUES ($1,$2,$3,$4,$5,$5) ON CONFLICT DO NOTHING RETURNING id
@@ -16634,7 +17059,7 @@ class PostgresIstraRepository {
   }
   async insertQueueItem(queueId, workItemId, rank) {
     try {
-      await this.executor.execute("INSERT INTO work_queue_items(queue_id,work_item_id,rank,created_at) VALUES ($1,$2,$3,$4)", [queueId, workItemId, rank, now$3()]);
+      await this.executor.execute("INSERT INTO work_queue_items(queue_id,work_item_id,rank,created_at) VALUES ($1,$2,$3,$4)", [queueId, workItemId, rank, now$5()]);
     } catch (error) {
       throw new ValidationError(error instanceof Error ? error.message : "Could not add work item to queue");
     }
@@ -16644,15 +17069,15 @@ class PostgresIstraRepository {
     await this.executor.execute(`
       INSERT INTO work_phase_links(work_item_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)
       ON CONFLICT(work_item_id,phase_id) DO UPDATE SET role=EXCLUDED.role,created_at=EXCLUDED.created_at
-    `, [workItemId, phaseId, role, now$3()]);
+    `, [workItemId, phaseId, role, now$5()]);
   }
   async insertWorkItemLabel(workItemId, labelId) {
     if (!await this.executor.maybeOne("SELECT 1 FROM labels WHERE id=$1", [labelId])) throw new NotFoundError("Label", labelId);
-    await this.executor.execute("INSERT INTO work_item_labels(work_item_id,label_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [workItemId, labelId, now$3()]);
+    await this.executor.execute("INSERT INTO work_item_labels(work_item_id,label_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [workItemId, labelId, now$5()]);
   }
   async createWorkItem(projectId, input, provenance) {
     const id2 = randomUUID();
-    const timestamp = now$3();
+    const timestamp = now$5();
     const labelIds = [...new Set(input.labelIds ?? [])];
     return this.transaction(async () => {
       if (input.parentId) await lockProjectGraph(this.executor, projectId);
@@ -16684,8 +17109,8 @@ class PostgresIstraRepository {
     return this.transaction(async () => {
       const initial = await this.executor.maybeOne("SELECT * FROM work_items WHERE id=$1", [id2]);
       if (!initial) throw new NotFoundError("Work item", id2);
-      if (input.parentId !== void 0) await lockProjectGraph(this.executor, String(initial.project_id));
-      const existing = input.parentId === void 0 ? initial : await this.executor.maybeOne("SELECT * FROM work_items WHERE id=$1", [id2]);
+      await lockProjectGraph(this.executor, String(initial.project_id));
+      const existing = await this.executor.maybeOne("SELECT * FROM work_items WHERE id=$1", [id2]);
       if (!existing) throw new NotFoundError("Work item", id2);
       const current = await this.workItemFromRow(existing);
       if (input.phaseId) await this.assertPhaseInProject(input.phaseId, current.projectId);
@@ -16700,7 +17125,7 @@ class PostgresIstraRepository {
       const result2 = await this.executor.query(`
         UPDATE work_items SET phase_id=$1,stable_key=$2,parent_id=$3,kind=$4,title=$5,description=$6,status=$7,priority=$8,version=version+1,updated_at=$9
         WHERE id=$10 AND version=$11 RETURNING *
-      `, [next.phaseId, next.stableKey ?? null, parentId, next.kind, next.title, next.description, next.status, next.priority, now$3(), id2, input.expectedVersion]);
+      `, [next.phaseId, next.stableKey ?? null, parentId, next.kind, next.title, next.description, next.status, next.priority, now$5(), id2, input.expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Work item", id2);
       const previousLabelIds = current.labels.map((label) => label.id);
       if (input.labelIds) {
@@ -16709,7 +17134,7 @@ class PostgresIstraRepository {
       }
       if (input.queueId !== void 0 || input.rank !== void 0) {
         await this.executor.execute("DELETE FROM work_queue_items WHERE work_item_id=$1", [id2]);
-        if (queueId) await this.insertQueueItem(queueId, id2, input.rank ?? current.rank ?? `${now$3()}-${id2}`);
+        if (queueId) await this.insertQueueItem(queueId, id2, input.rank ?? current.rank ?? `${now$5()}-${id2}`);
       }
       if (input.relatedPhaseIds !== void 0 || input.phaseId !== void 0) {
         await this.executor.execute("DELETE FROM work_phase_links WHERE work_item_id=$1", [id2]);
@@ -16719,7 +17144,7 @@ class PostgresIstraRepository {
       if (input.requirementIds !== void 0) {
         await this.executor.execute("DELETE FROM requirement_work_links WHERE work_item_id=$1", [id2]);
         for (const requirementId of new Set(input.requirementIds)) {
-          await this.executor.execute("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES ($1,$2,$3)", [requirementId, id2, now$3()]);
+          await this.executor.execute("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES ($1,$2,$3)", [requirementId, id2, now$5()]);
         }
       }
       await this.replaceSearch("work_item", id2, current.projectId, next.title, next.description ?? "");
@@ -16751,7 +17176,7 @@ class PostgresIstraRepository {
     if (!await this.getProject(projectId)) throw new NotFoundError("Project", projectId);
     const id2 = randomUUID();
     const revisionId = randomUUID();
-    const timestamp = now$3();
+    const timestamp = now$5();
     const row = await this.executor.one(`
       INSERT INTO updates(id,project_id,kind,current_revision_id,created_at,updated_at)
       VALUES ($1,$2,$3,$4,$5,$5) RETURNING *
@@ -16769,12 +17194,12 @@ class PostgresIstraRepository {
       const existing = await this.executor.maybeOne("SELECT * FROM updates WHERE id=$1", [updateId]);
       if (!existing) throw new NotFoundError("Update", updateId);
       if (existing.deleted_at) throw new ValidationError("Deleted updates cannot be revised");
-      const result2 = await this.executor.query("UPDATE updates SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$3(), updateId, input.expectedVersion]);
+      const result2 = await this.executor.query("UPDATE updates SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$5(), updateId, input.expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Update", updateId);
       const revisionRow = await this.executor.one("SELECT COALESCE(MAX(revision),0)+1 AS revision FROM update_revisions WHERE update_id=$1", [updateId]);
       const revision = Number(revisionRow.revision);
       const revisionId = randomUUID();
-      const timestamp = now$3();
+      const timestamp = now$5();
       const currentRevision = await this.executor.one("SELECT snapshot_json FROM update_revisions WHERE id=$1", [String(existing.current_revision_id)]);
       await this.executor.execute(`
         INSERT INTO update_revisions(id,update_id,revision,content,snapshot_json,source,client,created_at)
@@ -16793,7 +17218,7 @@ class PostgresIstraRepository {
       if (existing.kind === "checkpoint" && await this.executor.maybeOne("SELECT 1 FROM projects WHERE current_checkpoint_id=$1", [updateId])) {
         throw new ValidationError("The current checkpoint cannot be deleted until another checkpoint is saved");
       }
-      const timestamp = now$3();
+      const timestamp = now$5();
       const result2 = await this.executor.query("UPDATE updates SET deleted_at=$1,version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [timestamp, updateId, expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Update", updateId);
       await this.executor.execute("DELETE FROM search_index WHERE entity_type='update' AND entity_id=$1", [updateId]);
@@ -16817,13 +17242,13 @@ class PostgresIstraRepository {
         blockers,
         activePhaseIds: phases.filter((phase) => phase.status === "active").map((phase) => phase.id),
         unresolvedWorkItemIds: workItems.filter((item) => !["resolved", "dropped"].includes(item.status)).map((item) => item.id),
-        capturedAt: now$3()
+        capturedAt: now$5()
       };
       const checkpoint = await this.insertUpdate(projectId, "checkpoint", input.content, snapshot, provenance);
       const result2 = await this.executor.query(`
         UPDATE projects SET current_focus=$1,next_action=$2,blockers_json=$3::jsonb,current_checkpoint_id=$4,version=version+1,updated_at=$5
         WHERE id=$6 AND version=$7 RETURNING *
-      `, [currentFocus, nextAction, JSON.stringify(blockers), checkpoint.id, now$3(), projectId, input.expectedVersion]);
+      `, [currentFocus, nextAction, JSON.stringify(blockers), checkpoint.id, now$5(), projectId, input.expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Project", projectId);
       await this.event(projectId, "project", projectId, "project.checkpoint_selected", { checkpointId: checkpoint.id }, provenance);
       return checkpoint;
@@ -16834,7 +17259,7 @@ class PostgresIstraRepository {
   }
   async createLabel(input, provenance) {
     const id2 = randomUUID();
-    const timestamp = now$3();
+    const timestamp = now$5();
     return this.transaction(async () => {
       let row;
       try {
@@ -16854,7 +17279,7 @@ class PostgresIstraRepository {
       if (Number(existing.version) !== expectedVersion) throw new ConflictError("Work item", workItemId);
       if (!await this.executor.maybeOne("SELECT 1 FROM labels WHERE id=$1", [labelId])) throw new NotFoundError("Label", labelId);
       if (await this.executor.maybeOne("SELECT 1 FROM work_item_labels WHERE work_item_id=$1 AND label_id=$2", [workItemId, labelId])) return this.workItemFromRow(existing);
-      const result2 = await this.executor.query("UPDATE work_items SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$3(), workItemId, expectedVersion]);
+      const result2 = await this.executor.query("UPDATE work_items SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$5(), workItemId, expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Work item", workItemId);
       await this.insertWorkItemLabel(workItemId, labelId);
       await this.event(String(existing.project_id), "work_item", workItemId, "work_item.label_attached", { labelId }, provenance);
@@ -16867,7 +17292,7 @@ class PostgresIstraRepository {
       if (!existing) throw new NotFoundError("Work item", workItemId);
       if (Number(existing.version) !== expectedVersion) throw new ConflictError("Work item", workItemId);
       if (!await this.executor.maybeOne("SELECT 1 FROM work_item_labels WHERE work_item_id=$1 AND label_id=$2", [workItemId, labelId])) return this.workItemFromRow(existing);
-      const result2 = await this.executor.query("UPDATE work_items SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$3(), workItemId, expectedVersion]);
+      const result2 = await this.executor.query("UPDATE work_items SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [now$5(), workItemId, expectedVersion]);
       if (!result2.rows[0]) throw new ConflictError("Work item", workItemId);
       await this.executor.execute("DELETE FROM work_item_labels WHERE work_item_id=$1 AND label_id=$2", [workItemId, labelId]);
       await this.event(String(existing.project_id), "work_item", workItemId, "work_item.label_detached", { labelId }, provenance);
@@ -16945,10 +17370,10 @@ class PostgresIstraRepository {
       for (const [table, columns] of Object.entries(exportTables)) {
         const selectColumns = columns.map((column) => isJsonExportColumn(table, column) ? `${column}::text AS ${column}` : column);
         const rows = await this.executor.many(`SELECT ${selectColumns.join(",")} FROM ${table}`);
-        tables[table] = deterministicRows(table, rows);
+        tables[table] = portableExportRows(table, rows);
       }
     }, { isolationLevel: "repeatable read", readOnly: true });
-    return { format: "istra-export", formatVersion: 4, exportedAt: now$3(), tables };
+    return { format: "istra-export", formatVersion: 5, exportedAt: now$5(), tables };
   }
   async isEmpty() {
     for (const table of Object.keys(exportTables)) {
@@ -16957,9 +17382,11 @@ class PostgresIstraRepository {
     return true;
   }
   async importForMigration(bundle) {
-    if (bundle.format !== "istra-export" || bundle.formatVersion !== 4) {
-      throw new ValidationError("PostgreSQL migration requires an Istra export format v4 bundle");
+    if (bundle.format !== "istra-export" || bundle.formatVersion !== 5) {
+      throw new ValidationError("PostgreSQL migration requires an Istra export format v5 bundle");
     }
+    const automationViolations = automationExportViolations(bundle.formatVersion, bundle.tables);
+    if (automationViolations.length) throw new ValidationError("PostgreSQL migration bundle contains invalid automation data", { automationViolations });
     return this.transaction(async () => {
       if (!await this.isEmpty()) throw new ValidationError("PostgreSQL migration target is not empty");
       await this.executor.execute("SET CONSTRAINTS ALL DEFERRED");
@@ -16973,7 +17400,7 @@ class PostgresIstraRepository {
           const values = columns.map((quotedColumn) => {
             const column = quotedColumn.replaceAll('"', "");
             const value = row[column];
-            return booleanColumns.has(`${table}.${column}`) && value != null ? Boolean(value) : value;
+            return isBooleanExportColumn(table, column) && value != null ? Boolean(value) : value;
           });
           await this.executor.execute(`INSERT INTO ${table}(${columns.join(",")}) VALUES (${placeholders})`, values);
         }
@@ -16987,10 +17414,11 @@ class PostgresIstraRepository {
           EXISTS(SELECT 1 FROM evidence)
         )
       `);
-      const imported = await this.exportAll();
-      for (const table of Object.keys(exportTables)) {
+      for (const [table, columns] of Object.entries(exportTables)) {
+        const selectColumns = columns.map((column) => isJsonExportColumn(table, column) ? `${column}::text AS ${column}` : column);
+        const importedRows = deterministicRows(table, await this.executor.many(`SELECT ${selectColumns.join(",")} FROM ${table}`));
         const expected = deterministicRows(table, bundle.tables[table]);
-        if (canonicalJson(imported.tables[table]) !== canonicalJson(expected)) {
+        if (canonicalJson(importedRows) !== canonicalJson(expected)) {
           throw new ValidationError(`PostgreSQL migration verification failed for table ${table}`);
         }
       }
@@ -17257,11 +17685,313 @@ class SecretRedactor {
     return { value, redacted: count > 0, count, redactions: [...metadata2.values()] };
   }
 }
-const now$2 = () => (/* @__PURE__ */ new Date()).toISOString();
+const now$4 = () => (/* @__PURE__ */ new Date()).toISOString();
+const nullable$1 = (value) => value == null ? null : value instanceof Date ? value.toISOString() : String(value);
+const iso$1 = (value) => nullable$1(value);
+const json$3 = (value, fallback) => {
+  if (value == null) return fallback;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+const tokenHash$1 = (token) => createHash("sha256").update(token).digest("hex");
+const expiresAt$1 = (timestamp, seconds) => new Date(Date.parse(timestamp) + seconds * 1e3).toISOString();
+class PostgresAutomationRepository {
+  constructor(executor, event) {
+    this.executor = executor;
+    this.event = event;
+  }
+  executor;
+  event;
+  async queue(projectId, queueId) {
+    const row = await this.executor.maybeOne("SELECT * FROM work_queues WHERE id=$1 AND project_id=$2", [queueId, projectId]);
+    if (!row) throw new NotFoundError("Work queue", queueId);
+    return row;
+  }
+  policyFromRow(row) {
+    return {
+      queueId: String(row.queue_id),
+      projectId: String(row.project_id),
+      enabled: Boolean(row.enabled),
+      allowedKinds: json$3(row.allowed_kinds_json, ["issue", "task"]),
+      maxActiveClaims: Number(row.max_active_claims),
+      leaseSeconds: Number(row.lease_seconds),
+      requiresManualApproval: Boolean(row.requires_manual_approval),
+      allowSameWorkerRecovery: Boolean(row.allow_same_worker_recovery),
+      version: Number(row.version),
+      createdAt: iso$1(row.created_at),
+      updatedAt: iso$1(row.updated_at)
+    };
+  }
+  async getPolicy(projectId, queueId) {
+    const queue = await this.queue(projectId, queueId);
+    const row = await this.executor.maybeOne("SELECT * FROM work_queue_automation_policies WHERE queue_id=$1", [queueId]);
+    return row ? this.policyFromRow(row) : {
+      queueId,
+      projectId,
+      enabled: false,
+      allowedKinds: ["issue", "task"],
+      maxActiveClaims: 1,
+      leaseSeconds: 900,
+      requiresManualApproval: true,
+      allowSameWorkerRecovery: true,
+      version: 0,
+      createdAt: iso$1(queue.created_at),
+      updatedAt: iso$1(queue.updated_at)
+    };
+  }
+  async updatePolicy(projectId, queueId, input) {
+    return this.executor.transaction(async () => {
+      await lockProjectGraph(this.executor, projectId);
+      await this.queue(projectId, queueId);
+      const timestamp = now$4();
+      const existing = await this.executor.maybeOne("SELECT version FROM work_queue_automation_policies WHERE queue_id=$1 FOR UPDATE", [queueId]);
+      if (!existing) {
+        if (input.expectedVersion !== null) throw new ConflictError("Queue automation policy", queueId);
+        await this.executor.execute(`INSERT INTO work_queue_automation_policies(queue_id,project_id,enabled,allowed_kinds_json,max_active_claims,lease_seconds,requires_manual_approval,allow_same_worker_recovery,created_at,updated_at)
+          VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$9)`, [queueId, projectId, input.enabled, JSON.stringify([...new Set(input.allowedKinds)]), input.maxActiveClaims, input.leaseSeconds, input.requiresManualApproval, input.allowSameWorkerRecovery, timestamp]);
+      } else {
+        if (input.expectedVersion === null || Number(existing.version) !== input.expectedVersion) throw new ConflictError("Queue automation policy", queueId);
+        const changed = await this.executor.execute(
+          `UPDATE work_queue_automation_policies SET enabled=$1,allowed_kinds_json=$2::jsonb,max_active_claims=$3,lease_seconds=$4,requires_manual_approval=$5,allow_same_worker_recovery=$6,version=version+1,updated_at=$7 WHERE queue_id=$8 AND version=$9`,
+          [input.enabled, JSON.stringify([...new Set(input.allowedKinds)]), input.maxActiveClaims, input.leaseSeconds, input.requiresManualApproval, input.allowSameWorkerRecovery, timestamp, queueId, input.expectedVersion]
+        );
+        if (!changed) throw new ConflictError("Queue automation policy", queueId);
+      }
+      await this.event(projectId, "automation_policy", queueId, "automation_policy.updated", { enabled: input.enabled });
+      return this.getPolicy(projectId, queueId);
+    });
+  }
+  leaseFromRow(row) {
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      queueId: String(row.queue_id),
+      workItemId: String(row.work_item_id),
+      workerId: String(row.worker_id),
+      claimedWorkItemVersion: Number(row.claimed_work_item_version),
+      acquiredAt: iso$1(row.acquired_at),
+      heartbeatAt: iso$1(row.heartbeat_at),
+      expiresAt: iso$1(row.expires_at),
+      releasedAt: nullable$1(row.released_at),
+      releaseReason: nullable$1(row.release_reason),
+      terminalOutcome: nullable$1(row.terminal_outcome),
+      version: Number(row.version)
+    };
+  }
+  async workItemFromRow(row) {
+    const id2 = String(row.id);
+    const labels = (await this.executor.many("SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=$1 ORDER BY lower(l.name),l.id", [id2])).map((label) => ({ id: String(label.id), name: String(label.name), colour: nullable$1(label.colour), version: Number(label.version), createdAt: iso$1(label.created_at), updatedAt: iso$1(label.updated_at) }));
+    const reasons = (await this.executor.many(`SELECT reason FROM (
+      SELECT CASE WHEN wr.kind='blocks' THEN 'Blocked by ' || wi.title ELSE 'Depends on ' || wi.title END reason
+      FROM work_relations wr JOIN work_items wi ON ((wr.kind='depends_on' AND wi.id=wr.to_work_item_id) OR (wr.kind='blocks' AND wi.id=wr.from_work_item_id))
+      WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=$1) OR (wr.kind='blocks' AND wr.to_work_item_id=$1)) AND wi.status NOT IN ('resolved','dropped')
+      UNION ALL SELECT content FROM external_blockers WHERE project_id=$2 AND resolved_at IS NULL AND (work_item_id IS NULL OR work_item_id=$1)) reasons`, [id2, row.project_id])).map((entry) => String(entry.reason));
+    return {
+      id: id2,
+      projectId: String(row.project_id),
+      phaseId: nullable$1(row.phase_id),
+      kind: String(row.kind),
+      title: String(row.title),
+      description: nullable$1(row.description),
+      status: String(row.status),
+      priority: nullable$1(row.priority),
+      labels,
+      version: Number(row.version),
+      createdAt: iso$1(row.created_at),
+      updatedAt: iso$1(row.updated_at),
+      stableKey: nullable$1(row.stable_key),
+      parentId: nullable$1(row.parent_id),
+      queueId: nullable$1(row.queue_id),
+      rank: nullable$1(row.rank),
+      effectiveBlocked: reasons.length > 0 || String(row.status) === "blocked",
+      blockerReasons: reasons
+    };
+  }
+  observationFromRow(row) {
+    return { id: String(row.id), attemptId: String(row.attempt_id), sequence: Number(row.sequence), kind: String(row.kind), summary: String(row.summary), runId: nullable$1(row.run_id), evidenceId: nullable$1(row.evidence_id), delivery: json$3(row.delivery_json, null), createdAt: iso$1(row.created_at) };
+  }
+  async attemptFromRow(row) {
+    const observations = (await this.executor.many("SELECT * FROM automation_attempt_observations WHERE attempt_id=$1 ORDER BY sequence", [row.id])).map((entry) => this.observationFromRow(entry));
+    return { id: String(row.id), projectId: String(row.project_id), queueId: String(row.queue_id), workItemId: String(row.work_item_id), leaseId: String(row.lease_id), ordinal: Number(row.ordinal), startedAt: iso$1(row.started_at), endedAt: nullable$1(row.released_at), outcome: nullable$1(row.terminal_outcome), observations };
+  }
+  async getOverview(projectId, queueId) {
+    await this.queue(projectId, queueId);
+    const timestamp = now$4();
+    const leaseRows = await this.executor.many(`SELECT l.*,wi.title work_item_title,wi.status work_item_status FROM work_leases l JOIN work_items wi ON wi.id=l.work_item_id
+      WHERE l.queue_id=$1 AND l.released_at IS NULL ORDER BY l.acquired_at,l.id`, [queueId]);
+    const summaries = leaseRows.map((row) => ({
+      ...this.leaseFromRow(row),
+      workItemTitle: String(row.work_item_title),
+      workItemStatus: String(row.work_item_status),
+      state: iso$1(row.expires_at) <= timestamp ? "expired" : "active"
+    }));
+    const attempt = await this.executor.maybeOne("SELECT a.*,l.released_at,l.terminal_outcome FROM automation_attempts a JOIN work_leases l ON l.id=a.lease_id WHERE a.queue_id=$1 ORDER BY a.started_at DESC,a.id DESC LIMIT 1", [queueId]);
+    return {
+      policy: await this.getPolicy(projectId, queueId),
+      activeLeases: summaries.filter(({ state }) => state === "active"),
+      expiredLeases: summaries.filter(({ state }) => state === "expired"),
+      lastAttempt: attempt ? await this.attemptFromRow(attempt) : null,
+      cursor: encodeAutomationCursor({ projectId, queueId, sequence: await this.latestSequence(projectId, queueId), checkedAt: timestamp })
+    };
+  }
+  async latestSequence(projectId, queueId) {
+    return Number((await this.executor.one("SELECT COALESCE(MAX(sequence),0) sequence FROM automation_queue_changes WHERE project_id=$1 AND queue_id=$2", [projectId, queueId])).sequence);
+  }
+  async claimFeed(projectId, workItemId, blockerReasons, cursor) {
+    const requirementIds = (await this.executor.many("SELECT requirement_id FROM requirement_work_links WHERE work_item_id=$1 ORDER BY requirement_id", [workItemId])).map((row) => String(row.requirement_id));
+    const rows = await this.executor.many(`SELECT u.id,u.kind,u.updated_at,r.content,p.current_checkpoint_id FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id JOIN projects p ON p.id=u.project_id WHERE u.project_id=$1 AND u.deleted_at IS NULL ORDER BY u.updated_at DESC,u.id DESC LIMIT 5`, [projectId]);
+    const updates = rows.map((row) => ({ id: String(row.id), kind: String(row.kind), content: String(row.content), updatedAt: iso$1(row.updated_at), current: String(row.id) === nullable$1(row.current_checkpoint_id) }));
+    let current = updates.find((update) => update.current) ?? null;
+    if (!current) {
+      const row = await this.executor.maybeOne(`SELECT u.id,u.kind,u.updated_at,r.content FROM projects p JOIN updates u ON u.id=p.current_checkpoint_id JOIN update_revisions r ON r.id=u.current_revision_id WHERE p.id=$1`, [projectId]);
+      if (row) current = { id: String(row.id), kind: String(row.kind), content: String(row.content), updatedAt: iso$1(row.updated_at), current: true };
+    }
+    return { cursor, changes: [], timedOut: false, requirementIds, blockerReasons, currentCheckpoint: current ? { id: current.id, kind: current.kind, content: current.content, updatedAt: current.updatedAt } : null, recentUpdates: updates.map(({ current: _current, ...update }) => update) };
+  }
+  async claim(projectId, queueId, input) {
+    return this.executor.transaction(async () => {
+      await lockProjectGraph(this.executor, projectId);
+      const project = await this.executor.maybeOne("SELECT * FROM projects WHERE id=$1 FOR UPDATE", [projectId]);
+      if (!project || project.archived_at) throw new NotFoundError("Project", projectId);
+      await this.queue(projectId, queueId);
+      const timestamp = now$4();
+      const cursor = encodeAutomationCursor({ projectId, queueId, sequence: await this.latestSequence(projectId, queueId), checkedAt: timestamp });
+      if (String(project.state) !== "active") return { outcome: "project_paused", cursor };
+      const policy = await this.getPolicy(projectId, queueId);
+      if (!policy.enabled) return { outcome: "policy_disabled", cursor };
+      const active = Number((await this.executor.one("SELECT COUNT(*)::integer count FROM work_leases WHERE queue_id=$1 AND released_at IS NULL AND expires_at>$2", [queueId, timestamp])).count);
+      if (active >= policy.maxActiveClaims) return { outcome: "capacity_reached", cursor };
+      const allowed = policy.allowedKinds.filter((kind) => !input.allowedKinds || input.allowedKinds.includes(kind));
+      if (!allowed.length) return { outcome: "empty", cursor };
+      const kindParams = allowed.map((_, index) => `$${index + 3}`).join(",");
+      const recoveryParam = allowed.length + 3, workerParam = allowed.length + 4, queueParam = allowed.length + 5, timeParam = allowed.length + 6;
+      const row = await this.executor.maybeOne(`SELECT wi.*,wqi.queue_id,wqi.rank,wl.id expired_lease_id FROM work_items wi
+        JOIN work_queue_items wqi ON wqi.work_item_id=wi.id AND wqi.queue_id=$1
+        LEFT JOIN work_leases wl ON wl.work_item_id=wi.id AND wl.released_at IS NULL
+        WHERE wi.project_id=$2 AND wi.kind IN (${kindParams})
+          AND ((wi.status='open' AND wl.id IS NULL) OR (wi.status='in_progress' AND $${recoveryParam}=TRUE AND wl.worker_id=$${workerParam} AND wl.queue_id=$${queueParam} AND wl.claimed_work_item_version=wi.version AND wl.expires_at<=$${timeParam}))
+          AND NOT EXISTS (SELECT 1 FROM external_blockers eb WHERE eb.project_id=wi.project_id AND eb.resolved_at IS NULL AND (eb.work_item_id IS NULL OR eb.work_item_id=wi.id))
+          AND NOT EXISTS (SELECT 1 FROM work_relations wr JOIN work_items dependency ON ((wr.kind='depends_on' AND dependency.id=wr.to_work_item_id) OR (wr.kind='blocks' AND dependency.id=wr.from_work_item_id))
+            WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=wi.id) OR (wr.kind='blocks' AND wr.to_work_item_id=wi.id)) AND dependency.status NOT IN ('resolved','dropped'))
+        ORDER BY wqi.rank COLLATE "C",wqi.work_item_id LIMIT 1 FOR UPDATE OF wi`, [queueId, projectId, ...allowed, policy.allowSameWorkerRecovery, input.workerId, queueId, timestamp]);
+      if (!row) return { outcome: "empty", cursor };
+      if (row.expired_lease_id) await this.executor.execute("UPDATE work_leases SET released_at=$1,release_reason='recovery',terminal_outcome='interrupted',version=version+1 WHERE id=$2 AND released_at IS NULL", [timestamp, row.expired_lease_id]);
+      const updated = await this.executor.maybeOne("UPDATE work_items SET status='in_progress',version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [timestamp, row.id, row.version]);
+      if (!updated) throw new ConflictError("Work item", String(row.id));
+      const leaseId = randomUUID(), attemptId = randomUUID(), token = randomBytes(32).toString("base64url");
+      const leaseSeconds = Math.min(input.leaseSeconds ?? policy.leaseSeconds, policy.leaseSeconds);
+      await this.executor.execute(`INSERT INTO work_leases(id,project_id,queue_id,work_item_id,worker_id,token_hash,claimed_work_item_version,acquired_at,heartbeat_at,expires_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9)`, [leaseId, projectId, queueId, row.id, input.workerId, tokenHash$1(token), updated.version, timestamp, expiresAt$1(timestamp, leaseSeconds)]);
+      const ordinal = Number((await this.executor.one("SELECT COALESCE(MAX(ordinal),0)+1 ordinal FROM automation_attempts WHERE work_item_id=$1", [row.id])).ordinal);
+      await this.executor.execute("INSERT INTO automation_attempts(id,project_id,queue_id,work_item_id,lease_id,ordinal,started_at) VALUES ($1,$2,$3,$4,$5,$6,$7)", [attemptId, projectId, queueId, row.id, leaseId, ordinal, timestamp]);
+      await this.event(projectId, "work_lease", leaseId, "work_lease.claimed", { queueId, workItemId: row.id, workerId: input.workerId, attemptId });
+      const item = await this.workItemFromRow({ ...updated, queue_id: queueId, rank: row.rank });
+      const lease = this.leaseFromRow(await this.executor.one("SELECT * FROM work_leases WHERE id=$1", [leaseId]));
+      const attempt = await this.attemptFromRow(await this.executor.one("SELECT a.*,l.released_at,l.terminal_outcome FROM automation_attempts a JOIN work_leases l ON l.id=a.lease_id WHERE a.id=$1", [attemptId]));
+      const feedCursor = encodeAutomationCursor({ projectId, queueId, sequence: await this.latestSequence(projectId, queueId), checkedAt: timestamp });
+      return { outcome: "claimed", item, lease: { ...lease, leaseToken: token }, attempt, feed: await this.claimFeed(projectId, item.id, item.blockerReasons ?? [], feedCursor) };
+    });
+  }
+  async leaseAndItem(leaseId, forUpdate = false) {
+    const leaseRow = await this.executor.maybeOne(`SELECT * FROM work_leases WHERE id=$1${forUpdate ? " FOR UPDATE" : ""}`, [leaseId]);
+    if (!leaseRow) throw new NotFoundError("Work lease", leaseId);
+    const itemRow = await this.executor.one(`SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi LEFT JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.id=$1${forUpdate ? " FOR UPDATE OF wi" : ""}`, [leaseRow.work_item_id]);
+    return { leaseRow, item: await this.workItemFromRow(itemRow), policy: await this.getPolicy(String(leaseRow.project_id), String(leaseRow.queue_id)) };
+  }
+  async lockedLeaseAndItem(leaseId) {
+    const initial = await this.executor.maybeOne("SELECT project_id FROM work_leases WHERE id=$1", [leaseId]);
+    if (!initial) throw new NotFoundError("Work lease", leaseId);
+    await lockProjectGraph(this.executor, String(initial.project_id));
+    return this.leaseAndItem(leaseId, true);
+  }
+  validToken(row, token) {
+    return Boolean(token) && String(row.token_hash) === tokenHash$1(token);
+  }
+  async heartbeat(leaseId, input) {
+    return this.executor.transaction(async () => {
+      const current = await this.lockedLeaseAndItem(leaseId), timestamp = now$4();
+      if (!this.validToken(current.leaseRow, input.leaseToken) || current.leaseRow.released_at || iso$1(current.leaseRow.expires_at) <= timestamp) return { outcome: "lease_lost", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      const project = await this.executor.one("SELECT state FROM projects WHERE id=$1", [current.item.projectId]);
+      if (String(project.state) !== "active") return { outcome: "project_paused", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      if (!current.policy.enabled) return { outcome: "policy_disabled", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      if (current.item.version !== Number(current.leaseRow.claimed_work_item_version) || current.item.status !== "in_progress" || current.item.queueId !== String(current.leaseRow.queue_id) || current.item.effectiveBlocked) return { outcome: "human_changed_state", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      const row = await this.executor.maybeOne("UPDATE work_leases SET heartbeat_at=$1,expires_at=$2,version=version+1 WHERE id=$3 AND version=$4 AND released_at IS NULL AND expires_at>$1 RETURNING *", [timestamp, expiresAt$1(timestamp, current.policy.leaseSeconds), leaseId, current.leaseRow.version]);
+      if (!row) return { outcome: "lease_lost", lease: this.leaseFromRow(await this.executor.one("SELECT * FROM work_leases WHERE id=$1", [leaseId])), item: current.item };
+      const lease = this.leaseFromRow(row);
+      await this.event(lease.projectId, "work_lease", leaseId, "work_lease.heartbeat", { expiresAt: lease.expiresAt });
+      return { outcome: "heartbeat", lease };
+    });
+  }
+  async record(leaseId, input) {
+    return this.executor.transaction(async () => {
+      const current = await this.leaseAndItem(leaseId, true), timestamp = now$4();
+      if (!this.validToken(current.leaseRow, input.leaseToken) || current.leaseRow.released_at || iso$1(current.leaseRow.expires_at) <= timestamp) throw new ConflictError("Work lease", leaseId);
+      const attempt = await this.executor.one("SELECT * FROM automation_attempts WHERE lease_id=$1", [leaseId]);
+      for (const [table, id22] of [["runs", input.runId], ["evidence", input.evidenceId]]) if (id22 && !await this.executor.maybeOne(`SELECT 1 FROM ${table} WHERE id=$1 AND project_id=$2`, [id22, current.leaseRow.project_id])) throw new ValidationError(`${table === "runs" ? "runId" : "evidenceId"} must belong to the lease project`);
+      const sequence = Number((await this.executor.one("SELECT COALESCE(MAX(sequence),0)+1 sequence FROM automation_attempt_observations WHERE attempt_id=$1", [attempt.id])).sequence), id2 = randomUUID();
+      const row = await this.executor.one("INSERT INTO automation_attempt_observations(id,attempt_id,sequence,kind,summary,run_id,evidence_id,delivery_json,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9) RETURNING *", [id2, attempt.id, sequence, input.kind, input.summary, input.runId ?? null, input.evidenceId ?? null, input.delivery ? JSON.stringify(input.delivery) : null, timestamp]);
+      await this.event(String(current.leaseRow.project_id), "automation_attempt", String(attempt.id), "automation_attempt.recorded", { sequence, kind: input.kind, runId: input.runId ?? null, evidenceId: input.evidenceId ?? null });
+      return this.observationFromRow(row);
+    });
+  }
+  async complete(leaseId, input) {
+    return this.executor.transaction(async () => {
+      const current = await this.lockedLeaseAndItem(leaseId), timestamp = now$4();
+      if (!this.validToken(current.leaseRow, input.leaseToken) || current.leaseRow.released_at || iso$1(current.leaseRow.expires_at) <= timestamp) return { outcome: "lease_lost", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      const project = await this.executor.one("SELECT state FROM projects WHERE id=$1", [current.item.projectId]);
+      if (String(project.state) !== "active") return { outcome: "project_paused", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      if (!current.policy.enabled) return { outcome: "policy_disabled", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      if (current.item.version !== input.expectedWorkItemVersion || current.item.version !== Number(current.leaseRow.claimed_work_item_version) || current.item.status !== "in_progress" || current.item.queueId !== String(current.leaseRow.queue_id) || current.item.effectiveBlocked) return { outcome: "human_changed_state", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      const outcome = input.outcome === "resolved" && current.policy.requiresManualApproval ? "awaiting_approval" : input.outcome;
+      const status = outcome === "resolved" ? "resolved" : outcome === "blocked" ? "blocked" : ["retryable", "interrupted"].includes(outcome) ? "open" : "in_progress";
+      const itemRow = await this.executor.one("UPDATE work_items SET status=$1,version=version+1,updated_at=$2 WHERE id=$3 AND version=$4 RETURNING *", [status, timestamp, current.item.id, current.item.version]);
+      const leaseRow = await this.executor.one("UPDATE work_leases SET released_at=$1,release_reason=$2,terminal_outcome=$3,version=version+1 WHERE id=$4 AND released_at IS NULL RETURNING *", [timestamp, outcome === "interrupted" ? "runner_shutdown" : "manual", outcome, leaseId]);
+      await this.event(current.item.projectId, "work_lease", leaseId, "work_lease.completed", { workItemId: current.item.id, outcome });
+      return { outcome, lease: this.leaseFromRow(leaseRow), item: await this.workItemFromRow({ ...itemRow, queue_id: current.item.queueId, rank: current.item.rank }) };
+    });
+  }
+  async releaseInternal(leaseId, leaseToken2, reason, operator, expectedLeaseVersion) {
+    return this.executor.transaction(async () => {
+      const current = await this.lockedLeaseAndItem(leaseId), timestamp = now$4();
+      if (operator && Number(current.leaseRow.version) !== expectedLeaseVersion) throw new ConflictError("Work lease", leaseId);
+      if (current.leaseRow.released_at) return { outcome: "already_released", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      if (!operator && !this.validToken(current.leaseRow, leaseToken2)) return { outcome: "lease_lost", lease: this.leaseFromRow(current.leaseRow), item: current.item };
+      const leaseRow = await this.executor.one("UPDATE work_leases SET released_at=$1,release_reason=$2,terminal_outcome='interrupted',version=version+1 WHERE id=$3 AND released_at IS NULL RETURNING *", [timestamp, reason, leaseId]);
+      let item = current.item;
+      if (item.version === Number(current.leaseRow.claimed_work_item_version) && item.status === "in_progress" && item.queueId === String(current.leaseRow.queue_id)) {
+        const row = await this.executor.one("UPDATE work_items SET status='open',version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *", [timestamp, item.id, item.version]);
+        item = await this.workItemFromRow({ ...row, queue_id: item.queueId, rank: item.rank });
+      }
+      await this.event(item.projectId, "work_lease", leaseId, "work_lease.released", { workItemId: item.id, reason });
+      return { outcome: "released", lease: this.leaseFromRow(leaseRow), item };
+    });
+  }
+  release(leaseId, input) {
+    return this.releaseInternal(leaseId, input.leaseToken, input.reason, false);
+  }
+  operatorRelease(leaseId, input) {
+    return this.releaseInternal(leaseId, null, "manual", true, input.expectedLeaseVersion);
+  }
+  async readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) {
+    await this.queue(projectId, queueId);
+    const latestSequence = await this.latestSequence(projectId, queueId);
+    if (afterSequence > latestSequence) throw new ValidationError("Invalid automation queue cursor");
+    const page = (await this.executor.many("SELECT * FROM automation_queue_changes WHERE project_id=$1 AND queue_id=$2 AND sequence>$3 ORDER BY sequence LIMIT 201", [projectId, queueId, afterSequence])).slice(0, 200);
+    const changes = page.map((row) => ({ sequence: Number(row.sequence), projectId: String(row.project_id), queueId: String(row.queue_id), eventType: String(row.event_type), entityType: String(row.entity_type), entityId: String(row.entity_id), createdAt: iso$1(row.created_at) }));
+    const expiredLeases = (await this.executor.many("SELECT * FROM work_leases WHERE project_id=$1 AND queue_id=$2 AND released_at IS NULL AND expires_at>$3 AND expires_at<=$4 ORDER BY expires_at,id", [projectId, queueId, expiredAfter, checkedAt])).map((row) => this.leaseFromRow(row));
+    const next = await this.executor.one("SELECT MIN(expires_at) next_expiry FROM work_leases WHERE project_id=$1 AND queue_id=$2 AND released_at IS NULL AND expires_at>$3", [projectId, queueId, checkedAt]);
+    return { changes, cursorSequence: changes.at(-1)?.sequence ?? afterSequence, expiredLeases, nextExpiryAt: nullable$1(next.next_expiry) };
+  }
+}
+const now$3 = () => (/* @__PURE__ */ new Date()).toISOString();
 const text = (value) => value == null ? null : String(value);
 const iso = (value) => value instanceof Date ? value.toISOString() : String(value);
-const bool$1 = (value) => value === true || value === 1 || value === "1";
-const json$1 = (value, fallback) => {
+const bool$2 = (value) => value === true || value === 1 || value === "1";
+const json$2 = (value, fallback) => {
   if (value == null) return fallback;
   if (typeof value !== "string") return value;
   try {
@@ -17292,7 +18022,7 @@ function projectFromRow$1(row) {
     state: String(row.state),
     currentFocus: text(row.current_focus),
     nextAction: text(row.next_action),
-    blockers: json$1(row.blockers_json, []),
+    blockers: json$2(row.blockers_json, []),
     currentCheckpointId: text(row.current_checkpoint_id),
     archivedAt: text(row.archived_at) ? iso(row.archived_at) : null,
     version: Number(row.version),
@@ -17304,11 +18034,13 @@ function projectFromRow$1(row) {
 class PostgresOperationalRepository {
   constructor(executor) {
     this.executor = executor;
+    this.automation = new PostgresAutomationRepository(executor, (projectId, entityType, entityId, eventType, payload) => this.event(projectId, entityType, entityId, eventType, payload));
   }
   executor;
   contexts = new AsyncLocalStorage();
+  automation;
   async runIdempotent(client2, key, operation, payload, work) {
-    return this.runMutation({ source: "system", actor: client2, client: client2, idempotencyKey: key, occurredAt: now$2() }, operation, payload, work);
+    return this.runMutation({ source: "system", actor: client2, client: client2, idempotencyKey: key, occurredAt: now$3() }, operation, payload, work);
   }
   async runMutation(context, operation, payload, work) {
     const requestHash = createHash("sha256").update(canonicalJson(payload)).digest("hex");
@@ -17320,7 +18052,7 @@ class PostgresOperationalRepository {
         if (!claimed) {
           const existing = await this.executor.one("SELECT operation,request_hash,result_json FROM idempotency_records WHERE client=$1 AND idempotency_key=$2 FOR UPDATE", [client2, context.idempotencyKey]);
           if (String(existing.operation) !== operation || String(existing.request_hash) !== requestHash) throw new IdempotencyConflictError(context.idempotencyKey);
-          return json$1(existing.result_json, void 0);
+          return json$2(existing.result_json, void 0);
         }
       }
       const result2 = await work();
@@ -17329,7 +18061,7 @@ class PostgresOperationalRepository {
     }));
   }
   context() {
-    return this.contexts.getStore() ?? { source: "system", actor: "internal", client: "internal", idempotencyKey: null, occurredAt: now$2() };
+    return this.contexts.getStore() ?? { source: "system", actor: "internal", client: "internal", idempotencyKey: null, occurredAt: now$3() };
   }
   async event(projectId, entityType, entityId, eventType, payload = {}) {
     const context = this.context();
@@ -17372,7 +18104,7 @@ class PostgresOperationalRepository {
   async createRequirementState(projectId, input) {
     await this.project(projectId);
     const id2 = randomUUID();
-    const timestamp = now$2();
+    const timestamp = now$3();
     const position = input.position ?? Number((await this.executor.one("SELECT COALESCE(MAX(position),-1)+1 AS position FROM requirement_states WHERE project_id=$1", [projectId])).position);
     try {
       await this.executor.execute("INSERT INTO requirement_states(id,project_id,name,semantic,position,colour,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)", [id2, projectId, input.name, input.semantic, position, input.colour ?? null, timestamp]);
@@ -17384,7 +18116,7 @@ class PostgresOperationalRepository {
   }
   async evidenceStaleness(row) {
     const targetVersion = row.target_version == null ? null : Number(row.target_version);
-    const storedStale = bool$1(row.stale);
+    const storedStale = bool$2(row.stale);
     const storedReason = text(row.stale_reason);
     if (targetVersion == null) return { stale: storedStale, staleReason: storedReason };
     const versions = await this.executor.many(`SELECT version FROM requirements r JOIN evidence_requirement_links l ON l.requirement_id=r.id WHERE l.evidence_id=$1
@@ -17402,9 +18134,9 @@ class PostgresOperationalRepository {
         const effective = await this.evidenceStaleness(entry);
         return { id: String(entry.id), ordinal: Number(entry.ordinal), result: String(entry.result), createdAt: iso(entry.created_at), stale: effective.stale || Number(entry.criterion_version) !== Number(row.version), validationStatus: String(entry.validation_status) };
       });
-      const proof = evaluateCriterionProof({ id: String(row.id), title: String(row.title), required: bool$1(row.required), evidence: observations });
+      const proof = evaluateCriterionProof({ id: String(row.id), title: String(row.title), required: bool$2(row.required), evidence: observations });
       const archivedAt = row.archived_at == null ? null : iso(row.archived_at);
-      return { id: String(row.id), requirementId: String(row.requirement_id), title: String(row.title), description: text(row.description), position: Number(row.position), required: bool$1(row.required), version: Number(row.version), archivedAt, proofStatus: proof.status, proofEvidenceId: proof.evidenceId, proofReason: archivedAt ? "Criterion is archived and does not participate in requirement proof" : proof.reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+      return { id: String(row.id), requirementId: String(row.requirement_id), title: String(row.title), description: text(row.description), position: Number(row.position), required: bool$2(row.required), version: Number(row.version), archivedAt, proofStatus: proof.status, proofEvidenceId: proof.evidenceId, proofReason: archivedAt ? "Criterion is archived and does not participate in requirement proof" : proof.reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
     });
   }
   async requirementFromRow(row) {
@@ -17446,7 +18178,7 @@ class PostgresOperationalRepository {
         await this.assertRequirementParent(input.parentId, projectId);
       }
       const id2 = randomUUID();
-      const timestamp = now$2();
+      const timestamp = now$3();
       try {
         await this.executor.execute("INSERT INTO requirements(id,project_id,stable_key,kind,parent_id,title,description,state_id,responsible_phase_id,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)", [id2, projectId, input.stableKey, input.kind, input.parentId ?? null, input.title, input.description ?? null, state.id, input.responsiblePhaseId ?? null, timestamp]);
       } catch (error) {
@@ -17478,12 +18210,12 @@ class PostgresOperationalRepository {
       const relatedPhaseIds = input.relatedPhaseIds ?? current.relatedPhaseIds;
       for (const phaseId of new Set(relatedPhaseIds)) await this.assertProjectEntity("phases", phaseId, current.projectId);
       const next = { ...current, ...input };
-      const changed = await this.executor.execute(`UPDATE requirements SET stable_key=$1,kind=$2,parent_id=$3,title=$4,description=$5,state_id=$6,responsible_phase_id=$7,version=version+1,updated_at=$8 WHERE id=$9 AND version=$10`, [next.stableKey, next.kind, parentId ?? null, next.title, next.description ?? null, stateId, responsiblePhaseId ?? null, now$2(), id2, input.expectedVersion]);
+      const changed = await this.executor.execute(`UPDATE requirements SET stable_key=$1,kind=$2,parent_id=$3,title=$4,description=$5,state_id=$6,responsible_phase_id=$7,version=version+1,updated_at=$8 WHERE id=$9 AND version=$10`, [next.stableKey, next.kind, parentId ?? null, next.title, next.description ?? null, stateId, responsiblePhaseId ?? null, now$3(), id2, input.expectedVersion]);
       if (!changed) throw new ConflictError("Requirement", id2);
       if (input.relatedPhaseIds !== void 0 || input.responsiblePhaseId !== void 0) {
         await this.executor.execute("DELETE FROM requirement_phase_links WHERE requirement_id=$1", [id2]);
-        if (responsiblePhaseId) await this.executor.execute("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)", [id2, responsiblePhaseId, "responsible", now$2()]);
-        for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== responsiblePhaseId) await this.executor.execute("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)", [id2, phaseId, "related", now$2()]);
+        if (responsiblePhaseId) await this.executor.execute("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)", [id2, responsiblePhaseId, "responsible", now$3()]);
+        for (const phaseId of new Set(relatedPhaseIds)) if (phaseId !== responsiblePhaseId) await this.executor.execute("INSERT INTO requirement_phase_links(requirement_id,phase_id,role,created_at) VALUES ($1,$2,$3,$4)", [id2, phaseId, "related", now$3()]);
       }
       if (input.criteria !== void 0) {
         const existing = await this.executor.many("SELECT * FROM acceptance_criteria WHERE requirement_id=$1", [id2]);
@@ -17492,21 +18224,21 @@ class PostgresOperationalRepository {
         for (const [position, criterion] of input.criteria.entries()) {
           if (!criterion.id) {
             const criterionId = randomUUID();
-            const timestamp = now$2();
+            const timestamp = now$3();
             await this.executor.execute("INSERT INTO acceptance_criteria(id,requirement_id,title,description,position,required,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)", [criterionId, id2, criterion.title, criterion.description ?? null, position, criterion.required, timestamp]);
             await this.event(current.projectId, "acceptance_criterion", criterionId, "acceptance_criterion.created", { requirementId: id2 });
             continue;
           }
           const stored = byId.get(criterion.id);
           if (!stored) throw new ValidationError("Criterion must belong to the requirement being updated");
-          const materiallyChanged = String(stored.title) !== criterion.title || text(stored.description) !== (criterion.description ?? null) || bool$1(stored.required) !== criterion.required || Number(stored.position) !== position || stored.archived_at !== null;
-          const count = await this.executor.execute(`UPDATE acceptance_criteria SET title=$1,description=$2,position=$3,required=$4,archived_at=NULL,version=version+$5,updated_at=$6 WHERE id=$7 AND requirement_id=$8 AND version=$9`, [criterion.title, criterion.description ?? null, position, criterion.required, materiallyChanged ? 1 : 0, now$2(), criterion.id, id2, criterion.expectedVersion]);
+          const materiallyChanged = String(stored.title) !== criterion.title || text(stored.description) !== (criterion.description ?? null) || bool$2(stored.required) !== criterion.required || Number(stored.position) !== position || stored.archived_at !== null;
+          const count = await this.executor.execute(`UPDATE acceptance_criteria SET title=$1,description=$2,position=$3,required=$4,archived_at=NULL,version=version+$5,updated_at=$6 WHERE id=$7 AND requirement_id=$8 AND version=$9`, [criterion.title, criterion.description ?? null, position, criterion.required, materiallyChanged ? 1 : 0, now$3(), criterion.id, id2, criterion.expectedVersion]);
           if (!count) throw new ConflictError("Acceptance criterion", criterion.id);
           retained.add(criterion.id);
           if (materiallyChanged) await this.event(current.projectId, "acceptance_criterion", criterion.id, "acceptance_criterion.updated", { requirementId: id2 });
         }
         for (const stored of existing.filter((criterion) => criterion.archived_at == null && !retained.has(String(criterion.id)))) {
-          await this.executor.execute("UPDATE acceptance_criteria SET archived_at=$1,version=version+1,updated_at=$1 WHERE id=$2", [now$2(), stored.id]);
+          await this.executor.execute("UPDATE acceptance_criteria SET archived_at=$1,version=version+1,updated_at=$1 WHERE id=$2", [now$3(), stored.id]);
           await this.event(current.projectId, "acceptance_criterion", String(stored.id), "acceptance_criterion.archived", { requirementId: id2 });
         }
       }
@@ -17518,7 +18250,7 @@ class PostgresOperationalRepository {
   async linkRequirementWork(projectId, requirementId, workItemId) {
     await this.assertProjectEntity("requirements", requirementId, projectId);
     await this.assertProjectEntity("work_items", workItemId, projectId);
-    await this.executor.execute("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [requirementId, workItemId, now$2()]);
+    await this.executor.execute("INSERT INTO requirement_work_links(requirement_id,work_item_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [requirementId, workItemId, now$3()]);
     await this.event(projectId, "requirement", requirementId, "requirement.work_linked", { workItemId });
   }
   async unlinkRequirementWork(requirementId, workItemId) {
@@ -17575,7 +18307,7 @@ class PostgresOperationalRepository {
   async createWorkQueue(projectId, input) {
     await this.project(projectId);
     const id2 = randomUUID();
-    const timestamp = now$2();
+    const timestamp = now$3();
     try {
       await this.executor.execute("INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)", [id2, projectId, input.name, input.description ?? null, timestamp]);
     } catch (error) {
@@ -17583,6 +18315,36 @@ class PostgresOperationalRepository {
     }
     await this.event(projectId, "work_queue", id2, "work_queue.created", { name: input.name });
     return (await this.listWorkQueues(projectId)).find((q) => q.id === id2);
+  }
+  getQueueAutomationPolicy(projectId, queueId) {
+    return this.automation.getPolicy(projectId, queueId);
+  }
+  updateQueueAutomationPolicy(projectId, queueId, input) {
+    return this.automation.updatePolicy(projectId, queueId, input);
+  }
+  getQueueAutomationOverview(projectId, queueId) {
+    return this.automation.getOverview(projectId, queueId);
+  }
+  claimNextAutomatedWork(projectId, queueId, input) {
+    return this.automation.claim(projectId, queueId, input);
+  }
+  heartbeatAutomatedWork(leaseId, input) {
+    return this.automation.heartbeat(leaseId, input);
+  }
+  recordAutomationAttempt(leaseId, input) {
+    return this.automation.record(leaseId, input);
+  }
+  completeAutomatedWork(leaseId, input) {
+    return this.automation.complete(leaseId, input);
+  }
+  releaseAutomatedWork(leaseId, input) {
+    return this.automation.release(leaseId, input);
+  }
+  operatorReleaseAutomatedWork(leaseId, input) {
+    return this.automation.operatorRelease(leaseId, input);
+  }
+  readAutomationQueueChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) {
+    return this.automation.readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt);
   }
   async workItemFromRow(row) {
     const id2 = String(row.id);
@@ -17612,7 +18374,7 @@ class PostgresOperationalRepository {
       if (input.kind === "depends_on" && await this.dependencyWouldCycle(input.fromWorkItemId, input.toWorkItemId)) throw new ValidationError("Dependency would create a cycle");
       if (input.kind === "blocks" && await this.dependencyWouldCycle(input.toWorkItemId, input.fromWorkItemId)) throw new ValidationError("Blocking relationship would create a cycle");
       const id2 = randomUUID();
-      const timestamp = now$2();
+      const timestamp = now$3();
       try {
         await this.executor.execute("INSERT INTO work_relations(id,project_id,from_work_item_id,to_work_item_id,kind,created_at) VALUES ($1,$2,$3,$4,$5,$6)", [id2, projectId, input.fromWorkItemId, input.toWorkItemId, input.kind, timestamp]);
       } catch (error) {
@@ -17623,35 +18385,48 @@ class PostgresOperationalRepository {
     });
   }
   async unlinkWorkItems(id2) {
-    const relation = await this.executor.maybeOne("DELETE FROM work_relations WHERE id=$1 RETURNING *", [id2]);
-    if (relation) await this.event(String(relation.project_id), "work_relation", id2, "work_relation.deleted", { kind: relation.kind });
+    const current = await this.executor.maybeOne("SELECT * FROM work_relations WHERE id=$1", [id2]);
+    if (!current) return;
+    await this.executor.transaction(async () => {
+      await lockProjectGraph(this.executor, String(current.project_id));
+      const relation = await this.executor.maybeOne("DELETE FROM work_relations WHERE id=$1 RETURNING *", [id2]);
+      if (relation) await this.event(String(relation.project_id), "work_relation", id2, "work_relation.deleted", { kind: relation.kind });
+    });
   }
   async listWorkRelations(projectId) {
     return (await this.executor.many("SELECT * FROM work_relations WHERE project_id=$1 ORDER BY created_at,id", [projectId])).map((row) => ({ id: String(row.id), projectId: String(row.project_id), fromWorkItemId: String(row.from_work_item_id), toWorkItemId: String(row.to_work_item_id), kind: String(row.kind), createdAt: iso(row.created_at) }));
   }
   async createExternalBlocker(projectId, input) {
-    await this.project(projectId);
-    if (input.workItemId) await this.assertProjectEntity("work_items", input.workItemId, projectId);
-    const id2 = randomUUID();
-    const timestamp = now$2();
-    await this.executor.execute("INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)", [id2, projectId, input.workItemId ?? null, input.content, timestamp]);
-    await this.event(projectId, "external_blocker", id2, "external_blocker.created", { workItemId: input.workItemId ?? null });
-    return { id: id2, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp };
+    return this.executor.transaction(async () => {
+      await lockProjectGraph(this.executor, projectId);
+      await this.project(projectId);
+      if (input.workItemId) await this.assertProjectEntity("work_items", input.workItemId, projectId);
+      const id2 = randomUUID();
+      const timestamp = now$3();
+      await this.executor.execute("INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)", [id2, projectId, input.workItemId ?? null, input.content, timestamp]);
+      await this.event(projectId, "external_blocker", id2, "external_blocker.created", { workItemId: input.workItemId ?? null });
+      return { id: id2, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp };
+    });
   }
   async listExternalBlockers(projectId, includeResolved = false) {
     const rows = await this.executor.many(`SELECT * FROM external_blockers WHERE project_id=$1 ${includeResolved ? "" : "AND resolved_at IS NULL"} ORDER BY created_at DESC,id`, [projectId]);
     return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: row.resolved_at == null ? null : iso(row.resolved_at), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) }));
   }
   async resolveExternalBlocker(id2) {
-    const timestamp = now$2();
-    const row = await this.executor.maybeOne("UPDATE external_blockers SET resolved_at=$1,updated_at=$1 WHERE id=$2 RETURNING *", [timestamp, id2]);
-    if (!row) throw new NotFoundError("External blocker", id2);
-    await this.event(String(row.project_id), "external_blocker", id2, "external_blocker.resolved");
-    return { id: id2, projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: timestamp, createdAt: iso(row.created_at), updatedAt: timestamp };
+    const current = await this.executor.maybeOne("SELECT * FROM external_blockers WHERE id=$1", [id2]);
+    if (!current) throw new NotFoundError("External blocker", id2);
+    return this.executor.transaction(async () => {
+      await lockProjectGraph(this.executor, String(current.project_id));
+      const timestamp = now$3();
+      const row = await this.executor.maybeOne("UPDATE external_blockers SET resolved_at=$1,updated_at=$1 WHERE id=$2 RETURNING *", [timestamp, id2]);
+      if (!row) throw new NotFoundError("External blocker", id2);
+      await this.event(String(row.project_id), "external_blocker", id2, "external_blocker.resolved");
+      return { id: id2, projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: timestamp, createdAt: iso(row.created_at), updatedAt: timestamp };
+    });
   }
   async createWorkspace(input) {
     const id2 = randomUUID();
-    const timestamp = now$2();
+    const timestamp = now$3();
     const root = resolve$1(input.canonicalRoot);
     const aliases = [...new Set((input.aliases ?? []).map((entry) => resolve$1(entry)))];
     return this.executor.transaction(async () => {
@@ -17668,13 +18443,13 @@ class PostgresOperationalRepository {
   async linkProjectWorkspace(projectId, workspaceId) {
     await this.project(projectId);
     if (!await this.executor.maybeOne("SELECT 1 FROM workspaces WHERE id=$1", [workspaceId])) throw new NotFoundError("Workspace", workspaceId);
-    await this.executor.execute("INSERT INTO project_workspaces(project_id,workspace_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [projectId, workspaceId, now$2()]);
+    await this.executor.execute("INSERT INTO project_workspaces(project_id,workspace_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [projectId, workspaceId, now$3()]);
     await this.event(projectId, "workspace", workspaceId, "workspace.linked", { projectId });
   }
   async createWorkspaceRevision(input) {
     if (!await this.executor.maybeOne("SELECT 1 FROM workspaces WHERE id=$1", [input.workspaceId])) throw new NotFoundError("Workspace", input.workspaceId);
     const id2 = randomUUID();
-    const capturedAt = now$2();
+    const capturedAt = now$3();
     await this.executor.execute('INSERT INTO workspace_revisions(id,workspace_id,branch,"commit",dirty,diff_hash,captured_at) VALUES ($1,$2,$3,$4,$5,$6,$7)', [id2, input.workspaceId, input.branch ?? null, input.commit ?? null, input.dirty, input.diffHash ?? null, capturedAt]);
     const projects = await this.executor.many("SELECT project_id FROM project_workspaces WHERE workspace_id=$1", [input.workspaceId]);
     if (projects.length) for (const project of projects) await this.event(String(project.project_id), "workspace_revision", id2, "workspace_revision.created", { workspaceId: input.workspaceId, dirty: input.dirty });
@@ -17693,12 +18468,12 @@ class PostgresOperationalRepository {
     return new SecretRedactor({ secretNames: names2 });
   }
   errorReportFromRow(row) {
-    return { id: String(row.id), kind: String(row.kind), component: String(row.component), summary: String(row.summary), observation: String(row.observation), expectedBehaviour: text(row.expected_behaviour), actualBehaviour: text(row.actual_behaviour), reproductionSteps: json$1(row.reproduction_steps_json, []), impact: text(row.impact), projectId: text(row.project_id), workspacePath: text(row.workspace_path), status: String(row.status), triageNote: text(row.triage_note), source: String(row.source), client: text(row.client), actor: String(row.actor), redaction: json$1(row.redaction_json, { count: 0, fields: [] }), version: Number(row.version), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+    return { id: String(row.id), kind: String(row.kind), component: String(row.component), summary: String(row.summary), observation: String(row.observation), expectedBehaviour: text(row.expected_behaviour), actualBehaviour: text(row.actual_behaviour), reproductionSteps: json$2(row.reproduction_steps_json, []), impact: text(row.impact), projectId: text(row.project_id), workspacePath: text(row.workspace_path), status: String(row.status), triageNote: text(row.triage_note), source: String(row.source), client: text(row.client), actor: String(row.actor), redaction: json$2(row.redaction_json, { count: 0, fields: [] }), version: Number(row.version), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
   }
   async createErrorReport(input) {
     if (input.projectId) await this.project(input.projectId);
     const id2 = randomUUID();
-    const timestamp = now$2();
+    const timestamp = now$3();
     const context = this.context();
     const redactor = await this.secretRedactor(input.projectId);
     const component = redactor.redact(input.component);
@@ -17736,7 +18511,7 @@ class PostgresOperationalRepository {
   async getErrorReport(id2) {
     const row = await this.executor.maybeOne("SELECT * FROM error_reports WHERE id=$1", [id2]);
     if (!row) return null;
-    const history = (await this.executor.many("SELECT * FROM activity_events WHERE entity_type='error_report' AND entity_id=$1 ORDER BY created_at,id", [id2])).map((e) => ({ id: String(e.id), projectId: text(e.project_id), entityType: String(e.entity_type), entityId: String(e.entity_id), eventType: String(e.event_type), payload: json$1(e.payload_json, {}), source: String(e.source), client: text(e.client), actor: String(e.actor), idempotencyKey: text(e.idempotency_key), createdAt: iso(e.created_at) }));
+    const history = (await this.executor.many("SELECT * FROM activity_events WHERE entity_type='error_report' AND entity_id=$1 ORDER BY created_at,id", [id2])).map((e) => ({ id: String(e.id), projectId: text(e.project_id), entityType: String(e.entity_type), entityId: String(e.entity_id), eventType: String(e.event_type), payload: json$2(e.payload_json, {}), source: String(e.source), client: text(e.client), actor: String(e.actor), idempotencyKey: text(e.idempotency_key), createdAt: iso(e.created_at) }));
     return { report: this.errorReportFromRow(row), history };
   }
   async updateErrorReport(id2, input) {
@@ -17745,7 +18520,7 @@ class PostgresOperationalRepository {
     const redactor = await this.secretRedactor(text(current.project_id));
     const note = input.triageNote === void 0 ? text(current.triage_note) : input.triageNote === null ? null : redactor.redact(input.triageNote).value;
     const status = input.status ?? String(current.status);
-    const changed = await this.executor.execute("UPDATE error_reports SET status=$1,triage_note=$2,version=version+1,updated_at=$3 WHERE id=$4 AND version=$5", [status, note, now$2(), id2, input.expectedVersion]);
+    const changed = await this.executor.execute("UPDATE error_reports SET status=$1,triage_note=$2,version=version+1,updated_at=$3 WHERE id=$4 AND version=$5", [status, note, now$3(), id2, input.expectedVersion]);
     if (!changed) throw new ConflictError("Error report", id2);
     await this.event(null, "error_report", id2, "error_report.status_updated", { status });
     return this.errorReportFromRow(await this.executor.one("SELECT * FROM error_reports WHERE id=$1", [id2]));
@@ -17757,7 +18532,7 @@ class PostgresOperationalRepository {
     await this.project(projectId);
     if (input.workspaceRevisionId && !await this.executor.maybeOne(`SELECT 1 FROM workspace_revisions wr JOIN project_workspaces pw ON pw.workspace_id=wr.workspace_id WHERE wr.id=$1 AND pw.project_id=$2`, [input.workspaceRevisionId, projectId])) throw new ValidationError("Workspace revision does not belong to the project");
     const id2 = randomUUID();
-    const createdAt = now$2();
+    const createdAt = now$3();
     const redactor = await this.secretRedactor(projectId);
     const command = redactor.redact(stripAnsi$1(input.command));
     const working = input.workingDirectory ? redactor.redact(input.workingDirectory) : null;
@@ -17793,7 +18568,7 @@ class PostgresOperationalRepository {
   }
   async listRuns(projectId) {
     const rows = await this.executor.many("SELECT * FROM runs WHERE project_id=$1 ORDER BY started_at DESC,id DESC", [projectId]);
-    return serialMap(rows, async (row) => ({ id: String(row.id), projectId: String(row.project_id), workspaceRevisionId: text(row.workspace_revision_id), command: String(row.command), workingDirectory: text(row.working_directory), startedAt: iso(row.started_at), endedAt: row.ended_at == null ? null : iso(row.ended_at), durationMs: row.duration_ms == null ? null : Number(row.duration_ms), outcome: String(row.outcome), exitCode: row.exit_code == null ? null : Number(row.exit_code), toolchain: json$1(row.toolchain_json, {}), stdoutExcerpt: text(row.stdout_excerpt), stderrExcerpt: text(row.stderr_excerpt), stdoutTruncated: bool$1(row.stdout_truncated), stderrTruncated: bool$1(row.stderr_truncated), artifacts: await this.artifactsForRun(String(row.id)), validationStatus: String(row.validation_status), redaction: json$1(row.redaction_json, { count: 0, fields: [] }), createdAt: iso(row.created_at) }));
+    return serialMap(rows, async (row) => ({ id: String(row.id), projectId: String(row.project_id), workspaceRevisionId: text(row.workspace_revision_id), command: String(row.command), workingDirectory: text(row.working_directory), startedAt: iso(row.started_at), endedAt: row.ended_at == null ? null : iso(row.ended_at), durationMs: row.duration_ms == null ? null : Number(row.duration_ms), outcome: String(row.outcome), exitCode: row.exit_code == null ? null : Number(row.exit_code), toolchain: json$2(row.toolchain_json, {}), stdoutExcerpt: text(row.stdout_excerpt), stderrExcerpt: text(row.stderr_excerpt), stdoutTruncated: bool$2(row.stdout_truncated), stderrTruncated: bool$2(row.stderr_truncated), artifacts: await this.artifactsForRun(String(row.id)), validationStatus: String(row.validation_status), redaction: json$2(row.redaction_json, { count: 0, fields: [] }), createdAt: iso(row.created_at) }));
   }
   async listRunsPage(projectId, limit2, cursor) {
     return pageOf(await this.listRuns(projectId), limit2, cursor);
@@ -17808,12 +18583,12 @@ class PostgresOperationalRepository {
     const checkpoints = await this.executor.many("SELECT checkpoint_id FROM evidence_checkpoint_links WHERE evidence_id=$1 ORDER BY checkpoint_id", [id2]);
     const artifacts = await this.executor.many("SELECT a.* FROM artifact_references a JOIN evidence_artifact_links l ON l.artifact_id=a.id WHERE l.evidence_id=$1 ORDER BY a.created_at,a.id", [id2]);
     const override = await this.executor.maybeOne("SELECT * FROM evidence_overrides WHERE evidence_id=$1", [id2]);
-    return { id: id2, ordinal: Number(row.ordinal), projectId: String(row.project_id), runId: text(row.run_id), result: String(row.result), summary: String(row.summary), targetVersion: row.target_version == null ? null : Number(row.target_version), stale: stale.stale, staleReason: stale.staleReason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), requirementIds: reqs.map((x) => String(x.requirement_id)), workItemIds: work.map((x) => String(x.work_item_id)), updateIds: updates.map((x) => String(x.update_id)), checkpointIds: checkpoints.map((x) => String(x.checkpoint_id)), artifacts: artifacts.map((a) => ({ id: String(a.id), runId: text(a.run_id), uri: String(a.uri), mediaType: text(a.media_type), byteCount: a.byte_count == null ? null : Number(a.byte_count), digest: text(a.digest), createdAt: iso(a.created_at) })), criterionLinks: criteria.map((x) => ({ criterionId: String(x.criterion_id), criterionVersion: Number(x.criterion_version), stale: Number(x.criterion_version) !== Number(x.version) })), validationStatus: String(row.validation_status), redaction: json$1(row.redaction_json, { count: 0, fields: [] }), override: override ? { reason: String(override.reason), actor: String(override.actor), source: String(override.source), client: text(override.client), createdAt: iso(override.created_at) } : null };
+    return { id: id2, ordinal: Number(row.ordinal), projectId: String(row.project_id), runId: text(row.run_id), result: String(row.result), summary: String(row.summary), targetVersion: row.target_version == null ? null : Number(row.target_version), stale: stale.stale, staleReason: stale.staleReason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), requirementIds: reqs.map((x) => String(x.requirement_id)), workItemIds: work.map((x) => String(x.work_item_id)), updateIds: updates.map((x) => String(x.update_id)), checkpointIds: checkpoints.map((x) => String(x.checkpoint_id)), artifacts: artifacts.map((a) => ({ id: String(a.id), runId: text(a.run_id), uri: String(a.uri), mediaType: text(a.media_type), byteCount: a.byte_count == null ? null : Number(a.byte_count), digest: text(a.digest), createdAt: iso(a.created_at) })), criterionLinks: criteria.map((x) => ({ criterionId: String(x.criterion_id), criterionVersion: Number(x.criterion_version), stale: Number(x.criterion_version) !== Number(x.version) })), validationStatus: String(row.validation_status), redaction: json$2(row.redaction_json, { count: 0, fields: [] }), override: override ? { reason: String(override.reason), actor: String(override.actor), source: String(override.source), client: text(override.client), createdAt: iso(override.created_at) } : null };
   }
   async createEvidence(projectId, input) {
     await this.project(projectId);
     const id2 = randomUUID();
-    const timestamp = now$2();
+    const timestamp = now$3();
     const requirementIds = new Set(input.requirementIds ?? []);
     const criterionRows = [];
     for (const criterionId of new Set(input.criterionIds ?? [])) {
@@ -17918,7 +18693,7 @@ class PostgresOperationalRepository {
       const encoded = canonicalJson(document);
       const digest = createHash("sha256").update(encoded).digest("hex");
       const id2 = randomUUID();
-      const capturedAt = now$2();
+      const capturedAt = now$3();
       const inserted = await this.executor.maybeOne("INSERT INTO checkpoint_snapshots(id,checkpoint_id,schema_version,captured_at,document_json,digest) VALUES ($1,$2,3,$3,$4::jsonb,$5) ON CONFLICT (checkpoint_id) DO NOTHING RETURNING *", [id2, checkpointId, capturedAt, encoded, digest]);
       if (!inserted) return await this.getCheckpointSnapshot(checkpointId);
       await this.event(projectId, "checkpoint_snapshot", id2, "checkpoint_snapshot.captured", { checkpointId, digest });
@@ -17927,13 +18702,13 @@ class PostgresOperationalRepository {
   }
   async getCheckpointSnapshot(checkpointId) {
     const row = await this.executor.maybeOne("SELECT * FROM checkpoint_snapshots WHERE checkpoint_id=$1", [checkpointId]);
-    return row ? { id: String(row.id), checkpointId: String(row.checkpoint_id), schemaVersion: 3, capturedAt: iso(row.captured_at), document: json$1(row.document_json, {}), digest: String(row.digest) } : null;
+    return row ? { id: String(row.id), checkpointId: String(row.checkpoint_id), schemaVersion: 3, capturedAt: iso(row.captured_at), document: json$2(row.document_json, {}), digest: String(row.digest) } : null;
   }
   async reconstructCheckpointState(checkpointId) {
     const structured = await this.getCheckpointSnapshot(checkpointId);
     if (structured) return { ...structured.document, _snapshot: { legacy: false, schemaVersion: structured.schemaVersion, digest: structured.digest } };
     const row = await this.executor.maybeOne("SELECT r.snapshot_json FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id WHERE u.id=$1 AND u.kind='checkpoint' AND u.deleted_at IS NULL", [checkpointId]);
-    const compact = row ? json$1(row.snapshot_json, null) : null;
+    const compact = row ? json$2(row.snapshot_json, null) : null;
     return compact ? { compactSnapshot: compact, _snapshot: { legacy: true, schemaVersion: 1, digest: createHash("sha256").update(canonicalJson(compact)).digest("hex") } } : null;
   }
   async compareCheckpointSnapshots(leftCheckpointId, rightCheckpointId) {
@@ -18068,6 +18843,193 @@ class PostgresOperationalRepository {
     return results.slice(0, bounded);
   }
 }
+const sqliteAutomationMigration = `
+  CREATE TABLE work_queue_automation_policies (
+    queue_id TEXT PRIMARY KEY REFERENCES work_queues(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    allowed_kinds_json TEXT NOT NULL DEFAULT '["issue","task"]' CHECK(json_valid(allowed_kinds_json) AND json_type(allowed_kinds_json)='array'),
+    max_active_claims INTEGER NOT NULL DEFAULT 1 CHECK(max_active_claims BETWEEN 1 AND 32),
+    lease_seconds INTEGER NOT NULL DEFAULT 900 CHECK(lease_seconds BETWEEN 30 AND 5400),
+    requires_manual_approval INTEGER NOT NULL DEFAULT 1 CHECK(requires_manual_approval IN (0,1)),
+    allow_same_worker_recovery INTEGER NOT NULL DEFAULT 1 CHECK(allow_same_worker_recovery IN (0,1)),
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX automation_policies_project ON work_queue_automation_policies(project_id, queue_id);
+
+  CREATE TABLE work_leases (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    queue_id TEXT NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    worker_id TEXT NOT NULL CHECK(length(trim(worker_id)) BETWEEN 1 AND 200),
+    token_hash TEXT NOT NULL CHECK(length(token_hash)=64),
+    claimed_work_item_version INTEGER NOT NULL CHECK(claimed_work_item_version > 0),
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    release_reason TEXT CHECK(release_reason IS NULL OR release_reason IN ('manual','runner_shutdown','recovery','abandoned','expired')),
+    terminal_outcome TEXT CHECK(terminal_outcome IS NULL OR terminal_outcome IN ('resolved','awaiting_approval','retryable','blocked','interrupted')),
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0)
+  ) STRICT;
+  CREATE UNIQUE INDEX work_leases_one_active_item ON work_leases(work_item_id) WHERE released_at IS NULL;
+  CREATE INDEX work_leases_queue_active ON work_leases(queue_id, released_at, expires_at);
+  CREATE INDEX work_leases_worker ON work_leases(queue_id, worker_id, released_at, expires_at);
+
+  CREATE TABLE automation_attempts (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    queue_id TEXT NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    lease_id TEXT NOT NULL UNIQUE REFERENCES work_leases(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    started_at TEXT NOT NULL,
+    UNIQUE(work_item_id, ordinal)
+  ) STRICT;
+  CREATE INDEX automation_attempts_queue_started ON automation_attempts(queue_id, started_at DESC, id DESC);
+
+  CREATE TABLE automation_attempt_observations (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL REFERENCES automation_attempts(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK(sequence > 0),
+    kind TEXT NOT NULL CHECK(kind IN ('progress','verification','delivery','note')),
+    summary TEXT NOT NULL CHECK(length(trim(summary)) BETWEEN 1 AND 20000),
+    run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+    evidence_id TEXT REFERENCES evidence(id) ON DELETE SET NULL,
+    delivery_json TEXT CHECK(delivery_json IS NULL OR json_valid(delivery_json)),
+    created_at TEXT NOT NULL,
+    UNIQUE(attempt_id, sequence)
+  ) STRICT;
+  CREATE INDEX automation_observations_attempt ON automation_attempt_observations(attempt_id, sequence);
+
+  CREATE TABLE automation_queue_changes (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    queue_id TEXT NOT NULL REFERENCES work_queues(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX automation_queue_changes_read ON automation_queue_changes(project_id, queue_id, sequence);
+
+  CREATE TRIGGER automation_policy_integrity_insert BEFORE INSERT ON work_queue_automation_policies BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_queues q WHERE q.id=NEW.queue_id AND q.project_id=NEW.project_id)
+      THEN RAISE(ABORT,'automation policy queue must belong to its project') END;
+    SELECT CASE WHEN json_array_length(NEW.allowed_kinds_json) NOT BETWEEN 1 AND 2
+      OR EXISTS (SELECT 1 FROM json_each(NEW.allowed_kinds_json) WHERE type<>'text' OR value NOT IN ('issue','task'))
+      OR json_array_length(NEW.allowed_kinds_json)<>(SELECT COUNT(DISTINCT value) FROM json_each(NEW.allowed_kinds_json))
+      THEN RAISE(ABORT,'automation policy allowed kinds are invalid') END;
+  END;
+  CREATE TRIGGER automation_policy_integrity_update BEFORE UPDATE ON work_queue_automation_policies BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_queues q WHERE q.id=NEW.queue_id AND q.project_id=NEW.project_id)
+      THEN RAISE(ABORT,'automation policy queue must belong to its project') END;
+    SELECT CASE WHEN json_array_length(NEW.allowed_kinds_json) NOT BETWEEN 1 AND 2
+      OR EXISTS (SELECT 1 FROM json_each(NEW.allowed_kinds_json) WHERE type<>'text' OR value NOT IN ('issue','task'))
+      OR json_array_length(NEW.allowed_kinds_json)<>(SELECT COUNT(DISTINCT value) FROM json_each(NEW.allowed_kinds_json))
+      THEN RAISE(ABORT,'automation policy allowed kinds are invalid') END;
+  END;
+  CREATE TRIGGER automation_lease_integrity_insert BEFORE INSERT ON work_leases BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_queues q WHERE q.id=NEW.queue_id AND q.project_id=NEW.project_id)
+      OR NOT EXISTS (SELECT 1 FROM work_items wi WHERE wi.id=NEW.work_item_id AND wi.project_id=NEW.project_id)
+      THEN RAISE(ABORT,'automation lease entities must belong to one project') END;
+    SELECT CASE WHEN length(NEW.token_hash)<>64 OR NEW.token_hash GLOB '*[^0-9a-f]*'
+      THEN RAISE(ABORT,'automation lease token hash must be lowercase hexadecimal') END;
+    SELECT CASE WHEN NEW.acquired_at>NEW.heartbeat_at OR NEW.heartbeat_at>NEW.expires_at OR (NEW.released_at IS NOT NULL AND NEW.released_at<NEW.acquired_at)
+      OR NOT ((NEW.released_at IS NULL AND NEW.release_reason IS NULL AND NEW.terminal_outcome IS NULL)
+        OR (NEW.released_at IS NOT NULL AND NEW.release_reason IS NOT NULL AND NEW.terminal_outcome IS NOT NULL))
+      THEN RAISE(ABORT,'automation lease state is inconsistent') END;
+  END;
+  CREATE TRIGGER automation_lease_integrity_update BEFORE UPDATE ON work_leases BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_queues q WHERE q.id=NEW.queue_id AND q.project_id=NEW.project_id)
+      OR NOT EXISTS (SELECT 1 FROM work_items wi WHERE wi.id=NEW.work_item_id AND wi.project_id=NEW.project_id)
+      THEN RAISE(ABORT,'automation lease entities must belong to one project') END;
+    SELECT CASE WHEN length(NEW.token_hash)<>64 OR NEW.token_hash GLOB '*[^0-9a-f]*'
+      THEN RAISE(ABORT,'automation lease token hash must be lowercase hexadecimal') END;
+    SELECT CASE WHEN NEW.acquired_at>NEW.heartbeat_at OR NEW.heartbeat_at>NEW.expires_at OR (NEW.released_at IS NOT NULL AND NEW.released_at<NEW.acquired_at)
+      OR NOT ((NEW.released_at IS NULL AND NEW.release_reason IS NULL AND NEW.terminal_outcome IS NULL)
+        OR (NEW.released_at IS NOT NULL AND NEW.release_reason IS NOT NULL AND NEW.terminal_outcome IS NOT NULL))
+      THEN RAISE(ABORT,'automation lease state is inconsistent') END;
+  END;
+  CREATE TRIGGER automation_attempt_integrity_insert BEFORE INSERT ON automation_attempts BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_leases l WHERE l.id=NEW.lease_id AND l.project_id=NEW.project_id AND l.queue_id=NEW.queue_id AND l.work_item_id=NEW.work_item_id)
+      THEN RAISE(ABORT,'automation attempt must match its lease') END;
+  END;
+  CREATE TRIGGER automation_attempt_integrity_update BEFORE UPDATE ON automation_attempts BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_leases l WHERE l.id=NEW.lease_id AND l.project_id=NEW.project_id AND l.queue_id=NEW.queue_id AND l.work_item_id=NEW.work_item_id)
+      THEN RAISE(ABORT,'automation attempt must match its lease') END;
+  END;
+  CREATE TRIGGER automation_observation_integrity_insert BEFORE INSERT ON automation_attempt_observations BEGIN
+    SELECT CASE WHEN NEW.run_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM automation_attempts a JOIN runs r ON r.id=NEW.run_id WHERE a.id=NEW.attempt_id AND r.project_id=a.project_id)
+      THEN RAISE(ABORT,'automation observation run must belong to its project') END;
+    SELECT CASE WHEN NEW.evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM automation_attempts a JOIN evidence e ON e.id=NEW.evidence_id WHERE a.id=NEW.attempt_id AND e.project_id=a.project_id)
+      THEN RAISE(ABORT,'automation observation evidence must belong to its project') END;
+  END;
+  CREATE TRIGGER automation_observation_integrity_update BEFORE UPDATE ON automation_attempt_observations BEGIN
+    SELECT CASE WHEN NEW.run_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM automation_attempts a JOIN runs r ON r.id=NEW.run_id WHERE a.id=NEW.attempt_id AND r.project_id=a.project_id)
+      THEN RAISE(ABORT,'automation observation run must belong to its project') END;
+    SELECT CASE WHEN NEW.evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM automation_attempts a JOIN evidence e ON e.id=NEW.evidence_id WHERE a.id=NEW.attempt_id AND e.project_id=a.project_id)
+      THEN RAISE(ABORT,'automation observation evidence must belong to its project') END;
+  END;
+
+  CREATE TRIGGER automation_change_project_state AFTER UPDATE OF state ON projects WHEN OLD.state<>NEW.state BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT NEW.id,id,'project.state_changed','project',NEW.id,NEW.updated_at FROM work_queues WHERE project_id=NEW.id;
+  END;
+  CREATE TRIGGER automation_change_work_item AFTER UPDATE ON work_items BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT NEW.project_id,queue_id,'work_item.updated','work_item',NEW.id,NEW.updated_at FROM work_queue_items WHERE work_item_id=NEW.id;
+  END;
+  CREATE TRIGGER automation_change_queue_item_insert AFTER INSERT ON work_queue_items BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT project_id,NEW.queue_id,'queue_item.created','work_item',NEW.work_item_id,NEW.created_at FROM work_queues WHERE id=NEW.queue_id;
+  END;
+  CREATE TRIGGER automation_change_queue_item_delete AFTER DELETE ON work_queue_items BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT project_id,OLD.queue_id,'queue_item.deleted','work_item',OLD.work_item_id,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM work_queues WHERE id=OLD.queue_id;
+  END;
+  CREATE TRIGGER automation_change_relation_insert AFTER INSERT ON work_relations BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT NEW.project_id,wqi.queue_id,'work_relation.created','work_relation',NEW.id,NEW.created_at FROM work_queue_items wqi WHERE wqi.work_item_id IN (NEW.from_work_item_id,NEW.to_work_item_id);
+  END;
+  CREATE TRIGGER automation_change_relation_delete AFTER DELETE ON work_relations BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT OLD.project_id,wqi.queue_id,'work_relation.deleted','work_relation',OLD.id,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM work_queue_items wqi WHERE wqi.work_item_id IN (OLD.from_work_item_id,OLD.to_work_item_id);
+  END;
+  CREATE TRIGGER automation_change_blocker_insert AFTER INSERT ON external_blockers BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT NEW.project_id,q.id,'external_blocker.created','external_blocker',NEW.id,NEW.created_at FROM work_queues q
+    WHERE q.project_id=NEW.project_id AND (NEW.work_item_id IS NULL OR EXISTS (SELECT 1 FROM work_queue_items wqi WHERE wqi.queue_id=q.id AND wqi.work_item_id=NEW.work_item_id));
+  END;
+  CREATE TRIGGER automation_change_blocker_update AFTER UPDATE ON external_blockers BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT NEW.project_id,q.id,'external_blocker.updated','external_blocker',NEW.id,NEW.updated_at FROM work_queues q
+    WHERE q.project_id=NEW.project_id AND (NEW.work_item_id IS NULL OR EXISTS (SELECT 1 FROM work_queue_items wqi WHERE wqi.queue_id=q.id AND wqi.work_item_id=NEW.work_item_id));
+  END;
+  CREATE TRIGGER automation_change_policy_insert AFTER INSERT ON work_queue_automation_policies BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    VALUES (NEW.project_id,NEW.queue_id,'automation_policy.created','automation_policy',NEW.queue_id,NEW.created_at);
+  END;
+  CREATE TRIGGER automation_change_policy_update AFTER UPDATE ON work_queue_automation_policies BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    VALUES (NEW.project_id,NEW.queue_id,'automation_policy.updated','automation_policy',NEW.queue_id,NEW.updated_at);
+  END;
+  CREATE TRIGGER automation_change_lease_insert AFTER INSERT ON work_leases BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    VALUES (NEW.project_id,NEW.queue_id,'work_lease.created','work_lease',NEW.id,NEW.acquired_at);
+  END;
+  CREATE TRIGGER automation_change_lease_update AFTER UPDATE ON work_leases BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    VALUES (NEW.project_id,NEW.queue_id,CASE WHEN NEW.released_at IS NULL THEN 'work_lease.heartbeat' ELSE 'work_lease.released' END,'work_lease',NEW.id,COALESCE(NEW.released_at,NEW.heartbeat_at));
+  END;
+`;
 const migrations = [{
   version: 1,
   name: "authoritative_ledger",
@@ -18496,6 +19458,10 @@ const migrations = [{
     CREATE INDEX error_reports_component_created ON error_reports(component, created_at DESC, id DESC);
     CREATE INDEX error_reports_project_created ON error_reports(project_id, created_at DESC, id DESC);
   `
+}, {
+  version: 3,
+  name: "agent_queue_automation",
+  sql: sqliteAutomationMigration
 }];
 function resolveDatabasePaths(dataDir = process.env.ISTRA_DATA_DIR, backupDir = process.env.ISTRA_BACKUP_DIR) {
   const platformDefault = process.platform === "darwin" ? join(homedir(), "Library", "Application Support", "Istra") : process.platform === "win32" ? join(process.env.LOCALAPPDATA ?? homedir(), "Istra") : join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "istra");
@@ -18700,6 +19666,333 @@ async function openIstraDatabase(options = {}) {
   }
   return { db, paths, backupManager };
 }
+const now$2 = () => (/* @__PURE__ */ new Date()).toISOString();
+const bool$1 = (value) => Number(value) === 1;
+const nullable = (value) => value == null ? null : String(value);
+const json$1 = (value, fallback) => {
+  try {
+    return value == null ? fallback : JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+};
+const tokenHash = (token) => createHash("sha256").update(token).digest("hex");
+const expiresAt = (timestamp, seconds) => new Date(Date.parse(timestamp) + seconds * 1e3).toISOString();
+class SqliteAutomationRepository {
+  constructor(db, transaction, context, event) {
+    this.db = db;
+    this.transaction = transaction;
+    this.context = context;
+    this.event = event;
+  }
+  db;
+  transaction;
+  context;
+  event;
+  queue(projectId, queueId) {
+    const row = this.db.prepare("SELECT * FROM work_queues WHERE id=? AND project_id=?").get(queueId, projectId);
+    if (!row) throw new NotFoundError("Work queue", queueId);
+    return row;
+  }
+  policyFromRow(row) {
+    return {
+      queueId: String(row.queue_id),
+      projectId: String(row.project_id),
+      enabled: bool$1(row.enabled),
+      allowedKinds: json$1(row.allowed_kinds_json, ["issue", "task"]),
+      maxActiveClaims: Number(row.max_active_claims),
+      leaseSeconds: Number(row.lease_seconds),
+      requiresManualApproval: bool$1(row.requires_manual_approval),
+      allowSameWorkerRecovery: bool$1(row.allow_same_worker_recovery),
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at)
+    };
+  }
+  getPolicy(projectId, queueId) {
+    const queue = this.queue(projectId, queueId);
+    const row = this.db.prepare("SELECT * FROM work_queue_automation_policies WHERE queue_id=?").get(queueId);
+    return row ? this.policyFromRow(row) : {
+      queueId,
+      projectId,
+      enabled: false,
+      allowedKinds: ["issue", "task"],
+      maxActiveClaims: 1,
+      leaseSeconds: 900,
+      requiresManualApproval: true,
+      allowSameWorkerRecovery: true,
+      version: 0,
+      createdAt: String(queue.created_at),
+      updatedAt: String(queue.updated_at)
+    };
+  }
+  updatePolicy(projectId, queueId, input) {
+    return this.transaction(() => {
+      this.queue(projectId, queueId);
+      const timestamp = now$2();
+      const existing = this.db.prepare("SELECT version FROM work_queue_automation_policies WHERE queue_id=?").get(queueId);
+      if (!existing) {
+        if (input.expectedVersion !== null) throw new ConflictError("Queue automation policy", queueId);
+        this.db.prepare(`INSERT INTO work_queue_automation_policies(queue_id,project_id,enabled,allowed_kinds_json,max_active_claims,lease_seconds,requires_manual_approval,allow_same_worker_recovery,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?)`).run(queueId, projectId, Number(input.enabled), JSON.stringify([...new Set(input.allowedKinds)]), input.maxActiveClaims, input.leaseSeconds, Number(input.requiresManualApproval), Number(input.allowSameWorkerRecovery), timestamp, timestamp);
+      } else {
+        if (input.expectedVersion === null || Number(existing.version) !== input.expectedVersion) throw new ConflictError("Queue automation policy", queueId);
+        const result2 = this.db.prepare(`UPDATE work_queue_automation_policies SET enabled=?,allowed_kinds_json=?,max_active_claims=?,lease_seconds=?,requires_manual_approval=?,allow_same_worker_recovery=?,version=version+1,updated_at=? WHERE queue_id=? AND version=?`).run(Number(input.enabled), JSON.stringify([...new Set(input.allowedKinds)]), input.maxActiveClaims, input.leaseSeconds, Number(input.requiresManualApproval), Number(input.allowSameWorkerRecovery), timestamp, queueId, input.expectedVersion);
+        if (!Number(result2.changes)) throw new ConflictError("Queue automation policy", queueId);
+      }
+      this.event(projectId, "automation_policy", queueId, "automation_policy.updated", { enabled: input.enabled });
+      return this.getPolicy(projectId, queueId);
+    });
+  }
+  leaseFromRow(row) {
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      queueId: String(row.queue_id),
+      workItemId: String(row.work_item_id),
+      workerId: String(row.worker_id),
+      claimedWorkItemVersion: Number(row.claimed_work_item_version),
+      acquiredAt: String(row.acquired_at),
+      heartbeatAt: String(row.heartbeat_at),
+      expiresAt: String(row.expires_at),
+      releasedAt: nullable(row.released_at),
+      releaseReason: nullable(row.release_reason),
+      terminalOutcome: nullable(row.terminal_outcome),
+      version: Number(row.version)
+    };
+  }
+  workItemFromRow(row) {
+    const id2 = String(row.id);
+    const labels = this.db.prepare("SELECT l.* FROM labels l JOIN work_item_labels wil ON wil.label_id=l.id WHERE wil.work_item_id=? ORDER BY l.name COLLATE NOCASE").all(id2).map((label) => ({ id: String(label.id), name: String(label.name), colour: nullable(label.colour), version: Number(label.version), createdAt: String(label.created_at), updatedAt: String(label.updated_at) }));
+    const reasons = this.db.prepare(`SELECT reason FROM (
+      SELECT CASE WHEN wr.kind='blocks' THEN 'Blocked by ' || wi.title ELSE 'Depends on ' || wi.title END reason
+      FROM work_relations wr JOIN work_items wi ON ((wr.kind='depends_on' AND wi.id=wr.to_work_item_id) OR (wr.kind='blocks' AND wi.id=wr.from_work_item_id))
+      WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=?) OR (wr.kind='blocks' AND wr.to_work_item_id=?)) AND wi.status NOT IN ('resolved','dropped')
+      UNION ALL SELECT content FROM external_blockers WHERE project_id=? AND resolved_at IS NULL AND (work_item_id IS NULL OR work_item_id=?))`).all(id2, id2, String(row.project_id), id2).map((entry) => String(entry.reason));
+    return {
+      id: id2,
+      projectId: String(row.project_id),
+      phaseId: nullable(row.phase_id),
+      kind: String(row.kind),
+      title: String(row.title),
+      description: nullable(row.description),
+      status: String(row.status),
+      priority: nullable(row.priority),
+      labels,
+      version: Number(row.version),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      stableKey: nullable(row.stable_key),
+      parentId: nullable(row.parent_id),
+      queueId: nullable(row.queue_id),
+      rank: nullable(row.rank),
+      effectiveBlocked: reasons.length > 0 || String(row.status) === "blocked",
+      blockerReasons: reasons
+    };
+  }
+  attemptFromRow(row) {
+    const observations = this.db.prepare("SELECT * FROM automation_attempt_observations WHERE attempt_id=? ORDER BY sequence").all(String(row.id)).map((entry) => this.observationFromRow(entry));
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id),
+      queueId: String(row.queue_id),
+      workItemId: String(row.work_item_id),
+      leaseId: String(row.lease_id),
+      ordinal: Number(row.ordinal),
+      startedAt: String(row.started_at),
+      endedAt: nullable(row.released_at),
+      outcome: nullable(row.terminal_outcome),
+      observations
+    };
+  }
+  observationFromRow(row) {
+    return {
+      id: String(row.id),
+      attemptId: String(row.attempt_id),
+      sequence: Number(row.sequence),
+      kind: String(row.kind),
+      summary: String(row.summary),
+      runId: nullable(row.run_id),
+      evidenceId: nullable(row.evidence_id),
+      delivery: json$1(row.delivery_json, null),
+      createdAt: String(row.created_at)
+    };
+  }
+  getOverview(projectId, queueId) {
+    this.queue(projectId, queueId);
+    const timestamp = now$2();
+    const leaseRows = this.db.prepare(`SELECT l.*,wi.title work_item_title,wi.status work_item_status FROM work_leases l JOIN work_items wi ON wi.id=l.work_item_id
+      WHERE l.queue_id=? AND l.released_at IS NULL ORDER BY l.acquired_at,l.id`).all(queueId);
+    const summaries = leaseRows.map((row) => ({
+      ...this.leaseFromRow(row),
+      workItemTitle: String(row.work_item_title),
+      workItemStatus: String(row.work_item_status),
+      state: String(row.expires_at) <= timestamp ? "expired" : "active"
+    }));
+    const attempt = this.db.prepare(`SELECT a.*,l.released_at,l.terminal_outcome FROM automation_attempts a JOIN work_leases l ON l.id=a.lease_id WHERE a.queue_id=? ORDER BY a.started_at DESC,a.id DESC LIMIT 1`).get(queueId);
+    return {
+      policy: this.getPolicy(projectId, queueId),
+      activeLeases: summaries.filter(({ state }) => state === "active"),
+      expiredLeases: summaries.filter(({ state }) => state === "expired"),
+      lastAttempt: attempt ? this.attemptFromRow(attempt) : null,
+      cursor: encodeAutomationCursor({ projectId, queueId, sequence: this.latestSequence(projectId, queueId), checkedAt: timestamp })
+    };
+  }
+  latestSequence(projectId, queueId) {
+    return Number(this.db.prepare("SELECT COALESCE(MAX(sequence),0) sequence FROM automation_queue_changes WHERE project_id=? AND queue_id=?").get(projectId, queueId).sequence);
+  }
+  claimFeed(projectId, queueId, workItemId, blockerReasons, cursor) {
+    const requirementIds = this.db.prepare("SELECT requirement_id FROM requirement_work_links WHERE work_item_id=? ORDER BY requirement_id").all(workItemId).map((row) => String(row.requirement_id));
+    const updates = this.db.prepare(`SELECT u.id,u.kind,u.updated_at,r.content,p.current_checkpoint_id FROM updates u JOIN update_revisions r ON r.id=u.current_revision_id JOIN projects p ON p.id=u.project_id WHERE u.project_id=? AND u.deleted_at IS NULL ORDER BY u.updated_at DESC,u.id DESC LIMIT 5`).all(projectId).map((row) => ({ id: String(row.id), kind: String(row.kind), content: String(row.content), updatedAt: String(row.updated_at), current: String(row.id) === nullable(row.current_checkpoint_id) }));
+    const current = updates.find((update) => update.current) ?? (() => {
+      const row = this.db.prepare(`SELECT u.id,u.kind,u.updated_at,r.content FROM projects p JOIN updates u ON u.id=p.current_checkpoint_id JOIN update_revisions r ON r.id=u.current_revision_id WHERE p.id=?`).get(projectId);
+      return row ? { id: String(row.id), kind: String(row.kind), content: String(row.content), updatedAt: String(row.updated_at), current: true } : null;
+    })();
+    return { cursor, changes: [], timedOut: false, requirementIds, blockerReasons, currentCheckpoint: current ? { id: current.id, kind: current.kind, content: current.content, updatedAt: current.updatedAt } : null, recentUpdates: updates.map(({ current: _current, ...update }) => update) };
+  }
+  claim(projectId, queueId, input) {
+    return this.transaction(() => {
+      const project = this.db.prepare("SELECT * FROM projects WHERE id=?").get(projectId);
+      if (!project || project.archived_at) throw new NotFoundError("Project", projectId);
+      this.queue(projectId, queueId);
+      const timestamp = now$2();
+      const cursor = encodeAutomationCursor({ projectId, queueId, sequence: this.latestSequence(projectId, queueId), checkedAt: timestamp });
+      if (String(project.state) !== "active") return { outcome: "project_paused", cursor };
+      const policy = this.getPolicy(projectId, queueId);
+      if (!policy.enabled) return { outcome: "policy_disabled", cursor };
+      const active = Number(this.db.prepare("SELECT COUNT(*) count FROM work_leases WHERE queue_id=? AND released_at IS NULL AND expires_at>?").get(queueId, timestamp).count);
+      if (active >= policy.maxActiveClaims) return { outcome: "capacity_reached", cursor };
+      const allowed = policy.allowedKinds.filter((kind) => !input.allowedKinds || input.allowedKinds.includes(kind));
+      if (!allowed.length) return { outcome: "empty", cursor };
+      const placeholders = allowed.map(() => "?").join(",");
+      const row = this.db.prepare(`SELECT wi.*,wqi.queue_id,wqi.rank,wl.id expired_lease_id FROM work_items wi
+        JOIN work_queue_items wqi ON wqi.work_item_id=wi.id AND wqi.queue_id=?
+        LEFT JOIN work_leases wl ON wl.work_item_id=wi.id AND wl.released_at IS NULL
+        WHERE wi.project_id=? AND wi.kind IN (${placeholders})
+          AND ((wi.status='open' AND wl.id IS NULL) OR (wi.status='in_progress' AND ?=1 AND wl.worker_id=? AND wl.queue_id=? AND wl.claimed_work_item_version=wi.version AND wl.expires_at<=?))
+          AND NOT EXISTS (SELECT 1 FROM external_blockers eb WHERE eb.project_id=wi.project_id AND eb.resolved_at IS NULL AND (eb.work_item_id IS NULL OR eb.work_item_id=wi.id))
+          AND NOT EXISTS (SELECT 1 FROM work_relations wr JOIN work_items dependency ON ((wr.kind='depends_on' AND dependency.id=wr.to_work_item_id) OR (wr.kind='blocks' AND dependency.id=wr.from_work_item_id))
+            WHERE ((wr.kind='depends_on' AND wr.from_work_item_id=wi.id) OR (wr.kind='blocks' AND wr.to_work_item_id=wi.id)) AND dependency.status NOT IN ('resolved','dropped'))
+        ORDER BY wqi.rank COLLATE BINARY,wqi.work_item_id LIMIT 1`).get(queueId, projectId, ...allowed, Number(policy.allowSameWorkerRecovery), input.workerId, queueId, timestamp);
+      if (!row) return { outcome: "empty", cursor };
+      if (row.expired_lease_id) this.db.prepare("UPDATE work_leases SET released_at=?,release_reason='recovery',terminal_outcome='interrupted',version=version+1 WHERE id=? AND released_at IS NULL").run(timestamp, String(row.expired_lease_id));
+      const workUpdate = this.db.prepare("UPDATE work_items SET status='in_progress',version=version+1,updated_at=? WHERE id=? AND version=?").run(timestamp, String(row.id), Number(row.version));
+      if (!Number(workUpdate.changes)) throw new ConflictError("Work item", String(row.id));
+      const claimedVersion = Number(row.version) + 1;
+      const leaseId = randomUUID();
+      const attemptId = randomUUID();
+      const token = randomBytes(32).toString("base64url");
+      const leaseSeconds = Math.min(input.leaseSeconds ?? policy.leaseSeconds, policy.leaseSeconds);
+      this.db.prepare(`INSERT INTO work_leases(id,project_id,queue_id,work_item_id,worker_id,token_hash,claimed_work_item_version,acquired_at,heartbeat_at,expires_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`).run(leaseId, projectId, queueId, String(row.id), input.workerId, tokenHash(token), claimedVersion, timestamp, timestamp, expiresAt(timestamp, leaseSeconds));
+      const ordinal = Number(this.db.prepare("SELECT COALESCE(MAX(ordinal),0)+1 ordinal FROM automation_attempts WHERE work_item_id=?").get(String(row.id)).ordinal);
+      this.db.prepare("INSERT INTO automation_attempts(id,project_id,queue_id,work_item_id,lease_id,ordinal,started_at) VALUES (?,?,?,?,?,?,?)").run(attemptId, projectId, queueId, String(row.id), leaseId, ordinal, timestamp);
+      this.event(projectId, "work_lease", leaseId, "work_lease.claimed", { queueId, workItemId: row.id, workerId: input.workerId, attemptId });
+      const item = this.workItemFromRow(this.db.prepare("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.id=?").get(String(row.id)));
+      const lease = this.leaseFromRow(this.db.prepare("SELECT * FROM work_leases WHERE id=?").get(leaseId));
+      const attempt = this.attemptFromRow(this.db.prepare("SELECT a.*,l.released_at,l.terminal_outcome FROM automation_attempts a JOIN work_leases l ON l.id=a.lease_id WHERE a.id=?").get(attemptId));
+      const feedCursor = encodeAutomationCursor({ projectId, queueId, sequence: this.latestSequence(projectId, queueId), checkedAt: timestamp });
+      return { outcome: "claimed", item, lease: { ...lease, leaseToken: token }, attempt, feed: this.claimFeed(projectId, queueId, item.id, item.blockerReasons ?? [], feedCursor) };
+    });
+  }
+  leaseAndItem(leaseId) {
+    const leaseRow = this.db.prepare("SELECT * FROM work_leases WHERE id=?").get(leaseId);
+    if (!leaseRow) throw new NotFoundError("Work lease", leaseId);
+    const itemRow = this.db.prepare("SELECT wi.*,wqi.queue_id,wqi.rank FROM work_items wi LEFT JOIN work_queue_items wqi ON wqi.work_item_id=wi.id WHERE wi.id=?").get(String(leaseRow.work_item_id));
+    return { leaseRow, item: this.workItemFromRow(itemRow), policy: this.getPolicy(String(leaseRow.project_id), String(leaseRow.queue_id)) };
+  }
+  validToken(row, token) {
+    return Boolean(token) && String(row.token_hash) === tokenHash(token);
+  }
+  heartbeat(leaseId, input) {
+    return this.transaction(() => {
+      const { leaseRow, item, policy } = this.leaseAndItem(leaseId);
+      const timestamp = now$2();
+      if (!this.validToken(leaseRow, input.leaseToken) || leaseRow.released_at || String(leaseRow.expires_at) <= timestamp) return { outcome: "lease_lost", lease: this.leaseFromRow(leaseRow), item };
+      const project = this.db.prepare("SELECT state FROM projects WHERE id=?").get(item.projectId);
+      if (String(project.state) !== "active") return { outcome: "project_paused", lease: this.leaseFromRow(leaseRow), item };
+      if (!policy.enabled) return { outcome: "policy_disabled", lease: this.leaseFromRow(leaseRow), item };
+      if (item.version !== Number(leaseRow.claimed_work_item_version) || item.status !== "in_progress" || item.queueId !== String(leaseRow.queue_id) || item.effectiveBlocked) return { outcome: "human_changed_state", lease: this.leaseFromRow(leaseRow), item };
+      const changed = this.db.prepare("UPDATE work_leases SET heartbeat_at=?,expires_at=?,version=version+1 WHERE id=? AND version=? AND released_at IS NULL AND expires_at>?").run(timestamp, expiresAt(timestamp, policy.leaseSeconds), leaseId, Number(leaseRow.version), timestamp);
+      if (!Number(changed.changes)) return { outcome: "lease_lost", lease: this.leaseFromRow(this.db.prepare("SELECT * FROM work_leases WHERE id=?").get(leaseId)), item };
+      const lease = this.leaseFromRow(this.db.prepare("SELECT * FROM work_leases WHERE id=?").get(leaseId));
+      this.event(lease.projectId, "work_lease", leaseId, "work_lease.heartbeat", { expiresAt: lease.expiresAt });
+      return { outcome: "heartbeat", lease };
+    });
+  }
+  record(leaseId, input) {
+    return this.transaction(() => {
+      const { leaseRow } = this.leaseAndItem(leaseId);
+      const timestamp = now$2();
+      if (!this.validToken(leaseRow, input.leaseToken) || leaseRow.released_at || String(leaseRow.expires_at) <= timestamp) throw new ConflictError("Work lease", leaseId);
+      const attempt = this.db.prepare("SELECT * FROM automation_attempts WHERE lease_id=?").get(leaseId);
+      for (const [table, id22] of [["runs", input.runId], ["evidence", input.evidenceId]]) if (id22 && !this.db.prepare(`SELECT 1 FROM ${table} WHERE id=? AND project_id=?`).get(id22, String(leaseRow.project_id))) throw new ValidationError(`${table === "runs" ? "runId" : "evidenceId"} must belong to the lease project`);
+      const sequence = Number(this.db.prepare("SELECT COALESCE(MAX(sequence),0)+1 sequence FROM automation_attempt_observations WHERE attempt_id=?").get(String(attempt.id)).sequence);
+      const id2 = randomUUID();
+      this.db.prepare("INSERT INTO automation_attempt_observations(id,attempt_id,sequence,kind,summary,run_id,evidence_id,delivery_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(id2, String(attempt.id), sequence, input.kind, input.summary, input.runId ?? null, input.evidenceId ?? null, input.delivery ? JSON.stringify(input.delivery) : null, timestamp);
+      this.event(String(leaseRow.project_id), "automation_attempt", String(attempt.id), "automation_attempt.recorded", { sequence, kind: input.kind, runId: input.runId ?? null, evidenceId: input.evidenceId ?? null });
+      return this.observationFromRow(this.db.prepare("SELECT * FROM automation_attempt_observations WHERE id=?").get(id2));
+    });
+  }
+  complete(leaseId, input) {
+    return this.transaction(() => {
+      const { leaseRow, item, policy } = this.leaseAndItem(leaseId);
+      const timestamp = now$2();
+      if (!this.validToken(leaseRow, input.leaseToken) || leaseRow.released_at || String(leaseRow.expires_at) <= timestamp) return { outcome: "lease_lost", lease: this.leaseFromRow(leaseRow), item };
+      const project = this.db.prepare("SELECT state FROM projects WHERE id=?").get(String(leaseRow.project_id));
+      if (String(project.state) !== "active") return { outcome: "project_paused", lease: this.leaseFromRow(leaseRow), item };
+      if (!policy.enabled) return { outcome: "policy_disabled", lease: this.leaseFromRow(leaseRow), item };
+      const humanChanged = item.version !== input.expectedWorkItemVersion || item.version !== Number(leaseRow.claimed_work_item_version) || item.status !== "in_progress" || item.queueId !== String(leaseRow.queue_id) || item.effectiveBlocked;
+      if (humanChanged) return { outcome: "human_changed_state", lease: this.leaseFromRow(leaseRow), item };
+      const outcome = input.outcome === "resolved" && policy.requiresManualApproval ? "awaiting_approval" : input.outcome;
+      const status = outcome === "resolved" ? "resolved" : outcome === "blocked" ? "blocked" : ["retryable", "interrupted"].includes(outcome) ? "open" : "in_progress";
+      const updated = this.db.prepare("UPDATE work_items SET status=?,version=version+1,updated_at=? WHERE id=? AND version=?").run(status, timestamp, item.id, item.version);
+      if (!Number(updated.changes)) throw new ConflictError("Work item", item.id);
+      this.db.prepare("UPDATE work_leases SET released_at=?,release_reason=?,terminal_outcome=?,version=version+1 WHERE id=? AND released_at IS NULL").run(timestamp, outcome === "interrupted" ? "runner_shutdown" : "manual", outcome, leaseId);
+      this.event(item.projectId, "work_lease", leaseId, "work_lease.completed", { workItemId: item.id, outcome });
+      const fresh = this.leaseAndItem(leaseId);
+      return { outcome, lease: this.leaseFromRow(fresh.leaseRow), item: fresh.item };
+    });
+  }
+  releaseInternal(leaseId, leaseToken2, reason, operator, expectedLeaseVersion) {
+    return this.transaction(() => {
+      const { leaseRow, item } = this.leaseAndItem(leaseId);
+      const timestamp = now$2();
+      if (operator && Number(leaseRow.version) !== expectedLeaseVersion) throw new ConflictError("Work lease", leaseId);
+      if (leaseRow.released_at) return { outcome: "already_released", lease: this.leaseFromRow(leaseRow), item };
+      if (!operator && !this.validToken(leaseRow, leaseToken2)) return { outcome: "lease_lost", lease: this.leaseFromRow(leaseRow), item };
+      this.db.prepare("UPDATE work_leases SET released_at=?,release_reason=?,terminal_outcome='interrupted',version=version+1 WHERE id=? AND released_at IS NULL").run(timestamp, reason, leaseId);
+      if (item.version === Number(leaseRow.claimed_work_item_version) && item.status === "in_progress" && item.queueId === String(leaseRow.queue_id)) this.db.prepare("UPDATE work_items SET status='open',version=version+1,updated_at=? WHERE id=? AND version=?").run(timestamp, item.id, item.version);
+      this.event(item.projectId, "work_lease", leaseId, "work_lease.released", { workItemId: item.id, reason });
+      const fresh = this.leaseAndItem(leaseId);
+      return { outcome: "released", lease: this.leaseFromRow(fresh.leaseRow), item: fresh.item };
+    });
+  }
+  release(leaseId, input) {
+    return this.releaseInternal(leaseId, input.leaseToken, input.reason, false);
+  }
+  operatorRelease(leaseId, input) {
+    return this.releaseInternal(leaseId, null, "manual", true, input.expectedLeaseVersion);
+  }
+  readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) {
+    this.queue(projectId, queueId);
+    const latestSequence = this.latestSequence(projectId, queueId);
+    if (afterSequence > latestSequence) throw new ValidationError("Invalid automation queue cursor");
+    const page = this.db.prepare("SELECT * FROM automation_queue_changes WHERE project_id=? AND queue_id=? AND sequence>? ORDER BY sequence LIMIT 201").all(projectId, queueId, afterSequence).slice(0, 200);
+    const changes = page.map((row) => ({
+      sequence: Number(row.sequence),
+      projectId: String(row.project_id),
+      queueId: String(row.queue_id),
+      eventType: String(row.event_type),
+      entityType: String(row.entity_type),
+      entityId: String(row.entity_id),
+      createdAt: String(row.created_at)
+    }));
+    const expiredLeases = this.db.prepare("SELECT * FROM work_leases WHERE project_id=? AND queue_id=? AND released_at IS NULL AND expires_at>? AND expires_at<=? ORDER BY expires_at,id").all(projectId, queueId, expiredAfter, checkedAt).map((row) => this.leaseFromRow(row));
+    const next = this.db.prepare("SELECT MIN(expires_at) next_expiry FROM work_leases WHERE project_id=? AND queue_id=? AND released_at IS NULL AND expires_at>?").get(projectId, queueId, checkedAt);
+    return { changes, cursorSequence: changes.at(-1)?.sequence ?? afterSequence, expiredLeases, nextExpiryAt: nullable(next.next_expiry) };
+  }
+}
 const now$1 = () => (/* @__PURE__ */ new Date()).toISOString();
 const textOrNull$1 = (value) => value === null || value === void 0 ? null : String(value);
 const bool = (value) => Number(value) === 1;
@@ -18718,10 +20011,17 @@ const redactionMetadata = (entries) => ({
 class SqliteOperationalRepository {
   constructor(db) {
     this.db = db;
+    this.automation = new SqliteAutomationRepository(
+      db,
+      (work) => this.transaction(work),
+      () => this.mutationContext(),
+      (projectId, entityType, entityId, eventType, payload) => this.event(projectId, entityType, entityId, eventType, payload)
+    );
   }
   db;
   savepointSequence = 0;
   activeContext = null;
+  automation;
   transaction(work) {
     if (this.db.isTransaction) {
       const savepoint = `operational_${this.savepointSequence++}`;
@@ -19080,6 +20380,36 @@ class SqliteOperationalRepository {
     }
     this.event(projectId, "work_queue", id2, "work_queue.created", { name: input.name });
     return this.listWorkQueues(projectId).find((queue) => queue.id === id2);
+  }
+  getQueueAutomationPolicy(projectId, queueId) {
+    return this.automation.getPolicy(projectId, queueId);
+  }
+  updateQueueAutomationPolicy(projectId, queueId, input) {
+    return this.automation.updatePolicy(projectId, queueId, input);
+  }
+  getQueueAutomationOverview(projectId, queueId) {
+    return this.automation.getOverview(projectId, queueId);
+  }
+  claimNextAutomatedWork(projectId, queueId, input) {
+    return this.automation.claim(projectId, queueId, input);
+  }
+  heartbeatAutomatedWork(leaseId, input) {
+    return this.automation.heartbeat(leaseId, input);
+  }
+  recordAutomationAttempt(leaseId, input) {
+    return this.automation.record(leaseId, input);
+  }
+  completeAutomatedWork(leaseId, input) {
+    return this.automation.complete(leaseId, input);
+  }
+  releaseAutomatedWork(leaseId, input) {
+    return this.automation.release(leaseId, input);
+  }
+  operatorReleaseAutomatedWork(leaseId, input) {
+    return this.automation.operatorRelease(leaseId, input);
+  }
+  readAutomationQueueChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) {
+    return this.automation.readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt);
   }
   workItemFromRow(row) {
     const id2 = String(row.id);
@@ -20250,14 +21580,16 @@ class SqliteIstraRepository {
   exportAll() {
     const tables = {};
     for (const [table, columns] of Object.entries(exportTables)) {
-      tables[table] = deterministicRows(table, this.db.prepare(`SELECT ${columns.join(",")} FROM ${table}`).all());
+      tables[table] = portableExportRows(table, this.db.prepare(`SELECT ${columns.join(",")} FROM ${table}`).all());
     }
-    return { format: "istra-export", formatVersion: 4, exportedAt: now(), tables };
+    return { format: "istra-export", formatVersion: 5, exportedAt: now(), tables };
   }
   validateImport(bundle) {
     const temp = new DatabaseSync(":memory:");
     try {
-      if (![3, 4].includes(bundle.formatVersion)) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`);
+      if (![3, 4, 5].includes(bundle.formatVersion)) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`);
+      const automationViolations = automationExportViolations(bundle.formatVersion, bundle.tables);
+      if (automationViolations.length) throw new ValidationError("Import contains invalid automation data", { automationViolations });
       temp.exec("PRAGMA foreign_keys=ON;");
       for (const migration of migrations) temp.exec(migration.sql);
       temp.exec("BEGIN; PRAGMA defer_foreign_keys=ON;");
@@ -20503,6 +21835,7 @@ class SqliteIstraRepository {
       const rows = bundle.tables[table];
       if (!Array.isArray(rows)) {
         if (bundle.formatVersion === 3 && table === "error_reports") continue;
+        if (bundle.formatVersion < 5 && ["work_queue_automation_policies", "work_leases", "automation_attempts", "automation_queue_changes", "automation_attempt_observations"].includes(table)) continue;
         throw new ValidationError(`Import is missing table ${table}`);
       }
       const statement = db.prepare(`INSERT INTO ${table}(${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
@@ -31326,8 +32659,10 @@ const EMPTY_COMPLETION_RESULT = {
   }
 };
 const client = stringType().trim().max(200).optional().describe("Name of the MCP client recording this change");
+const automationClient = stringType().trim().min(1).max(200).describe("Stable operator-visible name of the automation client");
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const write = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const idempotentWrite = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const source = (name) => ({ source: "mcp", client: name ?? "istra-mcp" });
 function result(data) {
   return {
@@ -31533,6 +32868,51 @@ function createMcpServer(service) {
     inputSchema: CreateWorkQueueSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }),
     annotations: write
   }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createWorkQueue(projectId, input, idempotencyKey, source(clientName))));
+  server2.registerTool("get_queue_automation_policy", {
+    description: "Read the disabled-by-default automation policy for one work queue.",
+    inputSchema: objectType({ projectId: stringType().uuid(), queueId: stringType().uuid() }),
+    annotations: readOnly
+  }, async ({ projectId, queueId }) => result(await service.getQueueAutomationPolicy(projectId, queueId)));
+  server2.registerTool("get_queue_automation_overview", {
+    description: "Read queue automation policy, active and recently expired leases, the latest attempt and a scoped cursor without exposing lease tokens.",
+    inputSchema: objectType({ projectId: stringType().uuid(), queueId: stringType().uuid() }),
+    annotations: readOnly
+  }, async ({ projectId, queueId }) => result(await service.getQueueAutomationOverview(projectId, queueId)));
+  server2.registerTool("update_queue_automation_policy", {
+    description: "Explicitly enable, disable or configure automated claiming for one queue.",
+    inputSchema: UpdateQueueAutomationPolicySchema.extend({ projectId: stringType().uuid(), queueId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client: automationClient }),
+    annotations: idempotentWrite
+  }, async ({ projectId, queueId, idempotencyKey, client: clientName, ...input }) => result(await service.updateQueueAutomationPolicy(projectId, queueId, input, idempotencyKey, source(clientName))));
+  server2.registerTool("claim_next_automated_work", {
+    description: "Atomically claim the highest-ranked eligible work item under the queue policy.",
+    inputSchema: ClaimNextAutomatedWorkSchema.extend({ projectId: stringType().uuid(), queueId: stringType().uuid(), client: automationClient }),
+    annotations: idempotentWrite
+  }, async ({ projectId, queueId, client: clientName, ...input }) => result(await service.claimNextAutomatedWork(projectId, queueId, input, source(clientName))));
+  server2.registerTool("heartbeat_automated_work", {
+    description: "Extend a current automation lease using its opaque token.",
+    inputSchema: HeartbeatAutomatedWorkSchema.extend({ leaseId: stringType().uuid(), client: automationClient }),
+    annotations: idempotentWrite
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.heartbeatAutomatedWork(leaseId, input, source(clientName))));
+  server2.registerTool("record_automation_attempt", {
+    description: "Append a bounded observation, proof link or structured delivery reference to an automation attempt.",
+    inputSchema: RecordAutomationAttemptSchema.extend({ leaseId: stringType().uuid(), client: automationClient }),
+    annotations: idempotentWrite
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.recordAutomationAttempt(leaseId, input, source(clientName))));
+  server2.registerTool("complete_automated_work", {
+    description: "Token-check and atomically complete a lease without overwriting human-changed work state.",
+    inputSchema: CompleteAutomatedWorkSchema.extend({ leaseId: stringType().uuid(), client: automationClient }),
+    annotations: idempotentWrite
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.completeAutomatedWork(leaseId, input, source(clientName))));
+  server2.registerTool("release_automated_work", {
+    description: "Release a runner-owned automation lease using its opaque token. Operator release is available only through the local web control surface.",
+    inputSchema: RunnerReleaseAutomatedWorkSchema.extend({ leaseId: stringType().uuid(), client: automationClient }),
+    annotations: idempotentWrite
+  }, async ({ leaseId, client: clientName, ...input }) => result(await service.releaseAutomatedWork(leaseId, input, source(clientName))));
+  server2.registerTool("wait_for_queue_changes", {
+    description: "Long-poll a durable queue cursor for eligibility changes or lease expiry.",
+    inputSchema: WaitForQueueChangesSchema.extend({ projectId: stringType().uuid(), queueId: stringType().uuid() }),
+    annotations: readOnly
+  }, async ({ projectId, queueId, ...input }) => result(await service.waitForQueueChanges(projectId, queueId, input)));
   server2.registerTool("list_operational_work_items", {
     description: "List work items with queue rank and derived blocker reasons.",
     inputSchema: objectType({ projectId: stringType().uuid(), queueId: stringType().uuid().optional() }),

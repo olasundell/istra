@@ -43,6 +43,15 @@ import type {
   UpdateErrorReportInput,
   ValidationStatus,
 } from '../../domain/contracts.js'
+import type {
+  ClaimNextAutomatedWorkInput,
+  CompleteAutomatedWorkInput,
+  HeartbeatAutomatedWorkInput,
+  OperatorReleaseAutomatedWorkInput,
+  RecordAutomationAttemptInput,
+  RunnerReleaseAutomatedWorkInput,
+  UpdateQueueAutomationPolicyInput,
+} from '../../domain/automation.js'
 import { ConflictError, IdempotencyConflictError, NotFoundError, ValidationError } from '../../application/errors.js'
 import { pageOf } from '../../application/pagination.js'
 import { evaluateCriterionProof, explainRequirementProof, type CriterionEvidenceObservation } from '../../domain/proof.js'
@@ -50,6 +59,7 @@ import { assertEvidenceInvariants, assertRunInvariants, validateRunInvariants } 
 import { SecretRedactor, type SecretRedactionResult } from '../../application/secret-redactor.js'
 import { canonicalJson, canonicaliseJson } from '../../domain/canonical-json.js'
 import type { Awaitable, OperationalRepository } from '../../application/ports.js'
+import { SqliteAutomationRepository } from './automation-repository.js'
 
 type Row = Record<string, unknown>
 
@@ -68,8 +78,16 @@ const redactionMetadata = (entries: Array<{ field: string; result: SecretRedacti
 export class SqliteOperationalRepository implements OperationalRepository {
   private savepointSequence = 0
   private activeContext: MutationContext | null = null
+  private readonly automation: SqliteAutomationRepository
 
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(private readonly db: DatabaseSync) {
+    this.automation = new SqliteAutomationRepository(
+      db,
+      (work) => this.transaction(work),
+      () => this.mutationContext(),
+      (projectId, entityType, entityId, eventType, payload) => this.event(projectId, entityType, entityId, eventType, payload),
+    )
+  }
 
   private transaction<T>(work: () => T): T {
     if (this.db.isTransaction) {
@@ -388,6 +406,17 @@ export class SqliteOperationalRepository implements OperationalRepository {
     this.event(projectId, 'work_queue', id, 'work_queue.created', { name: input.name })
     return this.listWorkQueues(projectId).find((queue) => queue.id === id)!
   }
+
+  getQueueAutomationPolicy(projectId: string, queueId: string) { return this.automation.getPolicy(projectId, queueId) }
+  updateQueueAutomationPolicy(projectId: string, queueId: string, input: UpdateQueueAutomationPolicyInput) { return this.automation.updatePolicy(projectId, queueId, input) }
+  getQueueAutomationOverview(projectId: string, queueId: string) { return this.automation.getOverview(projectId, queueId) }
+  claimNextAutomatedWork(projectId: string, queueId: string, input: ClaimNextAutomatedWorkInput) { return this.automation.claim(projectId, queueId, input) }
+  heartbeatAutomatedWork(leaseId: string, input: HeartbeatAutomatedWorkInput) { return this.automation.heartbeat(leaseId, input) }
+  recordAutomationAttempt(leaseId: string, input: RecordAutomationAttemptInput) { return this.automation.record(leaseId, input) }
+  completeAutomatedWork(leaseId: string, input: CompleteAutomatedWorkInput) { return this.automation.complete(leaseId, input) }
+  releaseAutomatedWork(leaseId: string, input: RunnerReleaseAutomatedWorkInput) { return this.automation.release(leaseId, input) }
+  operatorReleaseAutomatedWork(leaseId: string, input: OperatorReleaseAutomatedWorkInput) { return this.automation.operatorRelease(leaseId, input) }
+  readAutomationQueueChanges(projectId: string, queueId: string, afterSequence: number, expiredAfter: string, checkedAt: string) { return this.automation.readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) }
 
   private workItemFromRow(row: Row): WorkItem {
     const id = String(row.id)

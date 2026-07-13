@@ -35,7 +35,7 @@ import { decodeCursor, encodeCursor, pageOf } from '../../application/pagination
 import { validateEvidenceInvariants, validateRunInvariants } from '../../domain/run-invariants.js'
 import { canonicalJson } from '../../domain/canonical-json.js'
 import { SecretRedactor } from '../../application/secret-redactor.js'
-import { deterministicRows, exportTables } from '../export-format.js'
+import { automationExportViolations, deterministicRows, exportTables, portableExportRows } from '../export-format.js'
 
 type SqlRow = Record<string, unknown>
 const now = () => new Date().toISOString()
@@ -576,15 +576,17 @@ export class SqliteIstraRepository implements IstraRepository {
   exportAll(): ExportBundle {
     const tables: ExportBundle['tables'] = {}
     for (const [table, columns] of Object.entries(exportTables)) {
-      tables[table] = deterministicRows(table, this.db.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all() as Array<Record<string, unknown>>)
+      tables[table] = portableExportRows(table, this.db.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all() as Array<Record<string, unknown>>)
     }
-    return { format: 'istra-export', formatVersion: 4, exportedAt: now(), tables }
+    return { format: 'istra-export', formatVersion: 5, exportedAt: now(), tables }
   }
 
   validateImport(bundle: ExportBundle): void {
     const temp = new DatabaseSync(':memory:')
     try {
-      if (![3, 4].includes(bundle.formatVersion)) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`)
+      if (![3, 4, 5].includes(bundle.formatVersion)) throw new ValidationError(`Unsupported import format version ${String(bundle.formatVersion)}`)
+      const automationViolations = automationExportViolations(bundle.formatVersion, bundle.tables)
+      if (automationViolations.length) throw new ValidationError('Import contains invalid automation data', { automationViolations })
       temp.exec('PRAGMA foreign_keys=ON;')
       for (const migration of migrations) temp.exec(migration.sql)
       temp.exec('BEGIN; PRAGMA defer_foreign_keys=ON;')
@@ -824,6 +826,7 @@ export class SqliteIstraRepository implements IstraRepository {
       const rows = bundle.tables[table]
       if (!Array.isArray(rows)) {
         if (bundle.formatVersion === 3 && table === 'error_reports') continue
+        if (bundle.formatVersion < 5 && ['work_queue_automation_policies','work_leases','automation_attempts','automation_queue_changes','automation_attempt_observations'].includes(table)) continue
         throw new ValidationError(`Import is missing table ${table}`)
       }
       const statement = db.prepare(`INSERT INTO ${table}(${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)

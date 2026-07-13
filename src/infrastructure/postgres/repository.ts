@@ -31,7 +31,7 @@ import type {
   WorkItem,
 } from '../../domain/contracts.js'
 import { canonicalJson } from '../../domain/canonical-json.js'
-import { deterministicRows, exportTables, isJsonExportColumn } from '../export-format.js'
+import { automationExportViolations, deterministicRows, exportTables, isBooleanExportColumn, isJsonExportColumn, portableExportRows } from '../export-format.js'
 import type { PostgresExecutor } from './database.js'
 import { lockProjectGraph } from './project-graph-lock.js'
 
@@ -132,14 +132,6 @@ function activityFromRow(row: SqlRow): ActivityEvent {
     createdAt: iso(row.created_at),
   }
 }
-
-const booleanColumns = new Set([
-  'acceptance_criteria.required',
-  'workspace_revisions.dirty',
-  'runs.stdout_truncated',
-  'runs.stderr_truncated',
-  'evidence.stale',
-])
 
 function parentFirst(table: string, rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
   const parentColumn = table === 'work_items' || table === 'requirements' ? 'parent_id' : null
@@ -342,6 +334,7 @@ export class PostgresIstraRepository implements IstraRepository {
     if (!current) throw new NotFoundError('Project', id)
     const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([key, value]) => key !== 'expectedVersion' && value !== undefined)) }
     return this.transaction(async () => {
+      await lockProjectGraph(this.executor, id)
       const result = await this.executor.query<SqlRow>(`
         UPDATE projects SET title=$1,description=$2,intent=$3,deadline=$4,completion_criteria=$5,state=$6,current_focus=$7,next_action=$8,
           blockers_json=$9::jsonb,version=version+1,updated_at=$10
@@ -359,6 +352,7 @@ export class PostgresIstraRepository implements IstraRepository {
     const current = await this.getProject(id)
     if (!current) throw new NotFoundError('Project', id)
     return this.transaction(async () => {
+      await lockProjectGraph(this.executor, id)
       const result = await this.executor.query<SqlRow>('UPDATE projects SET archived_at=$1,version=version+1,updated_at=$2 WHERE id=$3 AND version=$4 RETURNING *', [archived ? now() : null, now(), id, expectedVersion])
       if (!result.rows[0]) throw new ConflictError('Project', id)
       const updated = projectFromRow(result.rows[0])
@@ -520,10 +514,8 @@ export class PostgresIstraRepository implements IstraRepository {
     return this.transaction(async () => {
       const initial = await this.executor.maybeOne<SqlRow>('SELECT * FROM work_items WHERE id=$1', [id])
       if (!initial) throw new NotFoundError('Work item', id)
-      if (input.parentId !== undefined) await lockProjectGraph(this.executor, String(initial.project_id))
-      const existing = input.parentId === undefined
-        ? initial
-        : await this.executor.maybeOne<SqlRow>('SELECT * FROM work_items WHERE id=$1', [id])
+      await lockProjectGraph(this.executor, String(initial.project_id))
+      const existing = await this.executor.maybeOne<SqlRow>('SELECT * FROM work_items WHERE id=$1', [id])
       if (!existing) throw new NotFoundError('Work item', id)
       const current = await this.workItemFromRow(existing)
       if (input.phaseId) await this.assertPhaseInProject(input.phaseId, current.projectId)
@@ -797,10 +789,10 @@ export class PostgresIstraRepository implements IstraRepository {
       for (const [table, columns] of Object.entries(exportTables)) {
         const selectColumns = columns.map((column) => isJsonExportColumn(table, column) ? `${column}::text AS ${column}` : column)
         const rows = await this.executor.many<SqlRow>(`SELECT ${selectColumns.join(',')} FROM ${table}`)
-        tables[table] = deterministicRows(table, rows)
+        tables[table] = portableExportRows(table, rows)
       }
     }, { isolationLevel: 'repeatable read', readOnly: true })
-    return { format: 'istra-export', formatVersion: 4, exportedAt: now(), tables }
+    return { format: 'istra-export', formatVersion: 5, exportedAt: now(), tables }
   }
 
   async isEmpty(): Promise<boolean> {
@@ -811,9 +803,11 @@ export class PostgresIstraRepository implements IstraRepository {
   }
 
   async importForMigration(bundle: ExportBundle): Promise<{ tableCounts: Record<string, number> }> {
-    if (bundle.format !== 'istra-export' || bundle.formatVersion !== 4) {
-      throw new ValidationError('PostgreSQL migration requires an Istra export format v4 bundle')
+    if (bundle.format !== 'istra-export' || bundle.formatVersion !== 5) {
+      throw new ValidationError('PostgreSQL migration requires an Istra export format v5 bundle')
     }
+    const automationViolations = automationExportViolations(bundle.formatVersion, bundle.tables)
+    if (automationViolations.length) throw new ValidationError('PostgreSQL migration bundle contains invalid automation data', { automationViolations })
     return this.transaction(async () => {
       if (!await this.isEmpty()) throw new ValidationError('PostgreSQL migration target is not empty')
       await this.executor.execute('SET CONSTRAINTS ALL DEFERRED')
@@ -827,7 +821,7 @@ export class PostgresIstraRepository implements IstraRepository {
           const values = columns.map((quotedColumn) => {
             const column = quotedColumn.replaceAll('"', '')
             const value = row[column]
-            return booleanColumns.has(`${table}.${column}`) && value != null ? Boolean(value) : value
+            return isBooleanExportColumn(table, column) && value != null ? Boolean(value) : value
           })
           await this.executor.execute(`INSERT INTO ${table}(${columns.join(',')}) VALUES (${placeholders})`, values)
         }
@@ -842,10 +836,11 @@ export class PostgresIstraRepository implements IstraRepository {
         )
       `)
 
-      const imported = await this.exportAll()
-      for (const table of Object.keys(exportTables)) {
+      for (const [table, columns] of Object.entries(exportTables)) {
+        const selectColumns = columns.map((column) => isJsonExportColumn(table, column) ? `${column}::text AS ${column}` : column)
+        const importedRows = deterministicRows(table, await this.executor.many<SqlRow>(`SELECT ${selectColumns.join(',')} FROM ${table}`))
         const expected = deterministicRows(table, bundle.tables[table]!)
-        if (canonicalJson(imported.tables[table]) !== canonicalJson(expected)) {
+        if (canonicalJson(importedRows) !== canonicalJson(expected)) {
           throw new ValidationError(`PostgreSQL migration verification failed for table ${table}`)
         }
       }

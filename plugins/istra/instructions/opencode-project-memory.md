@@ -31,6 +31,19 @@ Use `client: "opencode-plugin:istra"` on every write. When a tool accepts an ide
 
 Avoid duplicates. Revise an authored update when correcting it rather than creating a contradictory replacement.
 
+## Automated Queue Work
+
+Automation is an explicit queue policy, not permission to execute arbitrary Istra work. An external runner should:
+
+1. Use `client: "opencode-plugin:istra"` and an operation-scoped idempotency key on every automation mutation; reuse that key only for an identical retry.
+2. Call `wait_for_queue_changes` with the last opaque cursor, then call `claim_next_automated_work`; queue events are wake-up hints, never authority to execute stale work. Cursors are project- and queue-scoped: if Istra rejects a stale or mismatched cursor, discard it and restart the wait without one. A timeout has no fabricated event even when the opaque expiry watermark advances.
+3. Treat the returned lease token as a secret capability. Do not print, journal, attach, export or persist it outside the runner's bounded recovery state.
+4. Heartbeat before expiry, append bounded observations with `record_automation_attempt`, and link existing run/evidence IDs rather than duplicating proof.
+5. Complete through `complete_automated_work`. If a mutation returns `human_changed_state`, `lease_lost`, `project_paused` or `policy_disabled`, preserve the human state and stop automatic delivery.
+6. Release interrupted work through `release_automated_work` with the current lease token and reason `runner_shutdown` or `abandoned`. Manual operator release belongs to the local web control surface and is not a runner tool. Never emulate claiming, release or completion through generic `update_work_item` calls.
+
+`get_queue_automation_overview` exposes active and recently expired lease summaries without bearer tokens. Istra records structured Git references only. Command execution, prompts, credentials, branches, commits, pushes, pull requests and worktree recovery remain the runner's responsibility.
+
 ## Record runs and evidence
 
 - Record meaningful verification commands with `istra_create_run`; do not log routine navigation or every implementation command.

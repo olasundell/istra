@@ -231,20 +231,25 @@ describe('SQLite repository behaviour', () => {
     expect(repository.listWorkItems(project.id).find(({ id }) => id === child.id)?.parentId).toBe(parent.id)
   })
 
-  it('exports v4 inbox data while accepting legacy v3 imports with an empty inbox', () => {
+  it('exports v5 automation data while accepting legacy v3 and v4 imports', () => {
     const project = repository.createProject({ title: 'Current export' }, provenance)
     const current = repository.exportAll()
 
-    expect(current.formatVersion).toBe(4)
+    expect(current.formatVersion).toBe(5)
     expect(() => repository.validateImport(current)).not.toThrow()
     repository.importAll(current)
     expect(repository.getProject(project.id)?.title).toBe('Current export')
 
-    const legacy = structuredClone(current) as unknown as ExportBundle
-    legacy.formatVersion = 3
-    delete legacy.tables.error_reports
-    expect(() => repository.validateImport(legacy)).not.toThrow()
-    repository.importAll(legacy)
+    const legacyV4 = structuredClone(current) as unknown as ExportBundle
+    legacyV4.formatVersion = 4
+    for (const table of ['work_queue_automation_policies','work_leases','automation_attempts','automation_attempt_observations']) delete legacyV4.tables[table]
+    expect(() => repository.validateImport(legacyV4)).not.toThrow()
+    repository.importAll(legacyV4)
+    const legacyV3 = structuredClone(legacyV4) as unknown as ExportBundle
+    legacyV3.formatVersion = 3
+    delete legacyV3.tables.error_reports
+    expect(() => repository.validateImport(legacyV3)).not.toThrow()
+    repository.importAll(legacyV3)
     expect(repository.getProject(project.id)?.title).toBe('Current export')
 
     for (const formatVersion of [1, 2]) {

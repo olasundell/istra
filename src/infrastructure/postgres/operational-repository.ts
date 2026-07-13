@@ -11,6 +11,10 @@ import type {
   Run, SearchFilters, SearchResult, TestSummary, UpdateErrorReportInput, UpdateRequirementInput,
   ValidationStatus, WorkItem, WorkQueue, WorkRelation, Workspace, WorkspaceRevision,
 } from '../../domain/contracts.js'
+import type {
+  ClaimNextAutomatedWorkInput, CompleteAutomatedWorkInput, HeartbeatAutomatedWorkInput,
+  OperatorReleaseAutomatedWorkInput, RecordAutomationAttemptInput, RunnerReleaseAutomatedWorkInput, UpdateQueueAutomationPolicyInput,
+} from '../../domain/automation.js'
 import type { Awaitable, OperationalRepository } from '../../application/ports.js'
 import { ConflictError, IdempotencyConflictError, NotFoundError, ValidationError } from '../../application/errors.js'
 import { pageOf } from '../../application/pagination.js'
@@ -20,6 +24,7 @@ import { SecretRedactor, type SecretRedactionResult } from '../../application/se
 import { canonicalJson, canonicaliseJson } from '../../domain/canonical-json.js'
 import type { PostgresExecutor } from './database.js'
 import { lockProjectGraph } from './project-graph-lock.js'
+import { PostgresAutomationRepository } from './automation-repository.js'
 
 type Row = Record<string, unknown>
 const now = () => new Date().toISOString()
@@ -56,8 +61,11 @@ function projectFromRow(row: Row): Project {
 
 export class PostgresOperationalRepository implements OperationalRepository {
   private readonly contexts = new AsyncLocalStorage<MutationContext>()
+  private readonly automation: PostgresAutomationRepository
 
-  constructor(private readonly executor: PostgresExecutor) {}
+  constructor(private readonly executor: PostgresExecutor) {
+    this.automation = new PostgresAutomationRepository(executor, (projectId, entityType, entityId, eventType, payload) => this.event(projectId, entityType, entityId, eventType, payload))
+  }
 
   async runIdempotent<T>(client: string, key: string, operation: string, payload: unknown, work: () => Awaitable<T>): Promise<T> {
     return this.runMutation({ source: 'system', actor: client, client, idempotencyKey: key, occurredAt: now() }, operation, payload, work)
@@ -282,6 +290,16 @@ export class PostgresOperationalRepository implements OperationalRepository {
 
   async listWorkQueues(projectId: string): Promise<WorkQueue[]> { await this.project(projectId); return (await this.executor.many<Row>('SELECT * FROM work_queues WHERE project_id=$1 ORDER BY created_at,id', [projectId])).map((row) => ({ id: String(row.id), projectId: String(row.project_id), name: String(row.name), description: text(row.description), version: Number(row.version), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) })) }
   async createWorkQueue(projectId: string, input: CreateWorkQueueInput): Promise<WorkQueue> { await this.project(projectId); const id = randomUUID(); const timestamp = now(); try { await this.executor.execute('INSERT INTO work_queues(id,project_id,name,description,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)', [id, projectId, input.name, input.description ?? null, timestamp]) } catch (error) { throw new ValidationError(error instanceof Error ? error.message : 'Could not create work queue') }; await this.event(projectId, 'work_queue', id, 'work_queue.created', { name: input.name }); return (await this.listWorkQueues(projectId)).find((q) => q.id === id)! }
+  getQueueAutomationPolicy(projectId: string, queueId: string) { return this.automation.getPolicy(projectId, queueId) }
+  updateQueueAutomationPolicy(projectId: string, queueId: string, input: UpdateQueueAutomationPolicyInput) { return this.automation.updatePolicy(projectId, queueId, input) }
+  getQueueAutomationOverview(projectId: string, queueId: string) { return this.automation.getOverview(projectId, queueId) }
+  claimNextAutomatedWork(projectId: string, queueId: string, input: ClaimNextAutomatedWorkInput) { return this.automation.claim(projectId, queueId, input) }
+  heartbeatAutomatedWork(leaseId: string, input: HeartbeatAutomatedWorkInput) { return this.automation.heartbeat(leaseId, input) }
+  recordAutomationAttempt(leaseId: string, input: RecordAutomationAttemptInput) { return this.automation.record(leaseId, input) }
+  completeAutomatedWork(leaseId: string, input: CompleteAutomatedWorkInput) { return this.automation.complete(leaseId, input) }
+  releaseAutomatedWork(leaseId: string, input: RunnerReleaseAutomatedWorkInput) { return this.automation.release(leaseId, input) }
+  operatorReleaseAutomatedWork(leaseId: string, input: OperatorReleaseAutomatedWorkInput) { return this.automation.operatorRelease(leaseId, input) }
+  readAutomationQueueChanges(projectId: string, queueId: string, afterSequence: number, expiredAfter: string, checkedAt: string) { return this.automation.readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) }
 
   private async workItemFromRow(row: Row): Promise<WorkItem> {
     const id = String(row.id)
@@ -313,12 +331,12 @@ export class PostgresOperationalRepository implements OperationalRepository {
       return { id, projectId, fromWorkItemId: input.fromWorkItemId, toWorkItemId: input.toWorkItemId, kind: input.kind, createdAt: timestamp }
     })
   }
-  async unlinkWorkItems(id: string): Promise<void> { const relation = await this.executor.maybeOne<Row>('DELETE FROM work_relations WHERE id=$1 RETURNING *', [id]); if (relation) await this.event(String(relation.project_id), 'work_relation', id, 'work_relation.deleted', { kind: relation.kind }) }
+  async unlinkWorkItems(id: string): Promise<void> { const current = await this.executor.maybeOne<Row>('SELECT * FROM work_relations WHERE id=$1', [id]); if (!current) return; await this.executor.transaction(async () => { await lockProjectGraph(this.executor, String(current.project_id)); const relation = await this.executor.maybeOne<Row>('DELETE FROM work_relations WHERE id=$1 RETURNING *', [id]); if (relation) await this.event(String(relation.project_id), 'work_relation', id, 'work_relation.deleted', { kind: relation.kind }) }) }
   async listWorkRelations(projectId: string): Promise<WorkRelation[]> { return (await this.executor.many<Row>('SELECT * FROM work_relations WHERE project_id=$1 ORDER BY created_at,id', [projectId])).map((row) => ({ id: String(row.id), projectId: String(row.project_id), fromWorkItemId: String(row.from_work_item_id), toWorkItemId: String(row.to_work_item_id), kind: String(row.kind) as WorkRelation['kind'], createdAt: iso(row.created_at) })) }
 
-  async createExternalBlocker(projectId: string, input: CreateExternalBlockerInput): Promise<ExternalBlocker> { await this.project(projectId); if (input.workItemId) await this.assertProjectEntity('work_items', input.workItemId, projectId); const id = randomUUID(); const timestamp = now(); await this.executor.execute('INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)', [id, projectId, input.workItemId ?? null, input.content, timestamp]); await this.event(projectId, 'external_blocker', id, 'external_blocker.created', { workItemId: input.workItemId ?? null }); return { id, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp } }
+  async createExternalBlocker(projectId: string, input: CreateExternalBlockerInput): Promise<ExternalBlocker> { return this.executor.transaction(async () => { await lockProjectGraph(this.executor, projectId); await this.project(projectId); if (input.workItemId) await this.assertProjectEntity('work_items', input.workItemId, projectId); const id = randomUUID(); const timestamp = now(); await this.executor.execute('INSERT INTO external_blockers(id,project_id,work_item_id,content,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)', [id, projectId, input.workItemId ?? null, input.content, timestamp]); await this.event(projectId, 'external_blocker', id, 'external_blocker.created', { workItemId: input.workItemId ?? null }); return { id, projectId, workItemId: input.workItemId ?? null, content: input.content, resolvedAt: null, createdAt: timestamp, updatedAt: timestamp } }) }
   async listExternalBlockers(projectId: string, includeResolved = false): Promise<ExternalBlocker[]> { const rows = await this.executor.many<Row>(`SELECT * FROM external_blockers WHERE project_id=$1 ${includeResolved ? '' : 'AND resolved_at IS NULL'} ORDER BY created_at DESC,id`, [projectId]); return rows.map((row) => ({ id: String(row.id), projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: row.resolved_at == null ? null : iso(row.resolved_at), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) })) }
-  async resolveExternalBlocker(id: string): Promise<ExternalBlocker> { const timestamp = now(); const row = await this.executor.maybeOne<Row>('UPDATE external_blockers SET resolved_at=$1,updated_at=$1 WHERE id=$2 RETURNING *', [timestamp, id]); if (!row) throw new NotFoundError('External blocker', id); await this.event(String(row.project_id), 'external_blocker', id, 'external_blocker.resolved'); return { id, projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: timestamp, createdAt: iso(row.created_at), updatedAt: timestamp } }
+  async resolveExternalBlocker(id: string): Promise<ExternalBlocker> { const current = await this.executor.maybeOne<Row>('SELECT * FROM external_blockers WHERE id=$1', [id]); if (!current) throw new NotFoundError('External blocker', id); return this.executor.transaction(async () => { await lockProjectGraph(this.executor, String(current.project_id)); const timestamp = now(); const row = await this.executor.maybeOne<Row>('UPDATE external_blockers SET resolved_at=$1,updated_at=$1 WHERE id=$2 RETURNING *', [timestamp, id]); if (!row) throw new NotFoundError('External blocker', id); await this.event(String(row.project_id), 'external_blocker', id, 'external_blocker.resolved'); return { id, projectId: String(row.project_id), workItemId: text(row.work_item_id), content: String(row.content), resolvedAt: timestamp, createdAt: iso(row.created_at), updatedAt: timestamp } }) }
 
   async createWorkspace(input: CreateWorkspaceInput): Promise<Workspace> { const id = randomUUID(); const timestamp = now(); const root = resolve(input.canonicalRoot); const aliases = [...new Set((input.aliases ?? []).map((entry) => resolve(entry)))]; return this.executor.transaction(async () => { try { await this.executor.execute('INSERT INTO workspaces(id,name,canonical_root,remote,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$5)', [id, input.name, root, input.remote ?? null, timestamp]); for (const alias of aliases) await this.executor.execute('INSERT INTO workspace_aliases(workspace_id,alias,created_at) VALUES ($1,$2,$3)', [id, alias, timestamp]) } catch (error) { throw new ValidationError(error instanceof Error ? error.message : 'Could not create workspace') }; await this.event(null, 'workspace', id, 'workspace.created', { name: input.name, canonicalRoot: root }); return { id, name: input.name, canonicalRoot: root, aliases, remote: input.remote ?? null, createdAt: timestamp, updatedAt: timestamp } }) }
   async linkProjectWorkspace(projectId: string, workspaceId: string): Promise<void> { await this.project(projectId); if (!await this.executor.maybeOne('SELECT 1 FROM workspaces WHERE id=$1', [workspaceId])) throw new NotFoundError('Workspace', workspaceId); await this.executor.execute('INSERT INTO project_workspaces(project_id,workspace_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [projectId, workspaceId, now()]); await this.event(projectId, 'workspace', workspaceId, 'workspace.linked', { projectId }) }

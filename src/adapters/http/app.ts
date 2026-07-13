@@ -1,6 +1,7 @@
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
 import { resolve } from 'node:path'
+import { z } from 'zod'
 import { AppError, NotFoundError, ValidationError } from '../../application/errors.js'
 import type { IstraService } from '../../application/istra-service.js'
 
@@ -13,6 +14,7 @@ export interface HttpAppOptions {
 
 const idParams = (request: { params: unknown }) => request.params as { id: string }
 const projectParams = (request: { params: unknown }) => request.params as { projectId: string }
+const queueParams = (request: { params: unknown }) => request.params as { projectId: string; queueId: string }
 const labelParams = (request: { params: unknown }) => request.params as { id: string; labelId: string }
 
 function isLoopbackHost(value: string | undefined): boolean {
@@ -40,9 +42,36 @@ function source(request: { headers: Record<string, unknown> }) {
   return { source: 'ui' as const, client: typeof client === 'string' ? client.slice(0, 200) : 'http' }
 }
 
+function automationSource(request: { headers: Record<string, unknown> }) {
+  const value = request.headers['x-istra-client']
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > 200) {
+    throw new ValidationError('Automation mutations require an x-istra-client header between 1 and 200 characters')
+  }
+  return { source: 'ui' as const, client: value.trim() }
+}
+
 function idempotencyKey(request: { headers: Record<string, unknown> }): string | undefined {
   const value = request.headers['idempotency-key']
   return typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined
+}
+
+function automationIdempotencyKey(request: { headers: Record<string, unknown> }): string {
+  const value = request.headers['idempotency-key']
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > 200) {
+    throw new ValidationError('Automation mutations require an Idempotency-Key header between 1 and 200 characters')
+  }
+  return value.trim()
+}
+
+const AutomationWaitQuerySchema = z.object({
+  cursor: z.string().trim().min(1).max(2_000).optional(),
+  timeoutSeconds: z.coerce.number().int().min(0).max(60).default(30),
+}).strict()
+
+function automationWaitQuery(value: unknown) {
+  const parsed = AutomationWaitQuerySchema.safeParse(value)
+  if (!parsed.success) throw new ValidationError('Input validation failed', parsed.error.flatten())
+  return parsed.data
 }
 
 export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInstance> {
@@ -120,6 +149,16 @@ export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInst
 
   app.get('/api/v1/projects/:projectId/work-queues', async (request) => ({ data: await options.service.listWorkQueues(projectParams(request).projectId) }))
   app.post('/api/v1/projects/:projectId/work-queues', async (request) => ({ data: await options.service.createWorkQueue(projectParams(request).projectId, request.body, idempotencyKey(request), source(request)) }))
+  app.get('/api/v1/projects/:projectId/work-queues/:queueId/automation-policy', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.getQueueAutomationPolicy(projectId, queueId) } })
+  app.put('/api/v1/projects/:projectId/work-queues/:queueId/automation-policy', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.updateQueueAutomationPolicy(projectId, queueId, request.body, automationIdempotencyKey(request), automationSource(request)) } })
+  app.get('/api/v1/projects/:projectId/work-queues/:queueId/automation', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.getQueueAutomationOverview(projectId, queueId) } })
+  app.get('/api/v1/projects/:projectId/work-queues/:queueId/automation/wait', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.waitForQueueChanges(projectId, queueId, automationWaitQuery(request.query)) } })
+  app.post('/api/v1/projects/:projectId/work-queues/:queueId/automation/claim', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.claimNextAutomatedWork(projectId, queueId, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) } })
+  app.post('/api/v1/automation-leases/:id/heartbeat', async (request) => ({ data: await options.service.heartbeatAutomatedWork(idParams(request).id, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) }))
+  app.post('/api/v1/automation-leases/:id/attempts', async (request) => ({ data: await options.service.recordAutomationAttempt(idParams(request).id, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) }))
+  app.post('/api/v1/automation-leases/:id/complete', async (request) => ({ data: await options.service.completeAutomatedWork(idParams(request).id, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) }))
+  app.post('/api/v1/automation-leases/:id/release', async (request) => ({ data: await options.service.releaseAutomatedWork(idParams(request).id, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) }))
+  app.post('/api/v1/automation-leases/:id/operator-release', async (request) => ({ data: await options.service.operatorReleaseAutomatedWork(idParams(request).id, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) }))
   app.get('/api/v1/projects/:projectId/operational-work-items', async (request) => ({ data: await options.service.listOperationalWorkItems(projectParams(request).projectId, (request.query as { queueId?: string }).queueId) }))
   app.get('/api/v1/projects/:projectId/operational-work-items/page', async (request) => ({ data: await options.service.listOperationalWorkItemsPage(projectParams(request).projectId, request.query) }))
   app.get('/api/v1/projects/:projectId/work-relations', async (request) => ({ data: await options.service.listWorkRelations(projectParams(request).projectId) }))

@@ -53,12 +53,30 @@ import type {
   Workspace,
   WorkspaceRevision,
 } from '../domain/contracts.js'
+import type {
+  AutomationAttempt,
+  AutomationAttemptObservation,
+  AutomationQueueProbe,
+  ClaimAutomatedWorkResult,
+  ClaimNextAutomatedWorkInput,
+  CompleteAutomatedWorkResult,
+  CompleteAutomatedWorkInput,
+  HeartbeatAutomatedWorkResult,
+  HeartbeatAutomatedWorkInput,
+  OperatorReleaseAutomatedWorkInput,
+  QueueAutomationOverview,
+  QueueAutomationPolicy,
+  RecordAutomationAttemptInput,
+  ReleaseAutomatedWorkResult,
+  RunnerReleaseAutomatedWorkInput,
+  UpdateQueueAutomationPolicyInput,
+} from '../domain/automation.js'
 
 export type Awaitable<T> = T | Promise<T>
 
 export interface ExportBundle {
   format: 'istra-export'
-  formatVersion: 3 | 4
+  formatVersion: 3 | 4 | 5
   exportedAt: string
   tables: Record<string, Array<Record<string, unknown>>>
 }
@@ -112,6 +130,16 @@ export interface OperationalRepository {
   getRequirementRollup(projectId: string): Awaitable<RequirementRollup>
   listWorkQueues(projectId: string): Awaitable<WorkQueue[]>
   createWorkQueue(projectId: string, input: CreateWorkQueueInput): Awaitable<WorkQueue>
+  getQueueAutomationPolicy(projectId: string, queueId: string): Awaitable<QueueAutomationPolicy>
+  updateQueueAutomationPolicy(projectId: string, queueId: string, input: UpdateQueueAutomationPolicyInput): Awaitable<QueueAutomationPolicy>
+  getQueueAutomationOverview(projectId: string, queueId: string): Awaitable<QueueAutomationOverview>
+  claimNextAutomatedWork(projectId: string, queueId: string, input: ClaimNextAutomatedWorkInput): Awaitable<ClaimAutomatedWorkResult>
+  heartbeatAutomatedWork(leaseId: string, input: HeartbeatAutomatedWorkInput): Awaitable<HeartbeatAutomatedWorkResult>
+  recordAutomationAttempt(leaseId: string, input: RecordAutomationAttemptInput): Awaitable<AutomationAttemptObservation>
+  completeAutomatedWork(leaseId: string, input: CompleteAutomatedWorkInput): Awaitable<CompleteAutomatedWorkResult>
+  releaseAutomatedWork(leaseId: string, input: RunnerReleaseAutomatedWorkInput): Awaitable<ReleaseAutomatedWorkResult>
+  operatorReleaseAutomatedWork(leaseId: string, input: OperatorReleaseAutomatedWorkInput): Awaitable<ReleaseAutomatedWorkResult>
+  readAutomationQueueChanges(projectId: string, queueId: string, afterSequence: number, expiredAfter: string, checkedAt: string): Awaitable<AutomationQueueProbe>
   listWorkItems(projectId: string, queueId?: string): Awaitable<WorkItem[]>
   listWorkItemsPage(projectId: string, limit: number, cursor?: string | null, queueId?: string): Awaitable<Page<WorkItem>>
   linkWorkItems(projectId: string, input: CreateWorkRelationInput): Awaitable<WorkRelation>

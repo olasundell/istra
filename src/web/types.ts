@@ -13,6 +13,17 @@ export {
 } from "../domain/contracts";
 
 export type {
+  AutomationAttempt,
+  AutomationAttemptObservation,
+  AutomationQueueFeed,
+  QueueAutomationLeaseSummary,
+  QueueAutomationOverview,
+  QueueAutomationPolicy,
+  UpdateQueueAutomationPolicyInput,
+  WorkLease,
+} from "../domain/automation";
+
+export type {
   AcceptanceCriterion,
   ActivityEvent,
   ArtifactReference,
