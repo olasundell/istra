@@ -173,6 +173,7 @@ export class SqliteAutomationRepository {
       if (String(project.state) !== 'active') return { outcome: 'project_paused', cursor }
       const policy = this.getPolicy(projectId, queueId)
       if (!policy.enabled) return { outcome: 'policy_disabled', cursor }
+      if (json<unknown[]>(project.blockers_json, []).length > 0) return { outcome: 'empty', cursor }
       const active = Number((this.db.prepare('SELECT COUNT(*) count FROM work_leases WHERE queue_id=? AND released_at IS NULL AND expires_at>?').get(queueId, timestamp) as Row).count)
       if (active >= policy.maxActiveClaims) return { outcome: 'capacity_reached', cursor }
       const allowed = policy.allowedKinds.filter((kind) => !input.allowedKinds || input.allowedKinds.includes(kind))
@@ -291,7 +292,10 @@ export class SqliteAutomationRepository {
   readChanges(projectId: string, queueId: string, afterSequence: number, expiredAfter: string, checkedAt: string): AutomationQueueProbe {
     this.queue(projectId, queueId)
     const latestSequence = this.latestSequence(projectId, queueId)
-    if (afterSequence > latestSequence) throw new ValidationError('Invalid automation queue cursor')
+    const retention = this.db.prepare('SELECT discarded_through_sequence FROM automation_queue_change_retention WHERE queue_id=?').get(queueId) as Row | undefined
+    const discardedThrough = Number(retention?.discarded_through_sequence ?? 0)
+    // Zero explicitly resets a stale cursor; equality is safe because every later change remains retained.
+    if (afterSequence > latestSequence || (afterSequence !== 0 && afterSequence < discardedThrough)) throw new ValidationError('Invalid automation queue cursor')
     const page = (this.db.prepare('SELECT * FROM automation_queue_changes WHERE project_id=? AND queue_id=? AND sequence>? ORDER BY sequence LIMIT 201').all(projectId, queueId, afterSequence) as Row[]).slice(0, 200)
     const changes = page.map((row): AutomationQueueChange => ({
       sequence: Number(row.sequence), projectId: String(row.project_id), queueId: String(row.queue_id), eventType: String(row.event_type), entityType: String(row.entity_type), entityId: String(row.entity_id), createdAt: String(row.created_at),

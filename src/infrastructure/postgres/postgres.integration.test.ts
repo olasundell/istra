@@ -310,6 +310,65 @@ describe.skipIf(!testDatabaseUrl)('PostgreSQL storage integration', () => {
     await expect(operational.getQueueAutomationOverview(project.id, item.queueId!)).resolves.toMatchObject({ activeLeases: [expect.objectContaining({ workItemId: item.id })] })
   }, 30_000)
 
+  it('publishes a queue change when descriptive project blockers change', async () => {
+    const { repository, operational } = harness!
+    const project = await repository.createProject({ title: 'PostgreSQL project blocker feed' }, provenance)
+    const item = await repository.createWorkItem(project.id, { kind: 'task', title: 'Wait for readiness' }, provenance)
+    const queueId = item.queueId!
+    const cursor = await operational.getQueueAutomationOverview(project.id, queueId)
+    const sequence = Number((JSON.parse(Buffer.from(cursor.cursor, 'base64url').toString('utf8')) as { sequence: number }).sequence)
+
+    await repository.updateProject(project.id, {
+      expectedVersion: project.version,
+      blockers: ['Waiting for a deployment decision.'],
+    }, provenance)
+
+    await expect(operational.readAutomationQueueChanges(
+      project.id,
+      queueId,
+      sequence,
+      '2020-01-01T00:00:00.000Z',
+      '2026-01-01T00:00:00.000Z',
+    )).resolves.toMatchObject({
+      changes: [expect.objectContaining({
+        eventType: 'project.blockers_changed',
+        entityType: 'project',
+        entityId: project.id,
+      })],
+    })
+  }, 30_000)
+
+  it('bounds queue-change retention and rejects a cursor that predates pruned changes', async () => {
+    const retentionLimit = 10_000
+    const { database, repository, operational } = harness!
+    const project = await repository.createProject({ title: 'PostgreSQL bounded feed' }, provenance)
+    const item = await repository.createWorkItem(project.id, { kind: 'task', title: 'Retention item' }, provenance)
+    const queueId = item.queueId!
+    const staleSequence = Number((await database.executor.one<{ sequence: number }>(
+      'SELECT COALESCE(MAX(sequence),0)::integer AS sequence FROM automation_queue_changes WHERE queue_id=$1',
+      [queueId],
+    )).sequence)
+
+    await database.executor.execute(`
+      INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+      SELECT $1,$2,'work_item.updated','work_item',$3,clock_timestamp()
+      FROM generate_series(1,$4)
+    `, [project.id, queueId, item.id, retentionLimit + 1])
+
+    await expect(database.executor.one<{ count: number }>(
+      'SELECT COUNT(*)::integer AS count FROM automation_queue_changes WHERE queue_id=$1',
+      [queueId],
+    )).resolves.toEqual({ count: retentionLimit })
+    await expect(database.executor.one(
+      'SELECT discarded_through_sequence FROM automation_queue_change_retention WHERE queue_id=$1',
+      [queueId],
+    )).resolves.toMatchObject({ discarded_through_sequence: expect.any(String) })
+    await expect(operational.readAutomationQueueChanges(project.id, queueId, staleSequence, '2020-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'))
+      .rejects.toThrow(/invalid automation queue cursor/i)
+    await expect(operational.readAutomationQueueChanges(project.id, queueId, 0, '2020-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'))
+      .resolves.toMatchObject({ changes: expect.arrayContaining([expect.objectContaining({ eventType: 'work_item.updated' })]) })
+  }, 30_000)
+
   it('serialises opposite requirement-parent mutations', async () => {
     const { repository, operational } = harness!
     const project = await repository.createProject({ title: 'Requirement graph project' }, provenance)

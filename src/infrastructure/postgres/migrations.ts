@@ -1,4 +1,5 @@
 import { postgresAutomationMigration } from './automation-migration.js'
+import { postgresAutomationRetentionMigration } from './automation-retention-migration.js'
 
 export interface PostgresMigration {
   version: number
@@ -576,6 +577,10 @@ export const postgresMigrations: PostgresMigration[] = [{
   version: 4,
   name: 'agent_queue_automation',
   sql: postgresAutomationMigration,
+}, {
+  version: 5,
+  name: 'automation_queue_change_retention',
+  sql: postgresAutomationRetentionMigration,
 }]
 
 export const latestPostgresSchemaVersion = postgresMigrations.at(-1)?.version ?? 0

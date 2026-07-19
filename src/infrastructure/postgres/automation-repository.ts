@@ -145,6 +145,7 @@ export class PostgresAutomationRepository {
       if (String(project.state) !== 'active') return { outcome: 'project_paused', cursor }
       const policy = await this.getPolicy(projectId, queueId)
       if (!policy.enabled) return { outcome: 'policy_disabled', cursor }
+      if (json<unknown[]>(project.blockers_json, []).length > 0) return { outcome: 'empty', cursor }
       const active = Number((await this.executor.one<Row>('SELECT COUNT(*)::integer count FROM work_leases WHERE queue_id=$1 AND released_at IS NULL AND expires_at>$2', [queueId, timestamp])).count)
       if (active >= policy.maxActiveClaims) return { outcome: 'capacity_reached', cursor }
       const allowed = policy.allowedKinds.filter((kind) => !input.allowedKinds || input.allowedKinds.includes(kind))
@@ -261,7 +262,10 @@ export class PostgresAutomationRepository {
   async readChanges(projectId: string, queueId: string, afterSequence: number, expiredAfter: string, checkedAt: string): Promise<AutomationQueueProbe> {
     await this.queue(projectId, queueId)
     const latestSequence = await this.latestSequence(projectId, queueId)
-    if (afterSequence > latestSequence) throw new ValidationError('Invalid automation queue cursor')
+    const retention = await this.executor.maybeOne<Row>('SELECT discarded_through_sequence FROM automation_queue_change_retention WHERE queue_id=$1', [queueId])
+    const discardedThrough = Number(retention?.discarded_through_sequence ?? 0)
+    // Zero explicitly resets a stale cursor; equality is safe because every later change remains retained.
+    if (afterSequence > latestSequence || (afterSequence !== 0 && afterSequence < discardedThrough)) throw new ValidationError('Invalid automation queue cursor')
     const page = (await this.executor.many<Row>('SELECT * FROM automation_queue_changes WHERE project_id=$1 AND queue_id=$2 AND sequence>$3 ORDER BY sequence LIMIT 201', [projectId, queueId, afterSequence])).slice(0, 200)
     const changes = page.map((row): AutomationQueueChange => ({ sequence: Number(row.sequence), projectId: String(row.project_id), queueId: String(row.queue_id), eventType: String(row.event_type), entityType: String(row.entity_type), entityId: String(row.entity_id), createdAt: iso(row.created_at) }))
     const expiredLeases = (await this.executor.many<Row>('SELECT * FROM work_leases WHERE project_id=$1 AND queue_id=$2 AND released_at IS NULL AND expires_at>$3 AND expires_at<=$4 ORDER BY expires_at,id', [projectId, queueId, expiredAfter, checkedAt])).map((row) => this.leaseFromRow(row))

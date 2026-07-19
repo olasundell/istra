@@ -152,6 +152,63 @@ describe('SQLite agent queue automation', () => {
     })).rejects.toThrow(/invalid automation queue cursor/i)
   })
 
+  it('wakes the queue feed when descriptive project blockers change', async () => {
+    const project = repository.createProject({ title: 'Project blocker feed' }, provenance)
+    const item = repository.createWorkItem(project.id, { kind: 'task', title: 'Wait for project readiness' }, provenance)
+    const queueId = item.queueId!
+    const cursor = operational.getQueueAutomationOverview(project.id, queueId).cursor
+
+    repository.updateProject(project.id, {
+      expectedVersion: project.version,
+      blockers: ['Waiting for a deployment decision.'],
+    }, provenance)
+
+    await expect(service.waitForQueueChanges(project.id, queueId, { cursor, timeoutSeconds: 0 })).resolves.toMatchObject({
+      timedOut: false,
+      changes: [expect.objectContaining({
+        eventType: 'project.blockers_changed',
+        entityType: 'project',
+        entityId: project.id,
+      })],
+    })
+  })
+
+  it('bounds retained queue changes, rejects stale cursors and permits an explicit cursor reset', async () => {
+    const retentionLimit = 10_000
+    const project = repository.createProject({ title: 'Bounded feed' }, provenance)
+    const item = repository.createWorkItem(project.id, { kind: 'task', title: 'Retention item' }, provenance)
+    const queueId = item.queueId!
+    const staleSequence = Number((database.db.prepare('SELECT COALESCE(MAX(sequence),0) AS sequence FROM automation_queue_changes WHERE queue_id=?').get(queueId) as { sequence: number }).sequence)
+    const insert = database.db.prepare('INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at) VALUES (?,?,?,?,?,?)')
+    database.db.exec('BEGIN')
+    try {
+      for (let index = 0; index <= retentionLimit; index += 1) {
+        insert.run(project.id, queueId, 'work_item.updated', 'work_item', item.id, new Date(1_700_000_000_000 + index).toISOString())
+      }
+      database.db.exec('COMMIT')
+    } catch (error) {
+      database.db.exec('ROLLBACK')
+      throw error
+    }
+
+    expect(database.db.prepare('SELECT COUNT(*) AS count FROM automation_queue_changes WHERE queue_id=?').get(queueId)).toEqual({ count: retentionLimit })
+    expect(database.db.prepare('SELECT discarded_through_sequence FROM automation_queue_change_retention WHERE queue_id=?').get(queueId)).toMatchObject({
+      discarded_through_sequence: expect.any(Number),
+    })
+    expect(() => operational.readAutomationQueueChanges(project.id, queueId, staleSequence, '2020-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'))
+      .toThrow(/invalid automation queue cursor/i)
+    await expect(service.waitForQueueChanges(project.id, queueId, { timeoutSeconds: 0 })).resolves.toMatchObject({
+      timedOut: false,
+      changes: expect.arrayContaining([expect.objectContaining({ eventType: 'work_item.updated' })]),
+    })
+
+    const freshSequence = Number((database.db.prepare('SELECT MAX(sequence) AS sequence FROM automation_queue_changes WHERE queue_id=?').get(queueId) as { sequence: number }).sequence)
+    expect(operational.readAutomationQueueChanges(project.id, queueId, freshSequence, '2020-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')).toMatchObject({
+      changes: [],
+      cursorSequence: freshSequence,
+    })
+  }, 30_000)
+
   it('exports active leases without reusable tokens and leaves live replay unchanged', async () => {
     const project = repository.createProject({ title: 'Token-safe export' }, provenance)
     const item = repository.createWorkItem(project.id, { kind: 'task', title: 'Protected claim' }, provenance)

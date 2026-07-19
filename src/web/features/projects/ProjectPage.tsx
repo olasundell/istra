@@ -140,7 +140,9 @@ export function ProjectPage() {
       />
 
       <QueueAutomationPanel
-        onEligibilityChanged={() => operationalPulse.reload()}
+        onEligibilityChanged={async () => {
+          await Promise.all([detail.reload(), operationalPulse.reload()]);
+        }}
         projectId={project.id}
         queues={workQueues.data ?? []}
         queuesError={workQueues.error}

@@ -333,6 +333,36 @@ function repositoryBehaviourContract(name: string, factory: RepositoryFactory, s
       expect(completed).toMatchObject({ outcome: 'resolved', item: { status: 'resolved' }, lease: { releasedAt: expect.any(String), terminalOutcome: 'resolved' } })
       expect(await operational.getQueueAutomationOverview(project.id, queueId)).toMatchObject({ activeLeases: [], lastAttempt: { outcome: 'resolved', observations: [expect.objectContaining({ kind: 'verification' })] } })
     }, 30_000)
+
+    it('does not claim work while the project has descriptive blockers', async () => {
+      const { repository, operational } = harness
+      const project = await repository.createProject({ title: 'Blocked automation parity' }, provenance)
+      const item = await repository.createWorkItem(project.id, { kind: 'task', title: 'Wait for the project blocker' }, provenance)
+      const queueId = item.queueId!
+      await repository.updateProject(project.id, {
+        expectedVersion: project.version,
+        blockers: ['Waiting for an operator decision.'],
+      }, provenance)
+
+      expect(await operational.claimNextAutomatedWork(project.id, queueId, {
+        workerId: 'contract-worker',
+        idempotencyKey: 'disabled-blocked-claim',
+      })).toMatchObject({ outcome: 'policy_disabled' })
+      await operational.updateQueueAutomationPolicy(project.id, queueId, {
+        expectedVersion: null, enabled: true, allowedKinds: ['task'], maxActiveClaims: 1, leaseSeconds: 60,
+        requiresManualApproval: false, allowSameWorkerRecovery: true,
+      })
+      expect(await operational.claimNextAutomatedWork(project.id, queueId, {
+        workerId: 'contract-worker',
+        idempotencyKey: 'blocked-claim',
+      })).toMatchObject({ outcome: 'empty' })
+      expect(await repository.getProject(project.id)).toMatchObject({
+        blockers: ['Waiting for an operator decision.'],
+      })
+      expect(await repository.listWorkItems(project.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: item.id, status: 'open' }),
+      ]))
+    }, 30_000)
   })
 }
 

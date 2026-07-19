@@ -93,23 +93,66 @@ Rebuild and reinstall the self-contained Codex and OpenCode packages, then resta
 
 Keep the closed SQLite database and its backups unchanged as rollback artefacts. To roll back, atomically select SQLite in the shared configuration, restart the API and every MCP runtime, verify storage status from each client, and confirm PostgreSQL has no remaining writers. Never run SQLite and PostgreSQL as dual writers.
 
-## Upgrade and roll back
+## Trial-first PostgreSQL deployment
 
-Before an upgrade, export portable JSON. Rebuild only the active service from the intended revision. For the PostgreSQL-backed Compose application:
+Use the guarded deployment command for upgrades of the PostgreSQL-backed Compose application. It defaults to a read-only dry run and refuses apply mode unless all of the following are true:
+
+- `ISTRA_DATABASE_URL` identifies a loopback PostgreSQL database with a non-default name.
+- `--confirm-target` is the exact same credential-free URL, including host, port and database.
+- The Git working tree is completely clean and `pnpm check` leaves it clean.
+- The resolved Compose application and PostgreSQL service target that same database.
+- The existing `istra:local` image is available to tag for rollback.
+- The configured Codex marketplace source is the expected local Istra package.
+- PostgreSQL client tools, Docker, pnpm, Codex, OpenCode and the Codex cachebuster helper are already installed. The deployment does not download helper dependencies.
+
+The command reads the pinned ignored `.env` with Node's built-in environment-file parser. It does not source or execute the file as shell code. The file must be a regular non-symlink owned by the deployment user and inaccessible to group/other users. Choose a private backup directory outside and non-nested with the checkout, then inspect the plan:
 
 ```bash
-docker compose pull --ignore-buildable
-docker compose up --build --detach --wait istra
+mkdir -p "$HOME/Library/Application Support/Istra/postgres-backups"
+chmod 700 "$HOME/Library/Application Support/Istra/postgres-backups"
+pnpm deploy:production -- \
+  --env-file "$PWD/.env" \
+  --confirm-target postgresql://127.0.0.1:5433/istra \
+  --backup-dir "$HOME/Library/Application Support/Istra/postgres-backups"
 ```
 
-For the host-shared PostgreSQL service:
+The dry run reads and validates the pinned environment, validates the supplied values, and prints only credential-free targets. It does not run external commands, connect to a database, write files, build an image or change a runtime. Review the generated trial database name and order before opening the maintenance window.
+
+Run apply mode from a normal terminal, not from an active Codex or OpenCode task. Stop native Istra API processes and close Codex/OpenCode tasks that may own PostgreSQL pools; the script stops the Compose application itself and then refuses to continue if any connection remains:
 
 ```bash
-docker compose pull postgres
-docker compose up --detach --wait postgres
+pnpm deploy:production -- \
+  --apply \
+  --env-file "$PWD/.env" \
+  --confirm-target postgresql://127.0.0.1:5433/istra \
+  --backup-dir "$HOME/Library/Application Support/Istra/postgres-backups"
 ```
 
-Startup applies pending migrations transactionally. SQLite receives a pre-migration snapshot before its schema changes. PostgreSQL backup automation is not yet available, so take and verify an external PostgreSQL backup before upgrading that backend. If the new service is unhealthy, inspect the relevant logs, stop it, and return to the previous source revision or image.
+Apply mode performs these gates in order:
+
+1. It verifies source, tools and resolved Compose configuration, tags the existing image as `istra:rollback-<deployment-id>`, and builds `istra:candidate-<deployment-id>`. Building the candidate does not move the live `istra:local` tag.
+2. It takes a consistent custom-format production dump, restores it into a generated `<production>_istra_trial_<deployment-id>` database, applies the current migrations and checks storage status, row counts and disabled automation policies there.
+3. It runs the PostgreSQL integration suite against isolated schemas inside the trial database. It then runs the exact candidate image against the migrated trial database through the PostgreSQL container's network namespace and requires the expected ready schema and trial target.
+4. It prepares immutable Codex and OpenCode packages without activating them. Package tests already passed in `pnpm check`; staged manifests, Node syntax and installed SHA-256 hashes are checked again during activation.
+5. Only after all trial gates pass does it stop the Compose application. It requires zero other database connections, rechecks the exact database identity and original project count, and creates a mode-`0600` custom-format production backup. `pg_restore --list` and a retained SHA-256 sidecar must succeed before migration.
+6. It migrates production, verifies the new schema and confirms every queue remains automation-disabled. It then promotes the candidate image to `istra:local`, force-recreates the application without rebuilding, and verifies `/api/v1/ready` and `/api/v1/storage`.
+7. It atomically refreshes the local Codex marketplace package and the immutable OpenCode package/loader. If OpenCode activation fails after Codex activation, both loaders are restored to their previous packages. The generated trial database is force-dropped in the final cleanup path.
+
+The script never includes a password or database URL in its progress/error output or Docker command arguments. Secrets are passed through bounded child-process environments. A deployment lock under the backup directory prevents concurrent runs. If a process is killed so abruptly that the lock remains, first prove that no deployment process or generated trial database is still active, then remove only that exact `.istra-deploy.lock` directory.
+
+After success, restart OpenCode and start a new Codex task. Installed files cannot update the MCP registry of an already-running task. Keep the reported PostgreSQL backup, SHA-256 sidecar, rollback image, previous Codex source directory and previous OpenCode loader until the deployment has been used successfully.
+
+### Failure boundaries and rollback
+
+If trial creation, migration, tests or candidate-image smoke fails, the script drops the generated trial database and never stops, backs up or migrates production. The only retained Docker changes are the rollback and candidate image tags; the running container and `istra:local` tag remain unchanged.
+
+If a failure occurs after the application stop is attempted but before the production migration is attempted, the script starts the same unchanged container. It uses `docker compose start`, so it does not resolve a mutable image tag. Inspect any `.partial` backup before deleting it, then fix the failure and begin again with a new deployment id and fresh trial clone.
+
+Once the production migration is attempted, an older image alone is **never** an automatic or assumed-valid rollback: the migration may have committed before its process reported failure, and older binaries reject newer migration history. A migration or post-migration failure deliberately leaves the service stopped unless the new runtime was already verified. Inspect the schema and backup before taking any recovery action. Do not retag `istra:rollback-<deployment-id>` over `istra:local` and start it against that database.
+
+For a post-migration database rollback, preserve the failed migrated database. Restore the reported custom-format backup into a new, explicitly named non-default database, never over the existing production database. Use PostgreSQL's `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE` environment variables so credentials do not appear in command arguments; create the new database, restore with `pg_restore --exit-on-error --single-transaction --no-owner --no-acl`, and run the previous runtime's storage check against it. Only after that duplicate reports the old expected schema and project count should you change both host and Compose URLs in the ignored `.env`, retag the reported rollback image as `istra:local`, and recreate the application. Recheck `/api/v1/storage`, Codex and OpenCode before allowing writes. Keep both the migrated database and backup until the rollback is independently verified.
+
+To roll back only a packaged client after a successful database/runtime deployment, stop that client first. The Codex source retained at `~/plugins/istra.previous.<deployment-id>` can be moved back to the configured marketplace source and reinstalled with `codex plugin add istra@personal --json`. The OpenCode loader retained as `~/.config/opencode/plugins/istra.js.previous.<deployment-id>` can be copied back over the active loader. Restart the client and verify `get_storage_status`; do not point an older client at a schema it does not support.
 
 ## SQLite fallback backups
 

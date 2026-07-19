@@ -62,11 +62,13 @@ describe('SQLite database integrity', () => {
       { version: 1, name: 'authoritative_ledger' },
       { version: 2, name: 'global_error_reports' },
       { version: 3, name: 'agent_queue_automation' },
+      { version: 4, name: 'automation_queue_change_retention' },
     ])
     expect(db.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all()).toEqual([
       { version: 1, name: 'authoritative_ledger' },
       { version: 2, name: 'global_error_reports' },
       { version: 3, name: 'agent_queue_automation' },
+      { version: 4, name: 'automation_queue_change_retention' },
     ])
 
     const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(({ name }) => name))
@@ -83,6 +85,11 @@ describe('SQLite database integrity', () => {
       'automation_attempts',
       'automation_attempt_observations',
       'automation_queue_changes',
+      'automation_queue_change_retention',
+    ]))
+    expect(db.prepare("PRAGMA index_xinfo('automation_queue_changes_queue')").all()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'queue_id', desc: 0, key: 1 }),
+      expect.objectContaining({ name: 'sequence', desc: 1, key: 1 }),
     ]))
   })
 
@@ -101,7 +108,7 @@ describe('SQLite database integrity', () => {
     databases.push(upgraded.db)
     expect((upgraded.db.prepare('SELECT COUNT(*) AS count FROM error_reports').get() as { count: number }).count).toBe(0)
     expect((upgraded.db.prepare("SELECT COUNT(*) AS count FROM projects WHERE title='Preserve me'").get() as { count: number }).count).toBe(1)
-    expect((await upgraded.backupManager.list()).some(({ name }) => name.startsWith('pre-migration-v1-to-v3-'))).toBe(true)
+    expect((await upgraded.backupManager.list()).some(({ name }) => name.startsWith('pre-migration-v1-to-v4-'))).toBe(true)
   })
 
   it('fails closed when a legacy migration history is opened without recreating the database', async () => {

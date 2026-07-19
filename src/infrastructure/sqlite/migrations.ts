@@ -1,4 +1,5 @@
 import { sqliteAutomationMigration } from './automation-migration.js'
+import { sqliteAutomationRetentionMigration } from './automation-retention-migration.js'
 
 export interface Migration {
   version: number
@@ -438,4 +439,8 @@ export const migrations: Migration[] = [{
   version: 3,
   name: 'agent_queue_automation',
   sql: sqliteAutomationMigration,
+}, {
+  version: 4,
+  name: 'automation_queue_change_retention',
+  sql: sqliteAutomationRetentionMigration,
 }]

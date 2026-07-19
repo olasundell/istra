@@ -191,6 +191,12 @@ state, and lease expiry/release. Durable changes are returned in bounded pages
 without advancing past undispatched rows. A timeout returns no fabricated
 change, but the opaque cursor may advance its lease-expiry watermark.
 
+The durable projection retains the newest 10,000 changes per queue. Istra
+rejects a non-zero cursor older than that queue's pruning watermark rather than
+silently skipping changes. The runner must then discard the stale cursor and
+restart without one; sequence zero is the explicit reset sentinel and starts a
+new bounded read from the retained window.
+
 For HTTP, implement this first as long-polling; a later UI enhancement may use
 SSE backed by the same cursor contract. For stdio MCP, the runner repeatedly
 calls the bounded long-poll tool. Do not add push callbacks from Istra to an
@@ -342,8 +348,9 @@ small queue activity view in the UI and document the wake-up semantics.
 
 **Acceptance proof**
 
-- A runner starting from an old cursor receives all eligibility-affecting
-  changes in order.
+- A runner with a retained cursor receives all later eligibility-affecting
+  changes in order; a cursor older than the retention watermark fails closed
+  and can be explicitly reset.
 - A timed-out wait returns without a spurious change.
 - Restart, lease expiry, and policy disable events wake an observer.
 - The feed works identically through HTTP and the packaged MCP runtime.

@@ -15660,6 +15660,78 @@ const postgresAutomationMigration = `
   END $$;
   CREATE TRIGGER automation_change_lease AFTER INSERT OR UPDATE ON work_leases FOR EACH ROW EXECUTE FUNCTION istra_automation_lease_change();
 `;
+const automationQueueChangeRetentionLimit = 1e4;
+const postgresAutomationRetentionMigration = `
+  CREATE TABLE automation_queue_change_retention (
+    queue_id UUID PRIMARY KEY REFERENCES work_queues(id) ON DELETE CASCADE,
+    discarded_through_sequence BIGINT NOT NULL CHECK(discarded_through_sequence > 0),
+    updated_at TIMESTAMPTZ NOT NULL
+  );
+
+  DROP INDEX automation_queue_changes_queue;
+  CREATE INDEX automation_queue_changes_queue ON automation_queue_changes(queue_id, sequence DESC);
+
+  INSERT INTO automation_queue_change_retention(queue_id,discarded_through_sequence,updated_at)
+  SELECT queue_id,MAX(sequence),MAX(created_at)
+  FROM (
+    SELECT queue_id,sequence,created_at,
+      ROW_NUMBER() OVER (PARTITION BY queue_id ORDER BY sequence DESC) AS retention_rank
+    FROM automation_queue_changes
+  ) ranked
+  WHERE retention_rank>${automationQueueChangeRetentionLimit}
+  GROUP BY queue_id;
+
+  DELETE FROM automation_queue_changes changes
+  USING (
+    SELECT sequence FROM (
+      SELECT sequence,
+        ROW_NUMBER() OVER (PARTITION BY queue_id ORDER BY sequence DESC) AS retention_rank
+      FROM automation_queue_changes
+    ) ranked
+    WHERE retention_rank>${automationQueueChangeRetentionLimit}
+  ) stale
+  WHERE changes.sequence=stale.sequence;
+
+  CREATE FUNCTION istra_automation_change_retention() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended(NEW.queue_id::text,0));
+    WITH stale AS (
+      SELECT sequence FROM automation_queue_changes
+      WHERE queue_id=NEW.queue_id
+      ORDER BY sequence DESC
+      OFFSET ${automationQueueChangeRetentionLimit - 1}
+    ), discarded AS (
+      DELETE FROM automation_queue_changes changes
+      USING stale
+      WHERE changes.sequence=stale.sequence
+      RETURNING changes.sequence
+    )
+    INSERT INTO automation_queue_change_retention(queue_id,discarded_through_sequence,updated_at)
+    SELECT NEW.queue_id,MAX(sequence),clock_timestamp() FROM discarded
+    HAVING COUNT(*)>0
+    ON CONFLICT(queue_id) DO UPDATE SET
+      discarded_through_sequence=GREATEST(automation_queue_change_retention.discarded_through_sequence,EXCLUDED.discarded_through_sequence),
+      updated_at=EXCLUDED.updated_at;
+    RETURN NEW;
+  END $$;
+  CREATE TRIGGER automation_queue_changes_retention
+  BEFORE INSERT ON automation_queue_changes
+  FOR EACH ROW EXECUTE FUNCTION istra_automation_change_retention();
+
+  CREATE OR REPLACE FUNCTION istra_automation_project_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF OLD.state IS DISTINCT FROM NEW.state OR OLD.blockers_json IS DISTINCT FROM NEW.blockers_json THEN
+      INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+      SELECT NEW.id,id,
+        CASE WHEN OLD.state IS DISTINCT FROM NEW.state THEN 'project.state_changed' ELSE 'project.blockers_changed' END,
+        'project',NEW.id,NEW.updated_at
+      FROM work_queues WHERE project_id=NEW.id;
+    END IF;
+    RETURN NEW;
+  END $$;
+  DROP TRIGGER automation_change_project_state ON projects;
+  CREATE TRIGGER automation_change_project_state
+  AFTER UPDATE OF state,blockers_json ON projects
+  FOR EACH ROW EXECUTE FUNCTION istra_automation_project_change();
+`;
 const postgresMigrations = [{
   version: 1,
   name: "authoritative_ledger",
@@ -16230,6 +16302,10 @@ const postgresMigrations = [{
   version: 4,
   name: "agent_queue_automation",
   sql: postgresAutomationMigration
+}, {
+  version: 5,
+  name: "automation_queue_change_retention",
+  sql: postgresAutomationRetentionMigration
 }];
 const latestPostgresSchemaVersion = postgresMigrations.at(-1)?.version ?? 0;
 const migrationLockId = "5283936332345650";
@@ -17863,6 +17939,7 @@ class PostgresAutomationRepository {
       if (String(project.state) !== "active") return { outcome: "project_paused", cursor };
       const policy = await this.getPolicy(projectId, queueId);
       if (!policy.enabled) return { outcome: "policy_disabled", cursor };
+      if (json$3(project.blockers_json, []).length > 0) return { outcome: "empty", cursor };
       const active = Number((await this.executor.one("SELECT COUNT(*)::integer count FROM work_leases WHERE queue_id=$1 AND released_at IS NULL AND expires_at>$2", [queueId, timestamp])).count);
       if (active >= policy.maxActiveClaims) return { outcome: "capacity_reached", cursor };
       const allowed = policy.allowedKinds.filter((kind) => !input.allowedKinds || input.allowedKinds.includes(kind));
@@ -17979,7 +18056,9 @@ class PostgresAutomationRepository {
   async readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) {
     await this.queue(projectId, queueId);
     const latestSequence = await this.latestSequence(projectId, queueId);
-    if (afterSequence > latestSequence) throw new ValidationError("Invalid automation queue cursor");
+    const retention = await this.executor.maybeOne("SELECT discarded_through_sequence FROM automation_queue_change_retention WHERE queue_id=$1", [queueId]);
+    const discardedThrough = Number(retention?.discarded_through_sequence ?? 0);
+    if (afterSequence > latestSequence || afterSequence !== 0 && afterSequence < discardedThrough) throw new ValidationError("Invalid automation queue cursor");
     const page = (await this.executor.many("SELECT * FROM automation_queue_changes WHERE project_id=$1 AND queue_id=$2 AND sequence>$3 ORDER BY sequence LIMIT 201", [projectId, queueId, afterSequence])).slice(0, 200);
     const changes = page.map((row) => ({ sequence: Number(row.sequence), projectId: String(row.project_id), queueId: String(row.queue_id), eventType: String(row.event_type), entityType: String(row.entity_type), entityId: String(row.entity_id), createdAt: iso$1(row.created_at) }));
     const expiredLeases = (await this.executor.many("SELECT * FROM work_leases WHERE project_id=$1 AND queue_id=$2 AND released_at IS NULL AND expires_at>$3 AND expires_at<=$4 ORDER BY expires_at,id", [projectId, queueId, expiredAfter, checkedAt])).map((row) => this.leaseFromRow(row));
@@ -19030,6 +19109,69 @@ const sqliteAutomationMigration = `
     VALUES (NEW.project_id,NEW.queue_id,CASE WHEN NEW.released_at IS NULL THEN 'work_lease.heartbeat' ELSE 'work_lease.released' END,'work_lease',NEW.id,COALESCE(NEW.released_at,NEW.heartbeat_at));
   END;
 `;
+const sqliteAutomationRetentionMigration = `
+  CREATE TABLE automation_queue_change_retention (
+    queue_id TEXT PRIMARY KEY REFERENCES work_queues(id) ON DELETE CASCADE,
+    discarded_through_sequence INTEGER NOT NULL CHECK(discarded_through_sequence > 0),
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX automation_queue_changes_queue ON automation_queue_changes(queue_id, sequence DESC);
+
+  INSERT INTO automation_queue_change_retention(queue_id,discarded_through_sequence,updated_at)
+  SELECT queue_id,MAX(sequence),MAX(created_at)
+  FROM (
+    SELECT queue_id,sequence,created_at,
+      ROW_NUMBER() OVER (PARTITION BY queue_id ORDER BY sequence DESC) AS retention_rank
+    FROM automation_queue_changes
+  ) ranked
+  WHERE retention_rank>${automationQueueChangeRetentionLimit}
+  GROUP BY queue_id;
+
+  DELETE FROM automation_queue_changes
+  WHERE sequence IN (
+    SELECT sequence FROM (
+      SELECT sequence,
+        ROW_NUMBER() OVER (PARTITION BY queue_id ORDER BY sequence DESC) AS retention_rank
+      FROM automation_queue_changes
+    ) ranked
+    WHERE retention_rank>${automationQueueChangeRetentionLimit}
+  );
+
+  CREATE TRIGGER automation_queue_changes_retention AFTER INSERT ON automation_queue_changes
+  WHEN (SELECT COUNT(*) FROM automation_queue_changes WHERE queue_id=NEW.queue_id)>${automationQueueChangeRetentionLimit}
+  BEGIN
+    INSERT OR IGNORE INTO automation_queue_change_retention(queue_id,discarded_through_sequence,updated_at)
+    VALUES (NEW.queue_id,1,NEW.created_at);
+    UPDATE automation_queue_change_retention
+    SET discarded_through_sequence=MAX(discarded_through_sequence,(
+      SELECT MAX(sequence) FROM (
+        SELECT sequence FROM automation_queue_changes
+        WHERE queue_id=NEW.queue_id
+        ORDER BY sequence DESC
+        LIMIT -1 OFFSET ${automationQueueChangeRetentionLimit}
+      ) stale
+    )),updated_at=NEW.created_at
+    WHERE queue_id=NEW.queue_id;
+    DELETE FROM automation_queue_changes
+    WHERE sequence IN (
+      SELECT sequence FROM automation_queue_changes
+      WHERE queue_id=NEW.queue_id
+      ORDER BY sequence DESC
+      LIMIT -1 OFFSET ${automationQueueChangeRetentionLimit}
+    );
+  END;
+
+  DROP TRIGGER automation_change_project_state;
+  CREATE TRIGGER automation_change_project_state AFTER UPDATE OF state,blockers_json ON projects
+  WHEN OLD.state<>NEW.state OR OLD.blockers_json<>NEW.blockers_json BEGIN
+    INSERT INTO automation_queue_changes(project_id,queue_id,event_type,entity_type,entity_id,created_at)
+    SELECT NEW.id,id,
+      CASE WHEN OLD.state<>NEW.state THEN 'project.state_changed' ELSE 'project.blockers_changed' END,
+      'project',NEW.id,NEW.updated_at
+    FROM work_queues WHERE project_id=NEW.id;
+  END;
+`;
 const migrations = [{
   version: 1,
   name: "authoritative_ledger",
@@ -19462,6 +19604,10 @@ const migrations = [{
   version: 3,
   name: "agent_queue_automation",
   sql: sqliteAutomationMigration
+}, {
+  version: 4,
+  name: "automation_queue_change_retention",
+  sql: sqliteAutomationRetentionMigration
 }];
 function resolveDatabasePaths(dataDir = process.env.ISTRA_DATA_DIR, backupDir = process.env.ISTRA_BACKUP_DIR) {
   const platformDefault = process.platform === "darwin" ? join(homedir(), "Library", "Application Support", "Istra") : process.platform === "win32" ? join(process.env.LOCALAPPDATA ?? homedir(), "Istra") : join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "istra");
@@ -19860,6 +20006,7 @@ class SqliteAutomationRepository {
       if (String(project.state) !== "active") return { outcome: "project_paused", cursor };
       const policy = this.getPolicy(projectId, queueId);
       if (!policy.enabled) return { outcome: "policy_disabled", cursor };
+      if (json$1(project.blockers_json, []).length > 0) return { outcome: "empty", cursor };
       const active = Number(this.db.prepare("SELECT COUNT(*) count FROM work_leases WHERE queue_id=? AND released_at IS NULL AND expires_at>?").get(queueId, timestamp).count);
       if (active >= policy.maxActiveClaims) return { outcome: "capacity_reached", cursor };
       const allowed = policy.allowedKinds.filter((kind) => !input.allowedKinds || input.allowedKinds.includes(kind));
@@ -19977,7 +20124,9 @@ class SqliteAutomationRepository {
   readChanges(projectId, queueId, afterSequence, expiredAfter, checkedAt) {
     this.queue(projectId, queueId);
     const latestSequence = this.latestSequence(projectId, queueId);
-    if (afterSequence > latestSequence) throw new ValidationError("Invalid automation queue cursor");
+    const retention = this.db.prepare("SELECT discarded_through_sequence FROM automation_queue_change_retention WHERE queue_id=?").get(queueId);
+    const discardedThrough = Number(retention?.discarded_through_sequence ?? 0);
+    if (afterSequence > latestSequence || afterSequence !== 0 && afterSequence < discardedThrough) throw new ValidationError("Invalid automation queue cursor");
     const page = this.db.prepare("SELECT * FROM automation_queue_changes WHERE project_id=? AND queue_id=? AND sequence>? ORDER BY sequence LIMIT 201").all(projectId, queueId, afterSequence).slice(0, 200);
     const changes = page.map((row) => ({
       sequence: Number(row.sequence),

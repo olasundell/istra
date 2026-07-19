@@ -102,7 +102,7 @@ Set `ISTRA_DATA_DIR` to keep SQLite elsewhere and `ISTRA_BACKUP_DIR` to separate
 
 Use the Data management view for a portable, versioned JSON export. SQLite supports validated full-replacement import and creates a pre-import snapshot. PostgreSQL automated backups and destructive full-replacement imports are deferred; export remains available, but PostgreSQL reports backups as unavailable and rejects replacement import.
 
-The authoritative ledger starts at migration v1 and adds the global error-report inbox in v2; SQLite v3 and PostgreSQL v4 add agent queue automation, while PostgreSQL v3 adds indexed accent-insensitive search parity. Existing databases with matching migration history upgrade transactionally; SQLite takes a pre-migration snapshot first, while incompatible legacy histories fail closed and are never deleted automatically. Istra exports format v5, accepts v3–v5 SQLite imports, and treats older imports as full replacements with disabled automation policies and no lease or attempt history. Portable v5 exports omit automation idempotency responses so lease bearer tokens are never exported; unreleased leases are restored expired with invalidated tokens and must be recovered or released explicitly.
+The authoritative ledger starts at migration v1 and adds the global error-report inbox in v2; SQLite v3 and PostgreSQL v4 add agent queue automation, while SQLite v4 and PostgreSQL v5 add bounded queue-change retention and project-blocker wake-ups. PostgreSQL v3 adds indexed accent-insensitive search parity. Existing databases with matching migration history upgrade transactionally; SQLite takes a pre-migration snapshot first, while incompatible legacy histories fail closed and are never deleted automatically. Istra exports format v5, accepts v3–v5 SQLite imports, and treats older imports as full replacements with disabled automation policies and no lease or attempt history. Portable v5 exports omit automation idempotency responses so lease bearer tokens are never exported; unreleased leases are restored expired with invalidated tokens and must be recovered or released explicitly.
 
 ## MCP
 
@@ -172,6 +172,8 @@ pnpm test:postgres  # live PostgreSQL suite (requires TEST_DATABASE_URL)
 pnpm check          # typecheck, tests and all production builds
 pnpm test:plugin    # verify the packaged Codex and OpenCode plugins
 pnpm test:e2e       # Playwright browser journeys
+pnpm test:deploy    # guarded deployment contract tests (no live database)
+pnpm deploy:production -- --help # trial-first PostgreSQL deploy and rollback usage
 ```
 
 ## Architecture

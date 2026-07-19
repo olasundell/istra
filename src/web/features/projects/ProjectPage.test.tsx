@@ -82,6 +82,21 @@ const activeLease = {
   version: 1,
   state: "active",
 };
+const automatedWorkItem = {
+  id: activeLease.workItemId,
+  projectId: id,
+  phaseId: null,
+  kind: "task",
+  title: activeLease.workItemTitle,
+  description: null,
+  status: "open",
+  priority: "high",
+  labels: [],
+  version: 1,
+  createdAt: "2026-07-10T09:00:00.000Z",
+  updatedAt: "2026-07-10T09:00:00.000Z",
+  queueId,
+};
 
 function response(data: unknown) {
   return Promise.resolve(new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } }));
@@ -270,8 +285,9 @@ describe("ProjectPage", () => {
     expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith(`/${queueId}/automation-policy`) && init?.method === "PUT")).toBe(false);
   });
 
-  it("refreshes an externally claimed lease through the queue feed without reloading the page", async () => {
+  it("refreshes an externally claimed lease and its visible work item through the queue feed", async () => {
     let overviewCalls = 0;
+    let detailCalls = 0;
     let resolveWait: (value: Response) => void = () => undefined;
     const feedChange = new Promise<Response>((resolve) => { resolveWait = resolve; });
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -281,15 +297,31 @@ describe("ProjectPage", () => {
         overviewCalls += 1;
         return response({ ...emptyAutomationOverview, activeLeases: overviewCalls > 1 ? [activeLease] : [], cursor: `cursor-${overviewCalls}` });
       }
+      if (url.endsWith(`/projects/${id}`)) {
+        detailCalls += 1;
+        return response({
+          ...detail,
+          workItems: [{ ...automatedWorkItem, status: detailCalls > 1 ? "in_progress" : "open", version: detailCalls }],
+        });
+      }
       return projectPageResponse(input, init);
     });
     render(<MemoryRouter initialEntries={[`/projects/${id}`]}><Routes><Route path="/projects/:projectId" element={<ProjectPage />} /></Routes></MemoryRouter>);
 
     expect(await screen.findByText("No unreleased runner lease.")).toBeInTheDocument();
+    const initialWorkItemRow = screen.getByRole("cell", { name: "Automate calibration" }).closest('[role="row"]') as HTMLElement | null;
+    expect(initialWorkItemRow).not.toBeNull();
+    expect(within(initialWorkItemRow!).getByText("Open")).toBeInTheDocument();
     await act(async () => resolveWait(new Response(JSON.stringify({ data: { cursor: "cursor-event", timedOut: false, changes: [{ sequence: 1 }] } }), { status: 200, headers: { "Content-Type": "application/json" } })));
 
     expect(await screen.findByText(/worker workshop-a/)).toBeInTheDocument();
+    await waitFor(() => {
+      const currentWorkItemRow = screen.getByRole("cell", { name: "Automate calibration" }).closest('[role="row"]') as HTMLElement | null;
+      expect(currentWorkItemRow).not.toBeNull();
+      expect(within(currentWorkItemRow!).getByText("In progress")).toBeInTheDocument();
+    });
     expect(overviewCalls).toBe(2);
+    expect(detailCalls).toBe(2);
     expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith(`/projects/${id}/work-queues/${queueId}/automation`))).toHaveLength(2);
   });
 
