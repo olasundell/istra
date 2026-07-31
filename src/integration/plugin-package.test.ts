@@ -39,6 +39,8 @@ describe("Codex plugin package", () => {
       },
     });
     expect(mcp.mcpServers).toHaveProperty("istra");
+    expect(skill).toContain('client: "codex-plugin:istra"');
+    expect(skill).toContain('client: "claude-plugin:istra"');
     expect(agentMetadata).toMatch(/requirements, work and evidence/i);
     expect(reportingMetadata).toMatch(/allow_implicit_invocation: true/);
     expect(reportingSkill).toMatch(/report concrete or strongly suspected faults/i);
@@ -63,14 +65,23 @@ describe("Codex plugin package", () => {
     const isolatedRoot = await mkdtemp(join(tmpdir(), "istra-plugin-package-"));
     temporaryDirectories.push(dataDir, isolatedRoot);
     await cp(pluginRoot, isolatedRoot, { recursive: true });
+    const packagedMcp = JSON.parse(await readFile(join(isolatedRoot, ".mcp.json"), "utf8")) as {
+      mcpServers: { istra: { command: string; args: string[] } };
+    };
     const environment = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
     );
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ["./dist/mcp/stdio.mjs"],
+      command: packagedMcp.mcpServers.istra.command,
+      args: packagedMcp.mcpServers.istra.args,
       cwd: isolatedRoot,
-      env: { ...environment, ISTRA_STORAGE: "sqlite", ISTRA_DATABASE_URL: "", ISTRA_DATA_DIR: dataDir },
+      env: {
+        ...environment,
+        CLAUDE_PLUGIN_ROOT: "",
+        ISTRA_STORAGE: "sqlite",
+        ISTRA_DATABASE_URL: "",
+        ISTRA_DATA_DIR: dataDir,
+      },
       stderr: "pipe",
     });
     const client = new Client({ name: "istra-plugin-test", version: "1.0.0" });

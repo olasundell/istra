@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "istra",
+  "displayName": "Istra",
+  "version": "0.1.0",
+  "description": "Durable operational project memory for open-ended work in Claude Code.",
+  "author": {
+    "name": "Istra contributors",
+    "url": "https://github.com/olasundell/istra"
+  },
+  "homepage": "https://github.com/olasundell/istra#readme",
+  "repository": "https://github.com/olasundell/istra",
+  "license": "MIT",
+  "keywords": [
+    "project-memory",
+    "checkpoints",
+    "requirements",
+    "evidence",
+    "error-reporting",
+    "local-first"
+  ],
+  "defaultEnabled": true
+}

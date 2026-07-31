@@ -25,7 +25,7 @@ Most tools capture tasks. Istra captures continuity.
 - **Durable journal** — Record progress, decisions, discoveries and checkpoints with revision history.
 - **Searchable by default** — Find a project, phase, work item or remembered decision without reconstructing the story.
 - **Local and calm** — Zero-configuration SQLite or local PostgreSQL, loopback-only HTTP and portable exports; no accounts, remote sync or collaboration layer required.
-- **Agent-ready** — Use the same application service from the web UI, MCP, Codex and OpenCode.
+- **Agent-ready** — Use the same application service from the web UI, MCP, Codex, Claude Code and OpenCode.
 
 Istra is designed for the moment after the meeting, the interrupted investigation or the half-finished build: the important thing is not only what exists, but why it exists, what was proved, and what should happen next.
 
@@ -57,7 +57,7 @@ The production server serves both the UI and API at `http://127.0.0.1:4317`.
 
 ## Run PostgreSQL with Docker Compose
 
-SQLite remains the zero-configuration default. To share PostgreSQL between the host-run API, Codex MCP and OpenCode MCP, start only the PostgreSQL service:
+SQLite remains the zero-configuration default. To share PostgreSQL between the host-run API, Codex MCP, Claude Code MCP and OpenCode MCP, start only the PostgreSQL service:
 
 ```bash
 cp .env.example .env
@@ -134,7 +134,27 @@ Build the self-contained plugin runtime with:
 pnpm build:plugin
 ```
 
-The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Its `.mcp.json` reads the same platform-local storage configuration and environment overrides as the web application, so the plugin does not create a second data path.
+The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Codex and Claude Code share a host-aware `.mcp.json` bootstrap, and all packaged clients read the same platform-local storage configuration and environment overrides as the web application, so no plugin creates a second data path.
+
+## Claude Code plugin
+
+The same `plugins/istra` bundle is a Claude Code plugin with full operational-memory and bounded Istra error-reporting skills. Add this repository as a marketplace and install Istra for all Claude Code projects:
+
+```bash
+claude plugin marketplace add olasundell/istra --scope user
+claude plugin install istra@istra --scope user
+```
+
+For local development before the marketplace changes are published, add the checkout instead:
+
+```bash
+claude plugin marketplace add /absolute/path/to/Istra --scope user
+claude plugin install istra@istra --scope user
+```
+
+Claude Code exposes the skills as `/istra:istra-project-memory` and `/istra:istra-error-reporting`. The plugin MCP configuration resolves the cached runtime through `${CLAUDE_PLUGIN_ROOT}`, so installed versions never depend on the source checkout. Run `/reload-plugins` in an existing Claude Code session after an install or update; new sessions load it automatically.
+
+Claude Code caches marketplace plugins by the manifest version. Keep `plugins/istra/.claude-plugin/plugin.json` aligned with the package release and bump it for every published update.
 
 ## OpenCode plugin
 
@@ -160,7 +180,7 @@ For local development before publishing, add the absolute `plugins/istra` path t
 pnpm dev            # API and Vite development servers
 pnpm build          # server, web and packaged plugin builds
 pnpm build:app      # server and web build without rebuilding plugin artefacts
-pnpm build:plugin   # self-contained MCP runtime and OpenCode server package
+pnpm build:plugin   # self-contained MCP runtime and multi-client plugin package
 pnpm start          # production-style loopback server
 pnpm migrate        # open the database and apply pending migrations
 pnpm storage:status # show the selected backend and redacted readiness status
@@ -170,7 +190,7 @@ pnpm typecheck      # browser and server TypeScript checks
 pnpm test           # unit and integration tests
 pnpm test:postgres  # live PostgreSQL suite (requires TEST_DATABASE_URL)
 pnpm check          # typecheck, tests and all production builds
-pnpm test:plugin    # verify the packaged Codex and OpenCode plugins
+pnpm test:plugin    # verify the packaged Codex, Claude Code and OpenCode plugins
 pnpm test:e2e       # Playwright browser journeys
 pnpm test:deploy    # guarded deployment contract tests (no live database)
 pnpm deploy:production -- --help # trial-first PostgreSQL deploy and rollback usage

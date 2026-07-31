@@ -1,13 +1,15 @@
 ---
 name: istra-project-memory
-description: Use Istra as durable operational project memory through its MCP tools. Trigger when Codex starts, resumes or closes work tracked in Istra; resolves a checkout to a project; reads or maintains requirements, queues, blockers or evidence; records command runs and verification; or inspects project history and checkpoints.
+description: Use Istra as durable operational project memory through its MCP tools. Trigger when an agent starts, resumes or closes work tracked in Istra; resolves a checkout to a project; reads or maintains requirements, queues, blockers or evidence; records command runs and verification; or inspects project history and checkpoints.
 ---
 
 # Istra Project Memory
 
 Use Istra as the only durable data path for project memory. Do not read or edit its SQLite database directly, and do not recreate Istra state in files, comments or another tracker.
 
-If Istra’s MCP tools, plugin packaging, bundled instructions or prescribed workflow appears faulty, invoke `$istra-error-reporting` and follow its bounded reporting policy. Do not use project work items to report Istra faults.
+If Istra’s MCP tools, plugin packaging, bundled instructions or prescribed workflow appears faulty, invoke the `istra-error-reporting` skill and follow its bounded reporting policy. Do not use project work items to report Istra faults.
+
+Select the MCP client identity from the current host before any write: use `client: "codex-plugin:istra"` in Codex and `client: "claude-plugin:istra"` in Claude Code. Apply the selected identity to every mutation, including error reports and automation calls.
 
 ## Begin Work
 
@@ -22,7 +24,7 @@ Do not block a clearly scoped task on bookkeeping. Resolve and read first, then 
 
 ## Maintain Requirements and Work
 
-Use `client: "codex-plugin:istra"` on every write. When a tool accepts an idempotency key, supply a stable key for the logical write and reuse it only when retrying the identical operation and payload.
+Use the selected host client identity on every write. When a tool accepts an idempotency key, supply a stable key for the logical write and reuse it only when retrying the identical operation and payload.
 
 - Use `create_requirement` or `update_requirement` as the task changes requirement state. Give new requirements stable keys and explicit acceptance criteria; preserve hierarchy and responsible or related phases. Use the latest version for updates.
 - Use `create_work_item` or `update_work_item` as the task changes work state. Preserve stable keys, queue placement, parent relationships and requirement links. Maintain dependencies with `link_work_items`, and create or resolve external blockers when they explain effective blocked state.
@@ -36,7 +38,7 @@ Avoid duplicates. Revise an authored update when correcting it rather than creat
 
 Automation is an explicit queue policy, not permission to execute arbitrary Istra work. An external runner should:
 
-1. Use `client: "codex-plugin:istra"` and an operation-scoped idempotency key on every automation mutation; reuse that key only for an identical retry.
+1. Use the selected host client identity and an operation-scoped idempotency key on every automation mutation; reuse that key only for an identical retry.
 2. Call `wait_for_queue_changes` with the last opaque cursor, then call `claim_next_automated_work`; queue events are wake-up hints, never authority to execute stale work. Cursors are project- and queue-scoped: if Istra rejects a stale or mismatched cursor, discard it and restart the wait without one. A timeout has no fabricated event even when the opaque expiry watermark advances.
 3. Treat the returned lease token as a secret capability. Do not print, journal, attach, export or persist it outside the runner's bounded recovery state.
 4. Heartbeat before expiry, append bounded observations with `record_automation_attempt`, and link existing run/evidence IDs rather than duplicating proof.

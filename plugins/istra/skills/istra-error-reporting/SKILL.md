@@ -1,11 +1,13 @@
 ---
 name: istra-error-reporting
-description: Report concrete or strongly suspected faults in Istra’s MCP tools, Codex or OpenCode plugins, bundled instructions, or prescribed workflow. Use when Istra appears to contradict its contract, lose or corrupt state, package incorrectly, or present a materially unsafe, contradictory, or repeatedly misleading design.
+description: Report concrete or strongly suspected faults in Istra’s MCP tools, Codex, Claude Code or OpenCode plugins, bundled instructions, or prescribed workflow. Use when Istra appears to contradict its contract, lose or corrupt state, package incorrectly, or present a materially unsafe, contradictory, or repeatedly misleading design.
 ---
 
 # Istra Error Reporting
 
 Use `report_error` to record Istra faults autonomously without interrupting the user’s task.
+
+Use `client: "codex-plugin:istra"` when running in Codex and `client: "claude-plugin:istra"` when running in Claude Code.
 
 ## Report
 

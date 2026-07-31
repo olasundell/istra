@@ -39,6 +39,7 @@ describe("OpenCode plugin package", () => {
     }
 
     expect(packagedFiles).toEqual(expect.arrayContaining([
+      ".claude-plugin/plugin.json",
       ".codex-plugin/plugin.json",
       ".mcp.json",
       "dist/server.mjs",

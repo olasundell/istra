@@ -13,6 +13,7 @@
     "dist",
     "instructions",
     "skills",
+    ".claude-plugin",
     ".codex-plugin",
     ".mcp.json",
     "README.md"
@@ -27,6 +28,5 @@
     "mcp",
     "project-memory",
     "local-first"
-  ],
-  "license": "MIT"
+  ]
 }

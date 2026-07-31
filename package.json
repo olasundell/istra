@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Durable, local-first project memory for open-ended work in Codex.",
+  "description": "Durable, local-first project memory for open-ended agent work.",
   "type": "module",
   "engines": {
     "node": ">=24.0.0 <27",
@@ -28,7 +28,7 @@
     "test:backend": "vitest run src --exclude 'src/web/**'",
     "test:postgres": "vitest run src/infrastructure/postgres/postgres.integration.test.ts",
     "test:web": "vitest run src/web",
-    "test:plugin": "vitest run src/integration/plugin-package.test.ts src/integration/opencode-plugin.test.ts",
+    "test:plugin": "vitest run src/integration/plugin-package.test.ts src/integration/claude-plugin.test.ts src/integration/opencode-plugin.test.ts",
     "test:deploy": "vitest run scripts/deploy-production.test.ts",
     "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json && tsc --noEmit -p tsconfig.scripts.json",

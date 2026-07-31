@@ -2,7 +2,10 @@
   "mcpServers": {
     "istra": {
       "command": "node",
-      "args": ["./dist/mcp/stdio.mjs"],
+      "args": [
+        "--eval",
+        "const { resolve } = require(\"node:path\"); const { pathToFileURL } = require(\"node:url\"); const root = process.env.CLAUDE_PLUGIN_ROOT || process.cwd(); import(pathToFileURL(resolve(root, \"dist/mcp/stdio.mjs\")).href).catch((error) => { console.error(error); process.exitCode = 1; });"
+      ],
       "cwd": ".",
       "tool_timeout_sec": 120
     }

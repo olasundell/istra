@@ -1,0 +1,14 @@
+{
+  "name": "istra",
+  "description": "Installable Istra project-memory plugins for coding agents.",
+  "owner": {
+    "name": "Istra contributors"
+  },
+  "plugins": [
+    {
+      "name": "istra",
+      "source": "./plugins/istra",
+      "description": "Durable operational project memory for Claude Code."
+    }
+  ]
+}
