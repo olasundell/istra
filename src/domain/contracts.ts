@@ -482,7 +482,9 @@ export interface ProjectPulseSummary {
   failedEvidenceCount: number
 }
 
-const nullableText = z.string().trim().max(20_000).nullable().optional()
+// Each property needs its own Zod instance. Reusing one instance makes the MCP
+// SDK lose the concrete JSON Schema for later nullable text properties.
+const nullableText = () => z.string().trim().max(20_000).nullable().optional()
 const isoDate = z.string().datetime({ offset: true }).nullable().optional()
 export const ProvenanceSchema = z.object({
   source: z.enum(['ui', 'mcp', 'import', 'system']).default('ui'),
@@ -491,29 +493,29 @@ export const ProvenanceSchema = z.object({
 
 export const CreateProjectSchema = z.object({
   title: z.string().trim().min(1).max(240),
-  description: nullableText,
-  intent: nullableText,
+  description: nullableText(),
+  intent: nullableText(),
   deadline: isoDate,
-  completionCriteria: nullableText,
+  completionCriteria: nullableText(),
   source: z.string().optional(),
 })
 
 export const UpdateProjectSchema = z.object({
   expectedVersion: z.number().int().positive(),
   title: z.string().trim().min(1).max(240).optional(),
-  description: nullableText,
-  intent: nullableText,
+  description: nullableText(),
+  intent: nullableText(),
   deadline: isoDate,
-  completionCriteria: nullableText,
+  completionCriteria: nullableText(),
   state: ProjectStateSchema.optional(),
-  currentFocus: nullableText,
-  nextAction: nullableText,
+  currentFocus: nullableText(),
+  nextAction: nullableText(),
   blockers: z.array(z.string().trim().min(1).max(500)).max(100).optional(),
 })
 
 export const CreatePhaseSchema = z.object({
   name: z.string().trim().min(1).max(240),
-  description: nullableText,
+  description: nullableText(),
   status: PhaseStateSchema.default('planned'),
   position: z.number().int().nonnegative().optional(),
 })
@@ -530,7 +532,7 @@ export const CreateWorkItemSchema = z.object({
   rank: z.string().trim().min(1).max(200).nullable().optional(),
   kind: WorkItemKindSchema,
   title: z.string().trim().min(1).max(500),
-  description: nullableText,
+  description: nullableText(),
   status: WorkItemStatusSchema.default('open'),
   priority: PrioritySchema.nullable().optional(),
   labelIds: z.array(z.string().uuid()).max(50).optional(),
@@ -550,8 +552,8 @@ export const ReviseUpdateSchema = z.object({
 export const CheckpointSchema = z.object({
   expectedVersion: z.number().int().positive(),
   content: z.string().trim().min(1).max(100_000),
-  currentFocus: nullableText,
-  nextAction: nullableText,
+  currentFocus: nullableText(),
+  nextAction: nullableText(),
   blockers: z.array(z.string().trim().min(1).max(500)).max(100).optional(),
 })
 
@@ -581,7 +583,7 @@ export const AcceptanceCriterionInputSchema = z.object({
   id: z.string().uuid().optional(),
   expectedVersion: z.number().int().positive().optional(),
   title: z.string().trim().min(1).max(500),
-  description: nullableText,
+  description: nullableText(),
   required: z.boolean().default(true),
 }).superRefine((criterion, context) => {
   if (criterion.id && criterion.expectedVersion === undefined) context.addIssue({ code: z.ZodIssueCode.custom, path: ['expectedVersion'], message: 'expectedVersion is required when updating an existing criterion' })
@@ -592,7 +594,7 @@ export const CreateRequirementSchema = z.object({
   kind: RequirementKindSchema,
   parentId: z.string().uuid().nullable().optional(),
   title: z.string().trim().min(1).max(500),
-  description: nullableText,
+  description: nullableText(),
   stateId: z.string().uuid().optional(),
   responsiblePhaseId: z.string().uuid().nullable().optional(),
   relatedPhaseIds: z.array(z.string().uuid()).max(100).optional(),
@@ -605,7 +607,7 @@ export const CreateRequirementLinkSchema = z.object({
 })
 export const CreateWorkQueueSchema = z.object({
   name: z.string().trim().min(1).max(200),
-  description: nullableText,
+  description: nullableText(),
 })
 export const CreateWorkRelationSchema = z.object({
   fromWorkItemId: z.string().uuid(),
@@ -639,8 +641,8 @@ export const CreateRunObjectSchema = z.object({
   workspaceRevisionId: z.string().uuid().nullable().optional(),
   command: z.string().trim().min(1).max(4_000),
   workingDirectory: z.string().trim().max(4_000).nullable().optional(),
-  startedAt: z.string().datetime({ offset: true }).optional(),
-  endedAt: z.string().datetime({ offset: true }).nullable().optional(),
+  startedAt: z.string().datetime({ offset: true }).optional().describe('Optional start timestamp. If omitted, Istra records the creation time.'),
+  endedAt: z.string().datetime({ offset: true }).nullable().optional().describe('Required when outcome is verified or failed; optional for recorded or interrupted runs.'),
   outcome: RunOutcomeSchema.default('recorded'),
   exitCode: z.number().int().nullable().optional(),
   toolchain: z.record(z.string().max(200)).optional(),
@@ -685,23 +687,23 @@ export const PageRequestSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().trim().max(500).nullable().optional(),
 })
-const optionalErrorReportText = z.string().trim().min(1).max(20_000).nullable().optional()
+const optionalErrorReportText = () => z.string().trim().min(1).max(20_000).nullable().optional()
 export const CreateErrorReportSchema = z.object({
   kind: ErrorReportKindSchema.describe('Use bug for contradicted behaviour or design for a materially unsafe, contradictory, impossible, or repeatedly misleading Istra design.'),
   component: z.string().trim().min(1).max(200).describe('Affected Istra surface, such as mcp:create_run, codex-plugin, opencode-plugin, instructions, or workflow.'),
   summary: z.string().trim().min(1).max(500).describe('Concise description of the perceived Istra fault.'),
   observation: z.string().trim().min(1).max(20_000).describe('Sanitised facts observed; keep inference separate from observation.'),
-  expectedBehaviour: optionalErrorReportText.describe('Optional expected behaviour or contract.'),
-  actualBehaviour: optionalErrorReportText.describe('Optional observed behaviour that differs from expectation.'),
+  expectedBehaviour: optionalErrorReportText().describe('Optional expected behaviour or contract.'),
+  actualBehaviour: optionalErrorReportText().describe('Optional observed behaviour that differs from expectation.'),
   reproductionSteps: z.array(z.string().trim().min(1).max(2_000)).max(20).optional().describe('Optional minimal, sanitised reproduction steps.'),
-  impact: optionalErrorReportText.describe('Optional concrete impact of the concern.'),
+  impact: optionalErrorReportText().describe('Optional concrete impact of the concern.'),
   projectId: z.string().uuid().nullable().optional().describe('Optional already-resolved project context; do not resolve a project merely to report a fault.'),
   workspacePath: z.string().trim().min(1).max(4_000).nullable().optional().describe('Optional relevant workspace context.'),
 }).strict()
 export const UpdateErrorReportSchema = z.object({
   expectedVersion: z.number().int().positive(),
   status: ErrorReportStatusSchema,
-  triageNote: optionalErrorReportText,
+  triageNote: optionalErrorReportText(),
 }).strict()
 export const ErrorReportPageRequestSchema = PageRequestSchema.extend({
   statuses: z.array(ErrorReportStatusSchema).min(1).max(errorReportStatuses.length).optional(),

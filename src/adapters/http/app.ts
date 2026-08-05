@@ -74,8 +74,33 @@ function automationWaitQuery(value: unknown) {
   return parsed.data
 }
 
+function automationWaitSignal(request: { raw: NodeJS.EventEmitter }, reply: { raw: NodeJS.EventEmitter & { writableEnded?: boolean } }, shutdownSignal: AbortSignal) {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  const abortIfDisconnected = () => {
+    if (!reply.raw.writableEnded) abort()
+  }
+  request.raw.once('aborted', abort)
+  reply.raw.once('close', abortIfDisconnected)
+  shutdownSignal.addEventListener('abort', abort, { once: true })
+  if (shutdownSignal.aborted) abort()
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      request.raw.removeListener('aborted', abort)
+      reply.raw.removeListener('close', abortIfDisconnected)
+      shutdownSignal.removeEventListener('abort', abort)
+    },
+  }
+}
+
 export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 20 * 1024 * 1024 })
+  const shutdownController = new AbortController()
+
+  app.addHook('preClose', () => {
+    shutdownController.abort()
+  })
 
   app.addHook('onRequest', async (request) => {
     if (!isLoopbackHost(request.headers.host)) throw new AppError('FORBIDDEN_HOST', 'Istra accepts loopback Host headers only', 403)
@@ -152,7 +177,15 @@ export async function buildHttpApp(options: HttpAppOptions): Promise<FastifyInst
   app.get('/api/v1/projects/:projectId/work-queues/:queueId/automation-policy', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.getQueueAutomationPolicy(projectId, queueId) } })
   app.put('/api/v1/projects/:projectId/work-queues/:queueId/automation-policy', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.updateQueueAutomationPolicy(projectId, queueId, request.body, automationIdempotencyKey(request), automationSource(request)) } })
   app.get('/api/v1/projects/:projectId/work-queues/:queueId/automation', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.getQueueAutomationOverview(projectId, queueId) } })
-  app.get('/api/v1/projects/:projectId/work-queues/:queueId/automation/wait', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.waitForQueueChanges(projectId, queueId, automationWaitQuery(request.query)) } })
+  app.get('/api/v1/projects/:projectId/work-queues/:queueId/automation/wait', async (request, reply) => {
+    const { projectId, queueId } = queueParams(request)
+    const wait = automationWaitSignal(request, reply, shutdownController.signal)
+    try {
+      return { data: await options.service.waitForQueueChanges(projectId, queueId, automationWaitQuery(request.query), wait.signal) }
+    } finally {
+      wait.dispose()
+    }
+  })
   app.post('/api/v1/projects/:projectId/work-queues/:queueId/automation/claim', async (request) => { const { projectId, queueId } = queueParams(request); return { data: await options.service.claimNextAutomatedWork(projectId, queueId, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) } })
   app.post('/api/v1/automation-leases/:id/heartbeat', async (request) => ({ data: await options.service.heartbeatAutomatedWork(idParams(request).id, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) }))
   app.post('/api/v1/automation-leases/:id/attempts', async (request) => ({ data: await options.service.recordAutomationAttempt(idParams(request).id, { ...(request.body as object), idempotencyKey: automationIdempotencyKey(request) }, automationSource(request)) }))

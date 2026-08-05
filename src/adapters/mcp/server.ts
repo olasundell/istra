@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { NotFoundError } from '../../application/errors.js'
+import { NotFoundError, ValidationError } from '../../application/errors.js'
 import type { IstraService } from '../../application/istra-service.js'
 import {
   CheckpointSchema,
@@ -51,6 +51,24 @@ function result(data: unknown) {
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
     structuredContent: { result: data },
+  }
+}
+
+function validationResult(error: unknown) {
+  if (!(error instanceof ValidationError)) throw error
+  const details = error.details as { fieldErrors?: Record<string, string[] | undefined>; formErrors?: string[] } | undefined
+  const fieldErrors = Object.fromEntries(
+    Object.entries(details?.fieldErrors ?? {}).filter(([, fieldMessages]) => fieldMessages?.length),
+  )
+  const messages = [
+    ...Object.entries(fieldErrors).flatMap(([field, fieldMessages]) =>
+      (fieldMessages ?? []).map((message) => `${field}: ${message}`)),
+    ...(details?.formErrors ?? []),
+  ]
+  return {
+    isError: true,
+    content: [{ type: 'text' as const, text: messages.length ? `Input validation failed:\n${messages.join('\n')}` : error.message }],
+    structuredContent: { error: { code: error.code, message: error.message, details: { fieldErrors } } },
   }
 }
 
@@ -368,10 +386,16 @@ export function createMcpServer(service: IstraService): McpServer {
   }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspaceRevision(input, idempotencyKey, source(clientName))))
 
   server.registerTool('create_run', {
-    description: 'Record a bounded command/test execution with redacted excerpts.',
+    description: 'Record a bounded command/test execution with redacted excerpts. For verified or failed outcomes, endedAt is required; startedAt remains optional and defaults to the creation time.',
     inputSchema: CreateRunObjectSchema.extend({ projectId: z.string().uuid(), idempotencyKey: z.string().trim().min(1).max(200), client }).strict(),
     annotations: write,
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, source(clientName))))
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => {
+    try {
+      return result(await service.createRun(projectId, input, idempotencyKey, source(clientName)))
+    } catch (error) {
+      return validationResult(error)
+    }
+  })
   server.registerTool('list_runs', {
     description: 'List structured runs for a project.',
     inputSchema: z.object({ projectId: z.string().uuid() }),

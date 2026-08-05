@@ -107,12 +107,42 @@ describe("Codex plugin package", () => {
         "save_checkpoint",
         "search",
       ]));
+      const bundledByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+      const checkpointSchema = bundledByName.get("save_checkpoint")?.inputSchema as {
+        properties?: Record<string, { anyOf?: Array<{ type?: string }> }>;
+      };
+      expect(checkpointSchema.properties?.nextAction?.anyOf).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "string" }),
+        expect.objectContaining({ type: "null" }),
+      ]));
+      expect(bundledByName.get("create_run")?.description).toMatch(/verified or failed outcomes, endedAt is required/i);
 
       const created = await client.callTool({
         name: "create_project",
         arguments: { title: "Plugin-visible project", client: "plugin-package-test" },
       });
       const project = (created.structuredContent as { result: Project }).result;
+
+      const incompleteRun = await client.callTool({
+        name: "create_run",
+        arguments: {
+          projectId: project.id,
+          idempotencyKey: "plugin-package-incomplete-run",
+          client: "plugin-package-test",
+          command: "pnpm test",
+          outcome: "verified",
+          exitCode: 0,
+        },
+      });
+      expect(incompleteRun).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: {
+            code: "VALIDATION_ERROR",
+            details: { fieldErrors: { endedAt: expect.arrayContaining(["A verified run must be complete"]) } },
+          },
+        },
+      });
 
       const saved = await client.callTool({
         name: "save_checkpoint",

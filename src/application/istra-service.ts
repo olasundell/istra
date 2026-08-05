@@ -41,7 +41,7 @@ import {
   WaitForQueueChangesSchema,
 } from '../domain/automation.js'
 import { decodeAutomationCursor, encodeAutomationCursor } from './automation-cursor.js'
-import { UnsupportedOperationError, ValidationError } from './errors.js'
+import { AppError, UnsupportedOperationError, ValidationError } from './errors.js'
 import type { Awaitable, DataProtection, ExportBundle, IstraRepository, OperationalRepository, StorageStatus } from './ports.js'
 
 const ExportBundleSchema = z.object({
@@ -53,6 +53,33 @@ const ExportBundleSchema = z.object({
 
 const queryBoolean = (value: unknown): boolean => value === true || value === 'true'
 type OperationalCaller = Partial<Provenance> | string
+
+function queueWaitAbortError(): AppError {
+  return new AppError('REQUEST_ABORTED', 'Automation queue wait was cancelled', 503)
+}
+
+function throwIfQueueWaitAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw queueWaitAbortError()
+}
+
+function waitForQueuePoll(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, milliseconds))
+  throwIfQueueWaitAborted(signal)
+  return new Promise((resolve, reject) => {
+    const finish = () => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }
+    const timer = setTimeout(finish, milliseconds)
+    const abort = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+      reject(queueWaitAbortError())
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+}
 
 function flatMapAwaitable<T, U>(value: Awaitable<T>, map: (resolved: T) => Awaitable<U>): Awaitable<U> {
   return value instanceof Promise ? value.then(map) : map(value)
@@ -280,20 +307,22 @@ export class IstraService {
   completeAutomatedWork(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(CompleteAutomatedWorkSchema, input); const operation = () => this.operations().completeAutomatedWork(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'complete_automated_work', { leaseId, parsed }, operation) }
   releaseAutomatedWork(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(RunnerReleaseAutomatedWorkSchema, input); const operation = () => this.operations().releaseAutomatedWork(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'release_automated_work', { leaseId, parsed }, operation) }
   operatorReleaseAutomatedWork(leaseId: string, input: unknown, caller: OperationalCaller) { const parsed = this.parse(OperatorReleaseAutomatedWorkSchema, input); const operation = () => this.operations().operatorReleaseAutomatedWork(leaseId, parsed); return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, 'operator_release_automated_work', { leaseId, parsed }, operation) }
-  async waitForQueueChanges(projectId: string, queueId: string, input: unknown = {}) {
+  async waitForQueueChanges(projectId: string, queueId: string, input: unknown = {}, signal?: AbortSignal) {
     const parsed = this.parse(WaitForQueueChangesSchema, input)
     const started = Date.now(); const deadline = started + parsed.timeoutSeconds * 1_000
     const initial = new Date(started).toISOString(); const cursor = decodeAutomationCursor(parsed.cursor, initial, { projectId, queueId })
     for (;;) {
+      throwIfQueueWaitAborted(signal)
       const checkedAt = new Date().toISOString()
       const probe = await this.operations().readAutomationQueueChanges(projectId, queueId, cursor.sequence, cursor.checkedAt, checkedAt)
+      throwIfQueueWaitAborted(signal)
       const expiryChanges = probe.expiredLeases.map((lease) => ({ sequence: probe.cursorSequence, projectId, queueId, eventType: 'work_lease.expired', entityType: 'work_lease', entityId: lease.id, createdAt: lease.expiresAt }))
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.entityId.localeCompare(right.entityId))
       if (probe.changes.length || expiryChanges.length) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [...probe.changes, ...expiryChanges], timedOut: false }
       const remaining = deadline - Date.now()
       if (remaining <= 0) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [], timedOut: true }
       const untilExpiry = probe.nextExpiryAt ? Math.max(0, Date.parse(probe.nextExpiryAt) - Date.now()) : remaining
-      await new Promise((resolve) => setTimeout(resolve, Math.min(250, remaining, untilExpiry)))
+      await waitForQueuePoll(Math.min(250, remaining, untilExpiry), signal)
     }
   }
   async listOperationalWorkItems(projectId: string, queueId?: string) { return await this.operations().listWorkItems(projectId, queueId) }

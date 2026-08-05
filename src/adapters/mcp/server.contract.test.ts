@@ -85,7 +85,8 @@ describe('MCP server contract', () => {
     expect(errorReportSchema.additionalProperties).toBe(false)
 
     const createRunSchema = byName.get('create_run')?.inputSchema as {
-      properties?: Record<string, { type?: string; anyOf?: Array<{ type?: string }> }>
+      description?: string
+      properties?: Record<string, { type?: string; anyOf?: Array<{ type?: string }>; description?: string }>
       required?: string[]
     }
     expect(Object.keys(createRunSchema.properties ?? {})).toEqual(expect.arrayContaining([
@@ -108,6 +109,23 @@ describe('MCP server contract', () => {
     ]))
     expect(createRunSchema.properties?.toolchain).toMatchObject({ type: 'object' })
     expect(createRunSchema.properties?.testSummary).toMatchObject({ type: 'object' })
+    expect(byName.get('create_run')?.description).toMatch(/verified or failed outcomes, endedAt is required/i)
+    expect(createRunSchema.properties?.endedAt?.description).toMatch(/required when outcome is verified or failed/i)
+    expect(createRunSchema.properties?.startedAt?.description).toMatch(/optional start timestamp/i)
+
+    for (const [toolName, propertyName] of [
+      ['save_checkpoint', 'nextAction'],
+      ['create_project', 'description'],
+      ['update_project', 'currentFocus'],
+      ['create_phase', 'description'],
+      ['update_error_report', 'triageNote'],
+    ] as const) {
+      const schema = byName.get(toolName)?.inputSchema as { properties?: Record<string, { type?: string; anyOf?: Array<{ type?: string }> }> }
+      expect(schema.properties?.[propertyName]?.anyOf).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'string' }),
+        expect.objectContaining({ type: 'null' }),
+      ]))
+    }
 
     for (const name of ['update_queue_automation_policy','claim_next_automated_work','heartbeat_automated_work','record_automation_attempt','complete_automated_work','release_automated_work']) {
       const schema = byName.get(name)?.inputSchema as { required?: string[]; properties?: Record<string, { enum?: string[] }> }
@@ -318,6 +336,46 @@ describe('MCP server contract', () => {
     expect(overrideAttempt.content).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'text', text: expect.stringMatching(/override|unrecognized|unknown/i) }),
     ]))
+  })
+
+  it('reports conditional run validation errors by field and keeps recorded run timestamps optional', async () => {
+    const project = structured<Project>(await client.callTool({
+      name: 'create_project',
+      arguments: { title: 'MCP run validation project' },
+    }))
+
+    const incompleteVerified = await client.callTool({
+      name: 'create_run',
+      arguments: {
+        projectId: project.id,
+        idempotencyKey: 'incomplete-verified-run',
+        command: 'pnpm test',
+        outcome: 'verified',
+        exitCode: 0,
+      },
+    })
+    expect(incompleteVerified.isError).toBe(true)
+    expect(incompleteVerified.content).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'text', text: expect.stringMatching(/endedAt: A verified run must be complete/) }),
+    ]))
+    expect(incompleteVerified.structuredContent).toMatchObject({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Input validation failed',
+        details: { fieldErrors: { endedAt: expect.arrayContaining(['A verified run must be complete']) } },
+      },
+    })
+
+    const recorded = structured<{ run: { outcome: string; startedAt: string; endedAt: string | null } }>(await client.callTool({
+      name: 'create_run',
+      arguments: {
+        projectId: project.id,
+        idempotencyKey: 'recorded-run-without-timestamps',
+        command: 'pnpm test',
+      },
+    }))
+    expect(recorded.run).toMatchObject({ outcome: 'recorded', endedAt: null })
+    expect(recorded.run.startedAt).toEqual(expect.any(String))
   })
 
   it('returns tool errors for missing nullable resources', async () => {

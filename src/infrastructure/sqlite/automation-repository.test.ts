@@ -75,6 +75,23 @@ describe('SQLite agent queue automation', () => {
     expect(operational.getQueueAutomationOverview(project.id, queueId)).toMatchObject({ activeLeases: [], lastAttempt: { outcome: 'awaiting_approval', observations: [expect.objectContaining({ kind: 'delivery' })] } })
   })
 
+  it('stops polling when a queue wait is cancelled', async () => {
+    const project = repository.createProject({ title: 'Cancelled queue wait' }, provenance)
+    const item = repository.createWorkItem(project.id, { kind: 'task', title: 'Waiting task' }, provenance)
+    const queueId = item.queueId!
+    const cursor = operational.getQueueAutomationOverview(project.id, queueId).cursor
+    const readChanges = vi.spyOn(operational, 'readAutomationQueueChanges')
+    const controller = new AbortController()
+
+    const waiting = service.waitForQueueChanges(project.id, queueId, { cursor, timeoutSeconds: 1 }, controller.signal)
+    await vi.waitFor(() => expect(readChanges).toHaveBeenCalledTimes(1))
+    controller.abort()
+
+    await expect(waiting).rejects.toMatchObject({ code: 'REQUEST_ABORTED', statusCode: 503 })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(readChanges).toHaveBeenCalledTimes(1)
+  })
+
   it('does not overwrite human changes and wakes a cursor when a lease expires', async () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-07-11T12:00:00.000Z'))
     const project = repository.createProject({ title: 'Lease safety' }, provenance)

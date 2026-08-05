@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -112,6 +113,50 @@ describe('HTTP API contract', () => {
     const release = await app.inject({ method: 'POST', url: `/api/v1/automation-leases/${claimed.lease.id}/operator-release`, headers: { ...automationHeaders, 'idempotency-key': 'operator-release-1' }, payload: { reason: 'manual', expectedLeaseVersion: claimed.lease.version } })
     expect(release.statusCode).toBe(200)
     expect(release.json()).toMatchObject({ data: { outcome: 'released', item: { status: 'open' } } })
+  })
+
+  it('cancels an outstanding automation wait before app shutdown can close storage', async () => {
+    const project = await createProject('HTTP automation shutdown')
+    const itemResponse = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.id}/work-items`, headers: jsonHeaders, payload: { kind: 'task', title: 'Waiting task' } })
+    const item = itemResponse.json().data as { queueId: string }
+    const overview = await app.inject({ method: 'GET', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation`, headers: { host: 'localhost:4317' } })
+    const cursor = (overview.json().data as { cursor: string }).cursor
+    const readChanges = vi.spyOn(runtime.operationalRepository, 'readAutomationQueueChanges')
+
+    const waiting = app.inject({
+      method: 'GET',
+      url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation/wait?cursor=${encodeURIComponent(cursor)}&timeoutSeconds=1`,
+      headers: { host: 'localhost:4317' },
+    })
+    await vi.waitFor(() => expect(readChanges).toHaveBeenCalledTimes(1))
+
+    const startedAt = Date.now()
+    await app.close()
+    expect(Date.now() - startedAt).toBeLessThan(200)
+    await expect(waiting).resolves.toMatchObject({ statusCode: 503 })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(readChanges).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels an outstanding automation wait when its HTTP client disconnects', async () => {
+    const project = await createProject('HTTP automation disconnect')
+    const itemResponse = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.id}/work-items`, headers: jsonHeaders, payload: { kind: 'task', title: 'Waiting task' } })
+    const item = itemResponse.json().data as { queueId: string }
+    const overview = await app.inject({ method: 'GET', url: `/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation`, headers: { host: 'localhost:4317' } })
+    const cursor = (overview.json().data as { cursor: string }).cursor
+    const readChanges = vi.spyOn(runtime.operationalRepository, 'readAutomationQueueChanges')
+    await app.listen({ host: '127.0.0.1', port: 0 })
+    const address = app.server.address()
+    if (!address || typeof address === 'string') throw new Error('Expected a loopback listener address')
+    const controller = new AbortController()
+
+    const waiting = fetch(`http://127.0.0.1:${address.port}/api/v1/projects/${project.id}/work-queues/${item.queueId}/automation/wait?cursor=${encodeURIComponent(cursor)}&timeoutSeconds=1`, { signal: controller.signal })
+    await vi.waitFor(() => expect(readChanges).toHaveBeenCalledTimes(1))
+    controller.abort()
+
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(readChanges).toHaveBeenCalledTimes(1)
   })
 
   it('requires explicit, bounded provenance and idempotency for automation mutations', async () => {

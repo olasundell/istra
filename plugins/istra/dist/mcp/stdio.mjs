@@ -9507,7 +9507,7 @@ const PulseSnapshotSchema = objectType({
   unresolvedWorkItemIds: arrayType(stringType().uuid()),
   capturedAt: stringType().datetime({ offset: true })
 });
-const nullableText = stringType().trim().max(2e4).nullable().optional();
+const nullableText = () => stringType().trim().max(2e4).nullable().optional();
 const isoDate = stringType().datetime({ offset: true }).nullable().optional();
 objectType({
   source: enumType(["ui", "mcp", "import", "system"]).default("ui"),
@@ -9515,27 +9515,27 @@ objectType({
 }).default({ source: "ui" });
 const CreateProjectSchema = objectType({
   title: stringType().trim().min(1).max(240),
-  description: nullableText,
-  intent: nullableText,
+  description: nullableText(),
+  intent: nullableText(),
   deadline: isoDate,
-  completionCriteria: nullableText,
+  completionCriteria: nullableText(),
   source: stringType().optional()
 });
 const UpdateProjectSchema = objectType({
   expectedVersion: numberType().int().positive(),
   title: stringType().trim().min(1).max(240).optional(),
-  description: nullableText,
-  intent: nullableText,
+  description: nullableText(),
+  intent: nullableText(),
   deadline: isoDate,
-  completionCriteria: nullableText,
+  completionCriteria: nullableText(),
   state: ProjectStateSchema.optional(),
-  currentFocus: nullableText,
-  nextAction: nullableText,
+  currentFocus: nullableText(),
+  nextAction: nullableText(),
   blockers: arrayType(stringType().trim().min(1).max(500)).max(100).optional()
 });
 const CreatePhaseSchema = objectType({
   name: stringType().trim().min(1).max(240),
-  description: nullableText,
+  description: nullableText(),
   status: PhaseStateSchema.default("planned"),
   position: numberType().int().nonnegative().optional()
 });
@@ -9551,7 +9551,7 @@ const CreateWorkItemSchema = objectType({
   rank: stringType().trim().min(1).max(200).nullable().optional(),
   kind: WorkItemKindSchema,
   title: stringType().trim().min(1).max(500),
-  description: nullableText,
+  description: nullableText(),
   status: WorkItemStatusSchema.default("open"),
   priority: PrioritySchema.nullable().optional(),
   labelIds: arrayType(stringType().uuid()).max(50).optional(),
@@ -9570,8 +9570,8 @@ const ReviseUpdateSchema = objectType({
 const CheckpointSchema = objectType({
   expectedVersion: numberType().int().positive(),
   content: stringType().trim().min(1).max(1e5),
-  currentFocus: nullableText,
-  nextAction: nullableText,
+  currentFocus: nullableText(),
+  nextAction: nullableText(),
   blockers: arrayType(stringType().trim().min(1).max(500)).max(100).optional()
 });
 const CreateLabelSchema = objectType({
@@ -9588,7 +9588,7 @@ const AcceptanceCriterionInputSchema = objectType({
   id: stringType().uuid().optional(),
   expectedVersion: numberType().int().positive().optional(),
   title: stringType().trim().min(1).max(500),
-  description: nullableText,
+  description: nullableText(),
   required: booleanType().default(true)
 }).superRefine((criterion, context) => {
   if (criterion.id && criterion.expectedVersion === void 0) context.addIssue({ code: ZodIssueCode.custom, path: ["expectedVersion"], message: "expectedVersion is required when updating an existing criterion" });
@@ -9599,7 +9599,7 @@ const CreateRequirementSchema = objectType({
   kind: RequirementKindSchema,
   parentId: stringType().uuid().nullable().optional(),
   title: stringType().trim().min(1).max(500),
-  description: nullableText,
+  description: nullableText(),
   stateId: stringType().uuid().optional(),
   responsiblePhaseId: stringType().uuid().nullable().optional(),
   relatedPhaseIds: arrayType(stringType().uuid()).max(100).optional(),
@@ -9612,7 +9612,7 @@ objectType({
 });
 const CreateWorkQueueSchema = objectType({
   name: stringType().trim().min(1).max(200),
-  description: nullableText
+  description: nullableText()
 });
 const CreateWorkRelationSchema = objectType({
   fromWorkItemId: stringType().uuid(),
@@ -9646,8 +9646,8 @@ const CreateRunObjectSchema = objectType({
   workspaceRevisionId: stringType().uuid().nullable().optional(),
   command: stringType().trim().min(1).max(4e3),
   workingDirectory: stringType().trim().max(4e3).nullable().optional(),
-  startedAt: stringType().datetime({ offset: true }).optional(),
-  endedAt: stringType().datetime({ offset: true }).nullable().optional(),
+  startedAt: stringType().datetime({ offset: true }).optional().describe("Optional start timestamp. If omitted, Istra records the creation time."),
+  endedAt: stringType().datetime({ offset: true }).nullable().optional().describe("Required when outcome is verified or failed; optional for recorded or interrupted runs."),
   outcome: RunOutcomeSchema.default("recorded"),
   exitCode: numberType().int().nullable().optional(),
   toolchain: recordType(stringType().max(200)).optional(),
@@ -9692,23 +9692,23 @@ const PageRequestSchema = objectType({
   limit: coerce.number().int().min(1).max(200).default(50),
   cursor: stringType().trim().max(500).nullable().optional()
 });
-const optionalErrorReportText = stringType().trim().min(1).max(2e4).nullable().optional();
+const optionalErrorReportText = () => stringType().trim().min(1).max(2e4).nullable().optional();
 const CreateErrorReportSchema = objectType({
   kind: ErrorReportKindSchema.describe("Use bug for contradicted behaviour or design for a materially unsafe, contradictory, impossible, or repeatedly misleading Istra design."),
   component: stringType().trim().min(1).max(200).describe("Affected Istra surface, such as mcp:create_run, codex-plugin, opencode-plugin, instructions, or workflow."),
   summary: stringType().trim().min(1).max(500).describe("Concise description of the perceived Istra fault."),
   observation: stringType().trim().min(1).max(2e4).describe("Sanitised facts observed; keep inference separate from observation."),
-  expectedBehaviour: optionalErrorReportText.describe("Optional expected behaviour or contract."),
-  actualBehaviour: optionalErrorReportText.describe("Optional observed behaviour that differs from expectation."),
+  expectedBehaviour: optionalErrorReportText().describe("Optional expected behaviour or contract."),
+  actualBehaviour: optionalErrorReportText().describe("Optional observed behaviour that differs from expectation."),
   reproductionSteps: arrayType(stringType().trim().min(1).max(2e3)).max(20).optional().describe("Optional minimal, sanitised reproduction steps."),
-  impact: optionalErrorReportText.describe("Optional concrete impact of the concern."),
+  impact: optionalErrorReportText().describe("Optional concrete impact of the concern."),
   projectId: stringType().uuid().nullable().optional().describe("Optional already-resolved project context; do not resolve a project merely to report a fault."),
   workspacePath: stringType().trim().min(1).max(4e3).nullable().optional().describe("Optional relevant workspace context.")
 }).strict();
 const UpdateErrorReportSchema = objectType({
   expectedVersion: numberType().int().positive(),
   status: ErrorReportStatusSchema,
-  triageNote: optionalErrorReportText
+  triageNote: optionalErrorReportText()
 }).strict();
 const ErrorReportPageRequestSchema = PageRequestSchema.extend({
   statuses: arrayType(ErrorReportStatusSchema).min(1).max(errorReportStatuses.length).optional(),
@@ -9843,6 +9843,30 @@ const ExportBundleSchema = objectType({
   tables: recordType(arrayType(recordType(unknownType())))
 }).strict();
 const queryBoolean = (value) => value === true || value === "true";
+function queueWaitAbortError() {
+  return new AppError("REQUEST_ABORTED", "Automation queue wait was cancelled", 503);
+}
+function throwIfQueueWaitAborted(signal) {
+  if (signal?.aborted) throw queueWaitAbortError();
+}
+function waitForQueuePoll(milliseconds, signal) {
+  if (!signal) return new Promise((resolve2) => setTimeout(resolve2, milliseconds));
+  throwIfQueueWaitAborted(signal);
+  return new Promise((resolve2, reject) => {
+    const finish = () => {
+      signal.removeEventListener("abort", abort);
+      resolve2();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      reject(queueWaitAbortError());
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
 function flatMapAwaitable(value, map) {
   return value instanceof Promise ? value.then(map) : map(value);
 }
@@ -10149,21 +10173,23 @@ class IstraService {
     const operation = () => this.operations().operatorReleaseAutomatedWork(leaseId, parsed);
     return this.writeOperational(this.automationCaller(caller), parsed.idempotencyKey, "operator_release_automated_work", { leaseId, parsed }, operation);
   }
-  async waitForQueueChanges(projectId, queueId, input = {}) {
+  async waitForQueueChanges(projectId, queueId, input = {}, signal) {
     const parsed = this.parse(WaitForQueueChangesSchema, input);
     const started = Date.now();
     const deadline = started + parsed.timeoutSeconds * 1e3;
     const initial = new Date(started).toISOString();
     const cursor = decodeAutomationCursor(parsed.cursor, initial, { projectId, queueId });
     for (; ; ) {
+      throwIfQueueWaitAborted(signal);
       const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
       const probe = await this.operations().readAutomationQueueChanges(projectId, queueId, cursor.sequence, cursor.checkedAt, checkedAt);
+      throwIfQueueWaitAborted(signal);
       const expiryChanges = probe.expiredLeases.map((lease) => ({ sequence: probe.cursorSequence, projectId, queueId, eventType: "work_lease.expired", entityType: "work_lease", entityId: lease.id, createdAt: lease.expiresAt })).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.entityId.localeCompare(right.entityId));
       if (probe.changes.length || expiryChanges.length) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [...probe.changes, ...expiryChanges], timedOut: false };
       const remaining = deadline - Date.now();
       if (remaining <= 0) return { cursor: encodeAutomationCursor({ projectId, queueId, sequence: probe.cursorSequence, checkedAt }), changes: [], timedOut: true };
       const untilExpiry = probe.nextExpiryAt ? Math.max(0, Date.parse(probe.nextExpiryAt) - Date.now()) : remaining;
-      await new Promise((resolve2) => setTimeout(resolve2, Math.min(250, remaining, untilExpiry)));
+      await waitForQueuePoll(Math.min(250, remaining, untilExpiry), signal);
     }
   }
   async listOperationalWorkItems(projectId, queueId) {
@@ -31663,12 +31689,12 @@ class Server extends Protocol {
           }
           return taskValidationResult.data;
         }
-        const validationResult = safeParse(CallToolResultSchema, result2);
-        if (!validationResult.success) {
-          const errorMessage = validationResult.error instanceof Error ? validationResult.error.message : String(validationResult.error);
+        const validationResult2 = safeParse(CallToolResultSchema, result2);
+        if (!validationResult2.success) {
+          const errorMessage = validationResult2.error instanceof Error ? validationResult2.error.message : String(validationResult2.error);
           throw new McpError(ErrorCode.InvalidParams, `Invalid tools/call result: ${errorMessage}`);
         }
-        return validationResult.data;
+        return validationResult2.data;
       };
       return super.setRequestHandler(requestSchema, wrappedHandler);
     }
@@ -31867,9 +31893,9 @@ class Server extends Protocol {
         if (result2.action === "accept" && result2.content && formParams.requestedSchema) {
           try {
             const validator = this._jsonSchemaValidator.getValidator(formParams.requestedSchema);
-            const validationResult = validator(result2.content);
-            if (!validationResult.valid) {
-              throw new McpError(ErrorCode.InvalidParams, `Elicitation response content does not match requested schema: ${validationResult.errorMessage}`);
+            const validationResult2 = validator(result2.content);
+            if (!validationResult2.valid) {
+              throw new McpError(ErrorCode.InvalidParams, `Elicitation response content does not match requested schema: ${validationResult2.errorMessage}`);
             }
           } catch (error) {
             if (error instanceof McpError) {
@@ -32819,6 +32845,23 @@ function result(data) {
     structuredContent: { result: data }
   };
 }
+function validationResult(error) {
+  if (!(error instanceof ValidationError)) throw error;
+  const details = error.details;
+  const fieldErrors = Object.fromEntries(
+    Object.entries(details?.fieldErrors ?? {}).filter(([, fieldMessages]) => fieldMessages?.length)
+  );
+  const messages2 = [
+    ...Object.entries(fieldErrors).flatMap(([field, fieldMessages]) => (fieldMessages ?? []).map((message) => `${field}: ${message}`)),
+    ...details?.formErrors ?? []
+  ];
+  return {
+    isError: true,
+    content: [{ type: "text", text: messages2.length ? `Input validation failed:
+${messages2.join("\n")}` : error.message }],
+    structuredContent: { error: { code: error.code, message: error.message, details: { fieldErrors } } }
+  };
+}
 function required(value, entity, id2) {
   if (value === null) throw new NotFoundError(entity, id2);
   return value;
@@ -33118,10 +33161,16 @@ function createMcpServer(service) {
     annotations: write
   }, async ({ idempotencyKey, client: clientName, ...input }) => result(await service.createWorkspaceRevision(input, idempotencyKey, source(clientName))));
   server2.registerTool("create_run", {
-    description: "Record a bounded command/test execution with redacted excerpts.",
+    description: "Record a bounded command/test execution with redacted excerpts. For verified or failed outcomes, endedAt is required; startedAt remains optional and defaults to the creation time.",
     inputSchema: CreateRunObjectSchema.extend({ projectId: stringType().uuid(), idempotencyKey: stringType().trim().min(1).max(200), client }).strict(),
     annotations: write
-  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => result(await service.createRun(projectId, input, idempotencyKey, source(clientName))));
+  }, async ({ projectId, idempotencyKey, client: clientName, ...input }) => {
+    try {
+      return result(await service.createRun(projectId, input, idempotencyKey, source(clientName)));
+    } catch (error) {
+      return validationResult(error);
+    }
+  });
   server2.registerTool("list_runs", {
     description: "List structured runs for a project.",
     inputSchema: objectType({ projectId: stringType().uuid() }),
