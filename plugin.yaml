@@ -1,0 +1,6 @@
+manifest_version: 1
+name: istra
+version: 0.1.1
+description: Durable operational project memory and proof for Hermes Agent.
+author: Istra contributors
+kind: standalone

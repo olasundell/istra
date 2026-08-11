@@ -24,8 +24,9 @@ Most tools capture tasks. Istra captures continuity.
 - **Operational memory** — Trace intent through requirements, work queues, external blockers, runs and evidence.
 - **Durable journal** — Record progress, decisions, discoveries and checkpoints with revision history.
 - **Searchable by default** — Find a project, phase, work item or remembered decision without reconstructing the story.
+- **Opt-in agent queueing** — Let external runners claim bounded work with leases, heartbeats and attempts while Istra keeps command execution and credentials outside the product.
 - **Local and calm** — Zero-configuration SQLite or local PostgreSQL, loopback-only HTTP and portable exports; no accounts, remote sync or collaboration layer required.
-- **Agent-ready** — Use the same application service from the web UI, MCP, Codex, Claude Code and OpenCode.
+- **Agent-ready** — Use the same application service from the web UI, MCP, Codex, Claude Code, Hermes Agent and OpenCode.
 
 Istra is designed for the moment after the meeting, the interrupted investigation or the half-finished build: the important thing is not only what exists, but why it exists, what was proved, and what should happen next.
 
@@ -57,7 +58,7 @@ The production server serves both the UI and API at `http://127.0.0.1:4317`.
 
 ## Run PostgreSQL with Docker Compose
 
-SQLite remains the zero-configuration default. To share PostgreSQL between the host-run API, Codex MCP, Claude Code MCP and OpenCode MCP, start only the PostgreSQL service:
+SQLite remains the zero-configuration default. To share PostgreSQL between the host-run API, Codex MCP, Claude Code MCP, Hermes MCP and OpenCode MCP, start only the PostgreSQL service:
 
 ```bash
 cp .env.example .env
@@ -124,6 +125,8 @@ default_tools_approval_mode = "writes"
 
 MCP provides read/search and non-destructive create, edit and archive tools. `report_error` records a bounded, sanitised report of a perceived Istra MCP, plugin, instruction, or workflow fault; it is not for bugs in the user’s project. Istra deliberately does not expose hard deletion, import or backup restoration.
 
+For recorded runs, `startedAt` is optional and defaults to the creation time. Verified and failed runs must include `endedAt`, so incomplete proof cannot be presented as finished.
+
 ## Codex plugin
 
 The installable plugin source lives in `plugins/istra`. It packages the stdio MCP server, the `istra-project-memory` skill, and the implicitly triggered `istra-error-reporting` skill. The latter tells agents when to report Istra faults autonomously, safely, and without blocking the user’s task.
@@ -134,7 +137,16 @@ Build the self-contained plugin runtime with:
 pnpm build:plugin
 ```
 
-The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Codex and Claude Code share a host-aware `.mcp.json` bootstrap, and all packaged clients read the same platform-local storage configuration and environment overrides as the web application, so no plugin creates a second data path.
+The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Codex and Claude Code share a host-aware `.mcp.json` bootstrap; Hermes and OpenCode point at the same bundled server through host-specific configuration. All packaged clients read the same platform-local storage configuration and environment overrides as the web application, so no plugin creates a second data path.
+
+Add this repository as a Codex marketplace and install the plugin:
+
+```bash
+codex plugin marketplace add olasundell/istra
+codex plugin add istra@istra
+```
+
+For unpublished local development, use the checkout's absolute path in the marketplace-add command. Start a new Codex task after installing or updating so its live MCP registry can load the new package.
 
 ## Claude Code plugin
 
@@ -154,7 +166,24 @@ claude plugin install istra@istra --scope user
 
 Claude Code exposes the skills as `/istra:istra-project-memory` and `/istra:istra-error-reporting`. The plugin MCP configuration resolves the cached runtime through `${CLAUDE_PLUGIN_ROOT}`, so installed versions never depend on the source checkout. Run `/reload-plugins` in an existing Claude Code session after an install or update; new sessions load it automatically.
 
-Claude Code caches marketplace plugins by the manifest version. Keep `plugins/istra/.claude-plugin/plugin.json` aligned with the package release and bump it for every published update.
+Claude Code caches marketplace plugins by the manifest version. Bump `plugins/istra/.claude-plugin/plugin.json` for every published Claude Code plugin update. Host manifests are versioned independently, so a Claude Code or Hermes bump does not imply a Codex or npm package release.
+
+## Hermes Agent plugin
+
+With Hermes Agent 0.20.0 or newer, the repository root is an installable plugin with namespaced operational-memory and error-reporting skills. Install and enable it, then add the bundled Istra runtime through Hermes' separate MCP configuration surface:
+
+```bash
+hermes plugins install olasundell/istra --enable
+ISTRA_HERMES_ROOT="$(dirname "$(hermes config path)")/plugins/istra"
+hermes mcp add istra --command node --args "$ISTRA_HERMES_ROOT/plugins/istra/dist/mcp/stdio.mjs"
+hermes mcp test istra
+```
+
+The test output must report a successful connection and discovered Istra tools; its process exit status alone is not sufficient. If it reports that the optional `mcp` Python SDK is missing, install Hermes MCP support by following [Hermes' official guidance](https://hermes-agent.nousresearch.com/docs/guides/use-mcp-with-hermes/), then repeat the test.
+
+Start a new session with `hermes -s istra:istra-project-memory`. Hermes exposes Istra calls with the `mcp__istra__` prefix and records writes with `client: "hermes-plugin:istra"`.
+
+Hermes' public plugin API does not register MCP servers, so the explicit `hermes mcp add` step is required rather than being hidden in plugin import side effects. See [the Hermes plugin guide](hermes/README.md) for updates and storage configuration.
 
 ## OpenCode plugin
 
@@ -190,7 +219,7 @@ pnpm typecheck      # browser and server TypeScript checks
 pnpm test           # unit and integration tests
 pnpm test:postgres  # live PostgreSQL suite (requires TEST_DATABASE_URL)
 pnpm check          # typecheck, tests and all production builds
-pnpm test:plugin    # verify the packaged Codex, Claude Code and OpenCode plugins
+pnpm test:plugin    # verify the packaged Codex, Claude Code, Hermes and OpenCode plugins
 pnpm test:e2e       # Playwright browser journeys
 pnpm test:deploy    # guarded deployment contract tests (no live database)
 pnpm deploy:production -- --help # trial-first PostgreSQL deploy and rollback usage

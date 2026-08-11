@@ -1,6 +1,6 @@
 # Istra agent plugins
 
-This package adds durable, local-first operational project memory to Codex, Claude Code and OpenCode. Every client starts the same self-contained Node.js MCP server against the database used by the Istra web application, then applies the requirements, work-queue, run, evidence and checkpoint workflow appropriate to its host.
+This package adds durable, local-first operational project memory to Codex, Claude Code, Hermes Agent and OpenCode. Every client starts the same self-contained Node.js MCP server against the database used by the Istra web application, then applies the requirements, work-queue, run, evidence and checkpoint workflow appropriate to its host.
 
 The bundle requires Node.js 24 or newer because its MCP runtime uses `node:sqlite`. Set `ISTRA_DATA_DIR` to share a non-default Istra data directory.
 
@@ -17,11 +17,28 @@ For unpublished local development, use the absolute repository path in the marke
 
 The shared `.mcp.json` starts `dist/mcp/stdio.mjs` from `${CLAUDE_PLUGIN_ROOT}` in Claude Code and from the plugin working directory in Codex, keeping both copied plugin caches independent of the checkout.
 
-Claude Code caches marketplace plugins by the manifest version, which must be bumped for every published package update.
+Claude Code caches marketplace plugins by the manifest version, which must be bumped for every published Claude Code plugin update.
 
 ## Codex
 
-The Codex manifest loads the shared `.mcp.json`, the same two skills, and the bundled MCP runtime. Codex writes use `client: "codex-plugin:istra"`; Claude Code writes use `client: "claude-plugin:istra"`.
+The Codex manifest loads the shared `.mcp.json`, the same two skills, and the bundled MCP runtime. Add the repository or local checkout as a Codex marketplace, then install `istra` from the marketplace name reported by Codex. Codex writes use `client: "codex-plugin:istra"`; Claude Code writes use `client: "claude-plugin:istra"`.
+
+## Hermes Agent
+
+With Hermes Agent 0.20.0 or newer, install the repository-root plugin, then add this package's bundled runtime through Hermes' MCP configuration:
+
+```bash
+hermes plugins install olasundell/istra --enable
+ISTRA_HERMES_ROOT="$(dirname "$(hermes config path)")/plugins/istra"
+hermes mcp add istra --command node --args "$ISTRA_HERMES_ROOT/plugins/istra/dist/mcp/stdio.mjs"
+hermes mcp test istra
+```
+
+Require the test output to report a successful connection and discovered Istra tools; do not rely on its process exit status alone. If the optional `mcp` Python SDK is missing, install Hermes MCP support by following [Hermes' official guidance](https://hermes-agent.nousresearch.com/docs/guides/use-mcp-with-hermes/), then repeat the test.
+
+Start a new session with `hermes -s istra:istra-project-memory`. Hermes plugin skills are explicitly loaded and namespaced; its MCP tools use the `mcp__istra__` prefix. Hermes writes use `client: "hermes-plugin:istra"`.
+
+The separate MCP command is required because Hermes does not expose MCP registration through its public native-plugin API. The plugin deliberately leaves the user's `config.yaml` untouched during import.
 
 ## OpenCode
 

@@ -34,7 +34,7 @@ describe("Claude Code plugin package", () => {
     expect(manifest).toMatchObject({
       name: "istra",
       displayName: "Istra",
-      version: "0.1.0",
+      version: "0.1.1",
       description: "Durable operational project memory for open-ended work in Claude Code.",
       repository: "https://github.com/olasundell/istra",
       license: "MIT",

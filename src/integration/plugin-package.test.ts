@@ -18,6 +18,9 @@ afterEach(async () => {
 
 describe("Codex plugin package", () => {
   it("declares a valid local MCP server and bundled project-memory skill", async () => {
+    const marketplace = JSON.parse(
+      await readFile(resolve(".agents/plugins/marketplace.json"), "utf8"),
+    ) as Record<string, unknown>;
     const manifest = JSON.parse(await readFile(join(pluginRoot, ".codex-plugin/plugin.json"), "utf8")) as Record<string, unknown>;
     const mcp = JSON.parse(await readFile(join(pluginRoot, ".mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> };
     const skill = await readFile(join(pluginRoot, "skills/istra-project-memory/SKILL.md"), "utf8");
@@ -25,6 +28,18 @@ describe("Codex plugin package", () => {
     const reportingSkill = await readFile(join(pluginRoot, "skills/istra-error-reporting/SKILL.md"), "utf8");
     const reportingMetadata = await readFile(join(pluginRoot, "skills/istra-error-reporting/agents/openai.yaml"), "utf8");
 
+    expect(marketplace).toEqual({
+      name: "istra",
+      interface: { displayName: "Istra" },
+      plugins: [
+        {
+          name: "istra",
+          source: { source: "local", path: "./plugins/istra" },
+          policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
+          category: "Productivity",
+        },
+      ],
+    });
     expect(manifest).toMatchObject({
       name: "istra",
       description: "Durable operational project memory for open-ended work in Codex.",

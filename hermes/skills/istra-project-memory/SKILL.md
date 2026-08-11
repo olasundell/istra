@@ -1,0 +1,77 @@
+---
+name: istra-project-memory
+description: Use Istra as durable operational project memory through its MCP tools. Trigger when an agent starts, resumes or closes work tracked in Istra; resolves a checkout to a project; reads or maintains requirements, queues, blockers or evidence; records command runs and verification; or inspects project history and checkpoints.
+---
+
+# Istra Project Memory
+
+Use Istra as the only durable data path for project memory. Do not read or edit its SQLite database directly, and do not recreate Istra state in files, comments or another tracker.
+
+Hermes exposes Istra MCP tools with the `mcp__istra__` prefix. If those tools are absent, explain that the Istra MCP server must be configured or reloaded; do not substitute similarly named tools from another server.
+
+If Istra's MCP tools, Hermes plugin packaging, bundled instructions or prescribed workflow appears faulty, load `istra:istra-error-reporting` with `skill_view` and follow its bounded reporting policy. Do not use project work items to report Istra faults.
+
+Use `client: "hermes-plugin:istra"` on every mutation, including error reports and automation calls.
+
+## Begin Work
+
+1. Call `mcp__istra__resolve_project` first with the current checkout path.
+2. If exactly one project matches, use it. If none matches, call `mcp__istra__list_projects` with a narrow query before considering a new project. If several projects remain plausible, ask the user; never choose by title or recency alone.
+3. Call `mcp__istra__get_project_pulse_summary` to read the current checkpoint, requirement roll-up, queue head, blockers and evidence warnings.
+4. Call `mcp__istra__list_work_queues`, then call `mcp__istra__list_requirements_page`, `mcp__istra__list_operational_work_items_page`, `mcp__istra__list_external_blockers` and `mcp__istra__list_evidence_page` for the relevant project. Request unresolved blockers and include stale evidence. Follow pagination only as far as the task requires.
+5. Use `mcp__istra__search` or `mcp__istra__list_project_history_page` when prior decisions, discoveries, runs or evidence may affect the task.
+6. Briefly surface the current focus, next action, relevant requirements and acceptance proof, active work, blockers, and failed or stale evidence before substantive work.
+
+Do not block a clearly scoped task on bookkeeping. Resolve and read first, then perform the requested work.
+
+## Maintain Requirements and Work
+
+Use `client: "hermes-plugin:istra"` on every write. When a tool accepts an idempotency key, supply a stable key for the logical write and reuse it only when retrying the identical operation and payload.
+
+- Use `mcp__istra__create_requirement` or `mcp__istra__update_requirement` as the task changes requirement state. Give new requirements stable keys and explicit acceptance criteria; preserve hierarchy and responsible or related phases. Use the latest version for updates.
+- Use `mcp__istra__create_work_item` or `mcp__istra__update_work_item` as the task changes work state. Preserve stable keys, queue placement, parent relationships and requirement links. Maintain dependencies with `mcp__istra__link_work_items`, and create or resolve external blockers when they explain effective blocked state.
+- Link requirements and work with `mcp__istra__link_requirement_work` instead of duplicating the relationship in prose.
+- Record material decisions and discoveries with `mcp__istra__create_update`; do not use journal text as a substitute for structured requirement or work state.
+- Change project lifecycle state or archive entities only when the user explicitly requests it or has already made that decision.
+
+Avoid duplicates. Revise an authored update when correcting it rather than creating a contradictory replacement.
+
+## Automated Queue Work
+
+Automation is an explicit queue policy, not permission to execute arbitrary Istra work. An external runner should:
+
+1. Use `client: "hermes-plugin:istra"` and an operation-scoped idempotency key on every automation mutation; reuse that key only for an identical retry.
+2. Call `mcp__istra__wait_for_queue_changes` with the last opaque cursor, then call `mcp__istra__claim_next_automated_work`; queue events are wake-up hints, never authority to execute stale work. Cursors are project- and queue-scoped: if Istra rejects a stale or mismatched cursor, discard it and restart the wait without one. A timeout has no fabricated event even when the opaque expiry watermark advances.
+3. Treat the returned lease token as a secret capability. Do not print, journal, attach, export or persist it outside the runner's bounded recovery state.
+4. Heartbeat before expiry, append bounded observations with `mcp__istra__record_automation_attempt`, and link existing run or evidence IDs rather than duplicating proof.
+5. Complete through `mcp__istra__complete_automated_work`. If a mutation returns `human_changed_state`, `lease_lost`, `project_paused` or `policy_disabled`, preserve the human state and stop automatic delivery.
+6. Release interrupted work through `mcp__istra__release_automated_work` with the current lease token and reason `runner_shutdown` or `abandoned`. Manual operator release belongs to the local web control surface and is not a runner tool. Never emulate claiming, release or completion through generic `mcp__istra__update_work_item` calls.
+
+`mcp__istra__get_queue_automation_overview` exposes active and recently expired lease summaries without bearer tokens. Istra records structured Git references only. Command execution, prompts, credentials, branches, commits, pushes, pull requests and worktree recovery remain the runner's responsibility.
+
+## Record Runs and Evidence
+
+- Record meaningful verification commands with `mcp__istra__create_run`; do not log routine navigation or every implementation command.
+- Record the command, working directory, timing, exit code, toolchain and test summary accurately. Use `verified` only for a genuinely successful run; use `failed` for a failed command or test and `interrupted` when execution did not finish.
+- Keep stdout and stderr excerpts short and bounded. Omit secrets, credentials, tokens, cookies and private environment values before calling Istra; server-side redaction is a final safety boundary, not permission to submit secrets. Store durable output as referenced artefacts where appropriate.
+- Call `mcp__istra__create_evidence` to link evidence to the exact acceptance criteria and work items, and include the requirement and run when available. Record failed or interrupted proof honestly; do not turn it into verified evidence.
+- Never create evidence overrides.
+- Treat stale evidence as historical context, not current proof. Re-run the relevant verification and attach fresh evidence before marking work proven.
+
+## Close Substantive Work
+
+After work that changed the project:
+
+1. Re-read `mcp__istra__get_project_pulse_summary` and the affected requirements, work items and evidence so concurrent changes are visible.
+2. Bring requirement, work, blocker and evidence state up to date. Record any still-unwritten decision or discovery.
+3. Call atomic `mcp__istra__save_checkpoint` with concise Markdown, the current focus, one concrete next action or `null`, current blockers, the latest `expectedVersion`, and an idempotency key.
+4. Confirm that `mcp__istra__save_checkpoint` returned its snapshot identifier and digest. If either is absent, report that checkpoint closure is incomplete and do not claim an authoritative checkpoint.
+5. Report the Istra records written in the final response.
+
+Do not create a checkpoint for a read-only lookup or a discussion that changed nothing. If work stops after durable partial changes, record interrupted runs and remaining work accurately, then checkpoint the honest partial state.
+
+## Concurrency and Failure
+
+On a stale-version conflict, re-read the affected record, reconcile the concurrent change and retry only when the intended write still applies. Never blindly overwrite newer state or reuse an idempotency key for different input.
+
+If the `istra` MCP server is unavailable, explain that the Hermes MCP integration must be restored. Do not bypass it through REST, direct SQLite access or a second persistence mechanism.

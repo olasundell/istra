@@ -1,10 +1,10 @@
 # Operating Istra
 
-Istra's supported baseline is single-user operation on one machine. SQLite is the zero-configuration default; a Docker Compose PostgreSQL service can provide one shared database for the host-run API, Codex MCP and OpenCode MCP. Neither topology is internet-facing or multi-user: there is no authentication, TLS termination or remote-access security model.
+Istra's supported baseline is single-user operation on one machine. SQLite is the zero-configuration default; a Docker Compose PostgreSQL service can provide one shared database for the host-run API and the Codex, Claude Code, Hermes and OpenCode MCP clients. Neither topology is internet-facing or multi-user: there is no authentication, TLS termination or remote-access security model.
 
 ## Choose one data boundary
 
-Every active Istra runtime must select the same backend. Native SQLite works when the API and plugins share the platform data directory. PostgreSQL works when all three use the same shared configuration or matching environment override.
+Every active Istra runtime must select the same backend. Native SQLite works when the API and plugins share the platform data directory. PostgreSQL works when every runtime uses the same shared configuration or matching environment override.
 
 The `istra` Compose service connects to the same Compose PostgreSQL service over the private network. Do not start it during a host-side migration into that database. Do not bind-mount the macOS SQLite database into Docker while host processes also use it; SQLite locks and Istra's PID-based backup lock are not designed to coordinate across the Docker VM and host PID namespaces. Do not scale the Compose application service beyond one replica.
 
@@ -67,7 +67,7 @@ Explicit runtime options take precedence over environment variables, which take 
 
 ## Migrate local SQLite to PostgreSQL
 
-Build and verify the PostgreSQL-capable runtime before the maintenance window. Then update the SQLite-backed Istra requirement and work item that track the cutover. Stop every writer before copying: the native API/watch process, Codex MCP children, OpenCode MCP children and any `istra` application container.
+Build and verify the PostgreSQL-capable runtime before the maintenance window. Then update the SQLite-backed Istra requirement and work item that track the cutover. Stop every writer before copying: the native API/watch process, Codex, Claude Code, Hermes and OpenCode MCP children, and any `istra` application container.
 
 ```bash
 docker compose stop istra
@@ -89,7 +89,7 @@ pnpm storage:status
 
 The migration refuses a non-empty PostgreSQL target, takes a pre-cutover SQLite snapshot, copies the portable state transactionally, verifies canonical tables, entity counts, checkpoint digests and representative filtered searches, and only then writes the shared PostgreSQL selection. If copy or verification fails, imported target rows are cleared and the shared selection remains SQLite. Never print `config.json`; it contains the connection URL.
 
-Rebuild and reinstall the self-contained Codex and OpenCode packages, then restart the host API and every MCP runtime. Verify `GET /api/v1/storage` and MCP `get_storage_status` report PostgreSQL. Re-run `lsof` on the SQLite file after each client restarts; any owner means the cutover is incomplete. A Codex plugin installed on disk may still require a new or reloaded task before the live tool registry changes.
+Rebuild the self-contained runtime, refresh every installed client package, then restart the host API and every MCP runtime. Verify `GET /api/v1/storage` and MCP `get_storage_status` report PostgreSQL from each client. Re-run `lsof` on the SQLite file after each client restarts; any owner means the cutover is incomplete. A client plugin installed on disk may still require a new or reloaded session before its live tool registry changes.
 
 Keep the closed SQLite database and its backups unchanged as rollback artefacts. To roll back, atomically select SQLite in the shared configuration, restart the API and every MCP runtime, verify storage status from each client, and confirm PostgreSQL has no remaining writers. Never run SQLite and PostgreSQL as dual writers.
 
@@ -118,7 +118,7 @@ pnpm deploy:production -- \
 
 The dry run reads and validates the pinned environment, validates the supplied values, and prints only credential-free targets. It does not run external commands, connect to a database, write files, build an image or change a runtime. Review the generated trial database name and order before opening the maintenance window.
 
-Run apply mode from a normal terminal, not from an active Codex or OpenCode task. Stop native Istra API processes and close Codex/OpenCode tasks that may own PostgreSQL pools; the script stops the Compose application itself and then refuses to continue if any connection remains:
+Run apply mode from a normal terminal, not from an active Istra client session. Stop native Istra API processes and close Codex, Claude Code, Hermes and OpenCode sessions that may own PostgreSQL pools; the script stops the Compose application itself and then refuses to continue if any connection remains:
 
 ```bash
 pnpm deploy:production -- \
@@ -140,7 +140,7 @@ Apply mode performs these gates in order:
 
 The script never includes a password or database URL in its progress/error output or Docker command arguments. Secrets are passed through bounded child-process environments. A deployment lock under the backup directory prevents concurrent runs. If a process is killed so abruptly that the lock remains, first prove that no deployment process or generated trial database is still active, then remove only that exact `.istra-deploy.lock` directory.
 
-After success, restart OpenCode and start a new Codex task. Installed files cannot update the MCP registry of an already-running task. Keep the reported PostgreSQL backup, SHA-256 sidecar, rollback image, previous Codex source directory and previous OpenCode loader until the deployment has been used successfully.
+After success, restart OpenCode and start a new Codex task. The deployment command refreshes those two packaged clients only; update Claude Code and Hermes separately before reconnecting either one to a migrated schema. Installed files cannot update the MCP registry of an already-running session. Keep the reported PostgreSQL backup, SHA-256 sidecar, rollback image, previous Codex source directory and previous OpenCode loader until the deployment has been used successfully.
 
 ### Failure boundaries and rollback
 
@@ -150,7 +150,7 @@ If a failure occurs after the application stop is attempted but before the produ
 
 Once the production migration is attempted, an older image alone is **never** an automatic or assumed-valid rollback: the migration may have committed before its process reported failure, and older binaries reject newer migration history. A migration or post-migration failure deliberately leaves the service stopped unless the new runtime was already verified. Inspect the schema and backup before taking any recovery action. Do not retag `istra:rollback-<deployment-id>` over `istra:local` and start it against that database.
 
-For a post-migration database rollback, preserve the failed migrated database. Restore the reported custom-format backup into a new, explicitly named non-default database, never over the existing production database. Use PostgreSQL's `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE` environment variables so credentials do not appear in command arguments; create the new database, restore with `pg_restore --exit-on-error --single-transaction --no-owner --no-acl`, and run the previous runtime's storage check against it. Only after that duplicate reports the old expected schema and project count should you change both host and Compose URLs in the ignored `.env`, retag the reported rollback image as `istra:local`, and recreate the application. Recheck `/api/v1/storage`, Codex and OpenCode before allowing writes. Keep both the migrated database and backup until the rollback is independently verified.
+For a post-migration database rollback, preserve the failed migrated database. Restore the reported custom-format backup into a new, explicitly named non-default database, never over the existing production database. Use PostgreSQL's `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE` environment variables so credentials do not appear in command arguments; create the new database, restore with `pg_restore --exit-on-error --single-transaction --no-owner --no-acl`, and run the previous runtime's storage check against it. Only after that duplicate reports the old expected schema and project count should you change both host and Compose URLs in the ignored `.env`, retag the reported rollback image as `istra:local`, and recreate the application. Recheck `/api/v1/storage` and every installed MCP client before allowing writes. Keep both the migrated database and backup until the rollback is independently verified.
 
 To roll back only a packaged client after a successful database/runtime deployment, stop that client first. The Codex source retained at `~/plugins/istra.previous.<deployment-id>` can be moved back to the configured marketplace source and reinstalled with `codex plugin add istra@personal --json`. The OpenCode loader retained as `~/.config/opencode/plugins/istra.js.previous.<deployment-id>` can be copied back over the active loader. Restart the client and verify `get_storage_status`; do not point an older client at a schema it does not support.
 
