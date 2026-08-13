@@ -15,7 +15,11 @@
     "skills",
     ".claude-plugin",
     ".codex-plugin",
+    ".cursor-plugin",
     ".mcp.json",
+    "mcp.json",
+    "rules",
+    "commands",
     "README.md"
   ],
   "engines": {

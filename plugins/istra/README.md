@@ -1,6 +1,6 @@
 # Istra agent plugins
 
-This package adds durable, local-first operational project memory to Codex, Claude Code, Hermes Agent and OpenCode. Every client starts the same self-contained Node.js MCP server against the database used by the Istra web application, then applies the requirements, work-queue, run, evidence and checkpoint workflow appropriate to its host.
+This package adds durable, local-first operational project memory to Codex, Claude Code, Cursor, Hermes Agent and OpenCode. Every client starts the same self-contained Node.js MCP server against the database used by the Istra web application, then applies the requirements, work-queue, run, evidence and checkpoint workflow appropriate to its host.
 
 The bundle requires Node.js 24 or newer because its MCP runtime uses `node:sqlite`. Set `ISTRA_DATA_DIR` to share a non-default Istra data directory.
 
@@ -21,7 +21,18 @@ Claude Code caches marketplace plugins by the manifest version, which must be bu
 
 ## Codex
 
-The Codex manifest loads the shared `.mcp.json`, the same two skills, and the bundled MCP runtime. Add the repository or local checkout as a Codex marketplace, then install `istra` from the marketplace name reported by Codex. Codex writes use `client: "codex-plugin:istra"`; Claude Code writes use `client: "claude-plugin:istra"`.
+The Codex manifest loads the shared `.mcp.json`, the same two skills, and the bundled MCP runtime. Add the repository or local checkout as a Codex marketplace, then install `istra` from the marketplace name reported by Codex. Codex writes use `client: "codex-plugin:istra"`; Claude Code writes use `client: "claude-plugin:istra"`; Cursor writes use `client: "cursor-plugin:istra"`.
+
+## Cursor
+
+Copy this package into Cursor’s local plugin directory (Cursor rejects a symlink whose target is outside `~/.cursor/plugins/local`), then reload the window:
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+rsync -a --delete /absolute/path/to/istra/plugins/istra/ ~/.cursor/plugins/local/istra/
+```
+
+The Cursor manifest registers `mcp.json`, `skills/`, `rules/` and `commands/` from this directory. Cursor expands `${PLUGIN_ROOT}` in the MCP configuration and starts `dist/mcp/stdio.mjs` from the installed plugin directory. Cursor exposes `/istra-pulse`, `/istra-checkpoint` and `/istra-report-fault`. The repository-root `.cursor-plugin/marketplace.json` is ready for a later marketplace submission.
 
 ## Hermes Agent
 

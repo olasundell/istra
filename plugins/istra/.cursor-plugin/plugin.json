@@ -1,0 +1,31 @@
+{
+  "name": "istra",
+  "displayName": "Istra",
+  "version": "0.1.0",
+  "description": "Durable operational project memory for open-ended work in Cursor.",
+  "author": {
+    "name": "Istra contributors"
+  },
+  "homepage": "https://github.com/olasundell/istra#readme",
+  "repository": "https://github.com/olasundell/istra",
+  "license": "MIT",
+  "keywords": [
+    "project-memory",
+    "checkpoints",
+    "requirements",
+    "evidence",
+    "error-reporting",
+    "local-first"
+  ],
+  "category": "developer-tools",
+  "tags": [
+    "project-memory",
+    "continuity",
+    "verification",
+    "local-first"
+  ],
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "rules": "./rules/",
+  "mcpServers": "./mcp.json"
+}

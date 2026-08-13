@@ -56,6 +56,7 @@ describe("Codex plugin package", () => {
     expect(mcp.mcpServers).toHaveProperty("istra");
     expect(skill).toContain('client: "codex-plugin:istra"');
     expect(skill).toContain('client: "claude-plugin:istra"');
+    expect(skill).toContain('client: "cursor-plugin:istra"');
     expect(agentMetadata).toMatch(/requirements, work and evidence/i);
     expect(reportingMetadata).toMatch(/allow_implicit_invocation: true/);
     expect(reportingSkill).toMatch(/report concrete or strongly suspected faults/i);

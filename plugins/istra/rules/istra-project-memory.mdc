@@ -1,0 +1,12 @@
+---
+description: Use Istra MCP as the only durable project-memory path in Cursor.
+alwaysApply: true
+---
+
+Istra is the only durable project-memory path. Do not bypass its MCP tools through REST, direct SQLite access, or a second tracker.
+
+Use `client: "cursor-plugin:istra"` on every write, including error reports and automation calls.
+
+Follow `istra-project-memory` for resolve → pulse → work → evidence → checkpoint. Follow `istra-error-reporting` for Istra MCP, plugin, instruction, or workflow faults only.
+
+Do not block a clearly scoped task on bookkeeping.

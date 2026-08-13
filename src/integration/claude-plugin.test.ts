@@ -54,9 +54,10 @@ describe("Claude Code plugin package", () => {
 
     expect(projectMemory).toContain('client: "codex-plugin:istra"');
     expect(projectMemory).toContain('client: "claude-plugin:istra"');
+    expect(projectMemory).toContain('client: "cursor-plugin:istra"');
     expect(projectMemory).toContain("Call `resolve_project` first with the current checkout path.");
     expect(projectMemory).toContain("Confirm that `save_checkpoint` returned its snapshot identifier and digest.");
-    expect(errorReporting).toMatch(/Codex, Claude Code or OpenCode plugins/);
+    expect(errorReporting).toMatch(/Codex, Claude Code, Cursor or OpenCode plugins/);
     expect(errorReporting).toContain('client: "claude-plugin:istra"');
     expect(errorReporting).toContain("Never report a `report_error` failure");
   });
