@@ -187,11 +187,11 @@ Do not spawn a Cursor UI. Expand Cursor's documented `${PLUGIN_ROOT}` token agai
 3. Shared skill identity / description updates.
 4. `package.json` `files`, README sections, `test:plugin` wiring.
 5. Cursor plugin contract test; update host-list assertions in existing tests.
-6. Local copy smoke-check (manual): Customize shows the plugin, MCP server, rule, skills, and commands.
+6. Optional manual follow-up: copy the plugin into Cursor and confirm Customize shows the MCP server, rule, skills, and commands.
 
 ## Success criteria
 
 - `pnpm test:plugin` passes, including the new Cursor contract.
-- A local copied install exposes Istra MCP tools plus `/istra-pulse`, `/istra-checkpoint`, and `/istra-report-fault`.
-- A Cursor write recorded in Istra carries `client: "cursor-plugin:istra"`.
+- The copied-bundle integration test starts the packaged MCP server outside the checkout and exposes the expected Istra tools.
+- Packaged skills, rules and commands require Cursor writes to carry `client: "cursor-plugin:istra"`.
 - Claude Code, Codex, Hermes and OpenCode packaging tests still pass without `.mcp.json` changes.
