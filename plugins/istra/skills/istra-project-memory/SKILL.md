@@ -9,7 +9,7 @@ Use Istra as the only durable data path for project memory. Do not read or edit 
 
 If Istra’s MCP tools, plugin packaging, bundled instructions or prescribed workflow appears faulty, invoke the `istra-error-reporting` skill and follow its bounded reporting policy. Do not use project work items to report Istra faults.
 
-Select the MCP client identity from the current host before any write: use `client: "codex-plugin:istra"` in Codex and `client: "claude-plugin:istra"` in Claude Code. Apply the selected identity to every mutation, including error reports and automation calls.
+Select the MCP client identity from the current host before any write: use `client: "codex-plugin:istra"` in Codex, `client: "claude-plugin:istra"` in Claude Code, and `client: "cursor-plugin:istra"` in Cursor. Apply the selected identity to every mutation, including error reports and automation calls.
 
 ## Begin Work
 

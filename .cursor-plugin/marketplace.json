@@ -1,0 +1,16 @@
+{
+  "name": "istra",
+  "owner": {
+    "name": "Istra contributors"
+  },
+  "metadata": {
+    "description": "Installable Istra project-memory plugins for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "istra",
+      "source": "./plugins/istra",
+      "description": "Durable operational project memory for Cursor."
+    }
+  ]
+}

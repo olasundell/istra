@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "istra": {
+      "command": "node",
+      "args": ["${PLUGIN_ROOT}/dist/mcp/stdio.mjs"],
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
+}

@@ -26,7 +26,7 @@ Most tools capture tasks. Istra captures continuity.
 - **Searchable by default** — Find a project, phase, work item or remembered decision without reconstructing the story.
 - **Opt-in agent queueing** — Let external runners claim bounded work with leases, heartbeats and attempts while Istra keeps command execution and credentials outside the product.
 - **Local and calm** — Zero-configuration SQLite or local PostgreSQL, loopback-only HTTP and portable exports; no accounts, remote sync or collaboration layer required.
-- **Agent-ready** — Use the same application service from the web UI, MCP, Codex, Claude Code, Hermes Agent and OpenCode.
+- **Agent-ready** — Use the same application service from the web UI, MCP, Codex, Claude Code, Cursor, Hermes Agent and OpenCode.
 
 Istra is designed for the moment after the meeting, the interrupted investigation or the half-finished build: the important thing is not only what exists, but why it exists, what was proved, and what should happen next.
 
@@ -137,7 +137,7 @@ Build the self-contained plugin runtime with:
 pnpm build:plugin
 ```
 
-The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Codex and Claude Code share a host-aware `.mcp.json` bootstrap; Hermes and OpenCode point at the same bundled server through host-specific configuration. All packaged clients read the same platform-local storage configuration and environment overrides as the web application, so no plugin creates a second data path.
+The resulting `plugins/istra/dist/mcp/stdio.mjs` needs Node.js 24 or newer at runtime, but does not depend on this checkout's `node_modules`. Codex and Claude Code share a host-aware `.mcp.json` bootstrap; Cursor uses a sibling `mcp.json` with Cursor's `${PLUGIN_ROOT}` substitution; Hermes and OpenCode point at the same bundled server through host-specific configuration. All packaged clients read the same platform-local storage configuration and environment overrides as the web application, so no plugin creates a second data path.
 
 Add this repository as a Codex marketplace and install the plugin:
 
@@ -166,7 +166,22 @@ claude plugin install istra@istra --scope user
 
 Claude Code exposes the skills as `/istra:istra-project-memory` and `/istra:istra-error-reporting`. The plugin MCP configuration resolves the cached runtime through `${CLAUDE_PLUGIN_ROOT}`, so installed versions never depend on the source checkout. Run `/reload-plugins` in an existing Claude Code session after an install or update; new sessions load it automatically.
 
-Claude Code caches marketplace plugins by the manifest version. Bump `plugins/istra/.claude-plugin/plugin.json` for every published Claude Code plugin update. Host manifests are versioned independently, so a Claude Code or Hermes bump does not imply a Codex or npm package release.
+Claude Code caches marketplace plugins by the manifest version. Bump `plugins/istra/.claude-plugin/plugin.json` for every published Claude Code plugin update. Host manifests are versioned independently, so a Claude Code or Hermes bump does not imply a Codex, Cursor or npm package release.
+
+## Cursor plugin
+
+The same `plugins/istra` bundle is a Cursor plugin: it loads the bundled stdio MCP server, the shared operational-memory and error-reporting skills, an always-on project-memory rule, and slash commands. Cursor writes use `client: "cursor-plugin:istra"`.
+
+For local development, copy the plugin directory (Cursor rejects a symlink whose target is outside `~/.cursor/plugins/local`) and reload the window:
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+rsync -a --delete /absolute/path/to/istra/plugins/istra/ ~/.cursor/plugins/local/istra/
+```
+
+Then run **Developer: Reload Window**. Cursor exposes `/istra-pulse`, `/istra-checkpoint` and `/istra-report-fault`. Cursor expands `${PLUGIN_ROOT}` in `mcp.json` to the installed plugin directory, so a copied or marketplace install does not depend on the source checkout.
+
+The repository-root `.cursor-plugin/marketplace.json` is ready for a later Cursor Marketplace submission. Bump `plugins/istra/.cursor-plugin/plugin.json` independently of other host manifests.
 
 ## Hermes Agent plugin
 
@@ -219,7 +234,7 @@ pnpm typecheck      # browser and server TypeScript checks
 pnpm test           # unit and integration tests
 pnpm test:postgres  # live PostgreSQL suite (requires TEST_DATABASE_URL)
 pnpm check          # typecheck, tests and all production builds
-pnpm test:plugin    # verify the packaged Codex, Claude Code, Hermes and OpenCode plugins
+pnpm test:plugin    # verify the packaged Codex, Claude Code, Cursor, Hermes and OpenCode plugins
 pnpm test:e2e       # Playwright browser journeys
 pnpm test:deploy    # guarded deployment contract tests (no live database)
 pnpm deploy:production -- --help # trial-first PostgreSQL deploy and rollback usage
