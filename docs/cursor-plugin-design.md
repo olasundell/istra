@@ -170,7 +170,7 @@ The contract test asserts:
 
 Extend existing Claude / package tests that pin the error-reporting host list so they accept Cursor in that sentence.
 
-Do not spawn a Cursor UI. Launch the copied Cursor bundle directly with `CURSOR_PLUGIN_ROOT` to prove that its own `mcp.json` resolves the isolated runtime and exposes the expected tools.
+Do not spawn a Cursor UI. Expand Cursor's documented `${PLUGIN_ROOT}` token against an isolated copied bundle, launch its own `mcp.json`, and prove that the runtime exposes the expected tools.
 
 ## Error handling and provenance
 
@@ -187,11 +187,11 @@ Do not spawn a Cursor UI. Launch the copied Cursor bundle directly with `CURSOR_
 3. Shared skill identity / description updates.
 4. `package.json` `files`, README sections, `test:plugin` wiring.
 5. Cursor plugin contract test; update host-list assertions in existing tests.
-6. Local symlink smoke-check (manual): Customize shows the plugin, MCP server, rule, skills, and commands.
+6. Local copy smoke-check (manual): Customize shows the plugin, MCP server, rule, skills, and commands.
 
 ## Success criteria
 
 - `pnpm test:plugin` passes, including the new Cursor contract.
-- A local symlink install exposes Istra MCP tools plus `/istra-pulse`, `/istra-checkpoint`, and `/istra-report-fault`.
+- A local copied install exposes Istra MCP tools plus `/istra-pulse`, `/istra-checkpoint`, and `/istra-report-fault`.
 - A Cursor write recorded in Istra carries `client: "cursor-plugin:istra"`.
 - Claude Code, Codex, Hermes and OpenCode packaging tests still pass without `.mcp.json` changes.
