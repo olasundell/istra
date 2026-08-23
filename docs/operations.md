@@ -55,6 +55,7 @@ If the configured host port is already used by a native Istra server, choose ano
 | `ISTRA_DATABASE_URL` | none | Host PostgreSQL connection URL; implies PostgreSQL when set. |
 | `ISTRA_COMPOSE_DATABASE_URL` | derived from Compose PostgreSQL variables | Container-only PostgreSQL URL using `postgres:5432`. |
 | `ISTRA_POSTGRES_POOL_MAX` | `4` | Maximum connections in each Istra runtime's PostgreSQL pool. |
+| `ISTRA_READINESS_FAILURE_EXIT_THRESHOLD` | `0` natively, `5` in Compose | Exit after this many consecutive database-readiness failures so the container restart policy can replace the process. `0` disables fail-fast recovery. |
 | `ISTRA_CONFIG_PATH` | `<data-dir>/config.json` | Optional path to the shared storage selection. |
 | `PORT` | `4317` | HTTP port inside the process. |
 | `ISTRA_HOST` | `127.0.0.1` natively, `0.0.0.0` in the image | Listen address. Only the container should need `0.0.0.0`. |
@@ -175,7 +176,9 @@ Use the Data management import for a portable JSON restore. A full SQLite snapsh
 - `GET /api/v1/health` is process liveness.
 - `GET /api/v1/ready` verifies the selected storage backend can answer a database query.
 - `GET /api/v1/storage` reports the backend, redacted target, schema version, readiness and backup capability.
-- Compose health checks use readiness.
+- Compose health checks use readiness. PostgreSQL connections enable TCP keepalive after ten idle seconds, queries have client and server deadlines, and pooled connections rotate after five minutes. A readiness query has a two-second client deadline.
+- The Compose runtime runs a single internal database probe every ten seconds and exits after five consecutive failures. Public requests to `/api/v1/ready` do not contribute to this counter. Exiting lets `restart: unless-stopped` replace the application process and its PostgreSQL pool; Docker health status alone does not restart a running container. Native runtimes leave this watchdog disabled by default.
+- The internal watchdog covers repeated database-readiness failures while the Node.js event loop is running. It is not an out-of-process supervisor for a blocked event loop; Docker Compose by itself cannot restart a merely unhealthy container in that case.
 - `docker compose stop` sends `SIGTERM`; Istra stops accepting traffic, closes Fastify and its database connections, and fails the shutdown after ten seconds rather than hanging indefinitely.
 
 SQLite runs with foreign keys, WAL, a five-second busy timeout and `synchronous=FULL`. This favours durable project memory over maximum write throughput.

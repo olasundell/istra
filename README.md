@@ -85,7 +85,7 @@ The `istra` Compose service uses the Compose PostgreSQL service and waits for it
 docker compose up --build --detach --wait istra
 ```
 
-Open `http://127.0.0.1:4317`. The application container runs as a non-root user, publishes only on host loopback, and connects to PostgreSQL over the private Compose network at `postgres:5432`.
+Open `http://127.0.0.1:4317`. The application container runs as a non-root user, publishes only on host loopback, and connects to PostgreSQL over the private Compose network at `postgres:5432`. PostgreSQL sockets use TCP keepalive, bounded client/server query deadlines and five-minute connection rotation. A single internal ten-second probe exits and restarts the Compose application after five consecutive database-readiness failures, discarding a poisoned connection pool. Public readiness requests do not affect that counter. Docker Compose alone still cannot restart a merely unhealthy container if the Node.js event loop itself is blocked.
 
 Do not start the application during a host-side migration into the same PostgreSQL database. The unauthenticated API and database ports must not be exposed to a LAN or the internet.
 

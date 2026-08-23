@@ -33,6 +33,7 @@ services:
       ISTRA_STORAGE: postgresql
       ISTRA_DATABASE_URL: ${ISTRA_COMPOSE_DATABASE_URL:-postgresql://${POSTGRES_USER:-istra}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-istra}}
       ISTRA_POSTGRES_POOL_MAX: "${ISTRA_POSTGRES_POOL_MAX:-4}"
+      ISTRA_READINESS_FAILURE_EXIT_THRESHOLD: "${ISTRA_READINESS_FAILURE_EXIT_THRESHOLD:-5}"
       ISTRA_DATA_DIR: /var/lib/istra
       ISTRA_BACKUP_DIR: /var/backups/istra
       ISTRA_STATIC_DIR: /app/dist-web
@@ -58,7 +59,7 @@ services:
         - -e
         - fetch('http://127.0.0.1:4317/api/v1/ready').then(response=>{if(!response.ok)process.exit(1)}).catch(()=>process.exit(1))
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 5
       start_period: 10s
     stop_grace_period: 15s

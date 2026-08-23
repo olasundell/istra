@@ -11,5 +11,7 @@ describe('Docker Compose storage contract', () => {
     expect(istraService).toContain('ISTRA_COMPOSE_DATABASE_URL')
     expect(istraService).toContain('@postgres:5432/')
     expect(istraService).toMatch(/depends_on:\n\s+postgres:\n\s+condition: service_healthy/)
+    expect(istraService).toContain('ISTRA_READINESS_FAILURE_EXIT_THRESHOLD: "${ISTRA_READINESS_FAILURE_EXIT_THRESHOLD:-5}"')
+    expect(istraService).toMatch(/healthcheck:[\s\S]+timeout: 5s/)
   })
 })

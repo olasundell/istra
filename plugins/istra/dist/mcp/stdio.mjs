@@ -16335,6 +16335,84 @@ const postgresMigrations = [{
 }];
 const latestPostgresSchemaVersion = postgresMigrations.at(-1)?.version ?? 0;
 const migrationLockId = "5283936332345650";
+const defaultConnectionTimeoutMillis = 2e3;
+const defaultIdleTimeoutMillis = 3e4;
+const defaultKeepAliveInitialDelayMillis = 1e4;
+const defaultMaxLifetimeSeconds = 300;
+const defaultReadinessTimeoutMillis = 2e3;
+const defaultStatementTimeoutMillis = 3e4;
+const protectedConnectionParameters = /* @__PURE__ */ new Set([
+  "application_name",
+  "connectionTimeoutMillis",
+  "idle_in_transaction_session_timeout",
+  "keepAlive",
+  "keepAliveInitialDelayMillis",
+  "query_timeout",
+  "statement_timeout"
+]);
+const protectedStartupOptionNames = [
+  "application_name",
+  "idle_in_transaction_session_timeout",
+  "statement_timeout"
+];
+function errorCode(error) {
+  if (!error || typeof error !== "object" || !("code" in error)) return void 0;
+  return typeof error.code === "string" ? error.code : void 0;
+}
+function isPostgresConnectionFailure(error) {
+  if (error instanceof AggregateError) return error.errors.some(isPostgresConnectionFailure);
+  const code2 = errorCode(error);
+  if (code2?.startsWith("08")) return true;
+  if (code2 && ["57P01", "57P02", "57P03", "ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "ENETDOWN", "ENETUNREACH", "EHOSTUNREACH"].includes(code2)) return true;
+  if (!(error instanceof Error)) return false;
+  return error.message === "Query read timeout" || /connection (?:terminated|closed|ended) unexpectedly/i.test(error.message) || /server closed the connection unexpectedly/i.test(error.message);
+}
+function aggregateRollbackFailure(error, rollbackError) {
+  return new AggregateError([error, rollbackError], "PostgreSQL operation failed and its rollback did not complete");
+}
+function postgresPoolConfig(options) {
+  const parsed = parsePostgresUrl(options.connectionString);
+  const conflictingParameters = [...parsed.searchParams.keys()].filter((parameter) => protectedConnectionParameters.has(parameter));
+  const startupOptions = parsed.searchParams.get("options")?.toLowerCase();
+  if (startupOptions && protectedStartupOptionNames.some((parameter) => startupOptions.includes(parameter))) {
+    conflictingParameters.push("options");
+  }
+  if (conflictingParameters.length > 0) {
+    throw new Error(`ISTRA_DATABASE_URL must not override managed PostgreSQL parameters: ${conflictingParameters.join(", ")}`);
+  }
+  const statementTimeoutMillis = options.statementTimeoutMillis ?? defaultStatementTimeoutMillis;
+  return {
+    connectionString: options.connectionString,
+    max: options.max ?? 4,
+    idleTimeoutMillis: options.idleTimeoutMillis ?? defaultIdleTimeoutMillis,
+    connectionTimeoutMillis: options.connectionTimeoutMillis ?? defaultConnectionTimeoutMillis,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: options.keepAliveInitialDelayMillis ?? defaultKeepAliveInitialDelayMillis,
+    maxLifetimeSeconds: options.maxLifetimeSeconds ?? defaultMaxLifetimeSeconds,
+    statement_timeout: statementTimeoutMillis,
+    query_timeout: options.queryTimeoutMillis ?? statementTimeoutMillis + 5e3,
+    idle_in_transaction_session_timeout: options.idleInTransactionSessionTimeoutMillis ?? statementTimeoutMillis,
+    application_name: options.applicationName ?? "istra",
+    ssl: options.ssl
+  };
+}
+function poolDiagnostics(pool) {
+  return {
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount
+  };
+}
+function reportPoolError(error, diagnostics) {
+  const code2 = errorCode(error);
+  process.stderr.write(`${JSON.stringify({
+    level: "warn",
+    message: "PostgreSQL idle pool client failed and was evicted",
+    ...code2 ? { code: code2 } : {},
+    pool: diagnostics
+  })}
+`);
+}
 function parsePostgresUrl(connectionString) {
   let parsed;
   try {
@@ -16380,7 +16458,12 @@ class PostgresExecutor {
     if (!transaction) return this.pool.query(text2, [...values]);
     const result2 = transaction.queryTail.then(() => transaction.client.query(text2, [...values]));
     transaction.queryTail = result2.then(() => void 0, () => void 0);
-    return result2;
+    try {
+      return await result2;
+    } catch (error) {
+      if (isPostgresConnectionFailure(error)) transaction.destroyClient = true;
+      throw error;
+    }
   }
   async many(text2, values = []) {
     return (await this.query(text2, values)).rows;
@@ -16400,13 +16483,24 @@ class PostgresExecutor {
     return result2.rowCount ?? result2.rows.length;
   }
   async withConnection(work) {
-    const active = this.transactions.getStore()?.client;
-    if (active) return work(active);
+    const transaction = this.transactions.getStore();
+    if (transaction) {
+      try {
+        return await work(transaction.client);
+      } catch (error) {
+        if (isPostgresConnectionFailure(error)) transaction.destroyClient = true;
+        throw error;
+      }
+    }
     const client2 = await this.pool.connect();
+    let destroyClient = false;
     try {
       return await work(client2);
+    } catch (error) {
+      destroyClient = isPostgresConnectionFailure(error);
+      throw error;
     } finally {
-      client2.release();
+      client2.release(destroyClient);
     }
   }
   async transaction(work, options = {}) {
@@ -16419,26 +16513,42 @@ class PostgresExecutor {
         await this.query(`RELEASE SAVEPOINT ${savepoint}`);
         return result2;
       } catch (error) {
-        await this.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        await this.query(`RELEASE SAVEPOINT ${savepoint}`);
+        if (active.destroyClient) throw error;
+        try {
+          await this.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+          await this.query(`RELEASE SAVEPOINT ${savepoint}`);
+        } catch (rollbackError) {
+          active.destroyClient = true;
+          throw aggregateRollbackFailure(error, rollbackError);
+        }
         throw error;
       }
     }
     const client2 = await this.pool.connect();
+    const state = { client: client2, nextSavepoint: 0, queryTail: Promise.resolve(), destroyClient: false };
     try {
       await client2.query(beginStatement(options));
-      return await this.transactions.run({ client: client2, nextSavepoint: 0, queryTail: Promise.resolve() }, async () => {
+      return await this.transactions.run(state, async () => {
         try {
           const result2 = await work(this);
           await this.query("COMMIT");
           return result2;
         } catch (error) {
-          await this.query("ROLLBACK");
+          if (state.destroyClient) throw error;
+          try {
+            await this.query("ROLLBACK");
+          } catch (rollbackError) {
+            state.destroyClient = true;
+            throw aggregateRollbackFailure(error, rollbackError);
+          }
           throw error;
         }
       });
+    } catch (error) {
+      if (isPostgresConnectionFailure(error)) state.destroyClient = true;
+      throw error;
     } finally {
-      client2.release();
+      client2.release(state.destroyClient);
     }
   }
 }
@@ -16474,26 +16584,37 @@ async function migratePostgres(executor) {
       await client2.query("COMMIT");
       return latestPostgresSchemaVersion;
     } catch (error) {
-      await client2.query("ROLLBACK");
+      if (isPostgresConnectionFailure(error)) throw error;
+      try {
+        await client2.query("ROLLBACK");
+      } catch (rollbackError) {
+        throw aggregateRollbackFailure(error, rollbackError);
+      }
       throw error;
     }
   });
 }
 class PostgresDatabase {
-  constructor(pool, target) {
+  constructor(pool, target, readinessTimeoutMillis = defaultReadinessTimeoutMillis) {
     this.pool = pool;
+    this.readinessTimeoutMillis = readinessTimeoutMillis;
     this.executor = new PostgresExecutor(pool);
     this.target = target;
   }
   pool;
+  readinessTimeoutMillis;
   executor;
   target;
   closed = false;
   async healthCheck() {
     try {
-      const row = await this.executor.one(
-        "SELECT COALESCE(MAX(version),0)::integer AS version FROM schema_migrations"
-      );
+      const query2 = {
+        text: "SELECT COALESCE(MAX(version),0)::integer AS version FROM schema_migrations",
+        query_timeout: this.readinessTimeoutMillis
+      };
+      const result2 = await this.pool.query(query2);
+      const row = result2.rows[0];
+      if (!row || result2.rows.length !== 1) throw new Error("Expected exactly one PostgreSQL schema version row");
       return { ready: true, schemaVersion: Number(row.version) };
     } catch {
       return { ready: false, schemaVersion: 0 };
@@ -16512,18 +16633,13 @@ class PostgresDatabase {
   }
 }
 async function openPostgresDatabase(options) {
-  parsePostgresUrl(options.connectionString);
-  const pool = new Pool({
-    connectionString: options.connectionString,
-    max: options.max ?? 4,
-    idleTimeoutMillis: options.idleTimeoutMillis ?? 3e4,
-    connectionTimeoutMillis: options.connectionTimeoutMillis ?? 5e3,
-    statement_timeout: options.statementTimeoutMillis ?? 3e4,
-    application_name: options.applicationName ?? "istra",
-    ssl: options.ssl
-  });
-  pool.on("error", () => void 0);
-  const database = new PostgresDatabase(pool, redactPostgresTarget(options.connectionString));
+  const pool = new Pool(postgresPoolConfig(options));
+  pool.on("error", (error) => (options.onPoolError ?? reportPoolError)(error, poolDiagnostics(pool)));
+  const database = new PostgresDatabase(
+    pool,
+    redactPostgresTarget(options.connectionString),
+    options.readinessTimeoutMillis ?? defaultReadinessTimeoutMillis
+  );
   try {
     if (options.migrate !== false) await migratePostgres(database.executor);
     return database;

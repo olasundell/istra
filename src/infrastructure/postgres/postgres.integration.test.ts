@@ -177,6 +177,27 @@ describe.skipIf(!testDatabaseUrl)('PostgreSQL storage integration', () => {
       .rejects.toThrow(/already exists/i)
   }, 30_000)
 
+  it('evicts a timed-out client and recovers through a fresh connection', async () => {
+    const { schema } = harness!
+    const database = await openPostgresDatabase({
+      connectionString: schemaConnectionString(testDatabaseUrl!, schema),
+      max: 1,
+      migrate: false,
+      queryTimeoutMillis: 100,
+      statementTimeoutMillis: 10_000,
+      applicationName: 'istra-postgres-timeout-recovery',
+    })
+    try {
+      await expect(database.executor.query('SELECT pg_sleep(10)')).rejects.toThrow('Query read timeout')
+      expect(database.pool.totalCount).toBe(0)
+      await expect(database.executor.one<{ value: number }>('SELECT 1::integer AS value'))
+        .resolves.toEqual({ value: 1 })
+      expect(database.pool.totalCount).toBe(1)
+    } finally {
+      await database.close()
+    }
+  }, 30_000)
+
   it('keeps projects, operational memory, checkpoints and search in parity', async () => {
     const { repository, operational } = harness!
     const project = await repository.createProject({

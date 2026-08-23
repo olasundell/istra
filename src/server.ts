@@ -2,12 +2,25 @@ import { stat } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { buildHttpApp } from './adapters/http/app.js'
 import { createRuntime } from './infrastructure/runtime.js'
+import { createReadinessWatchdog } from './infrastructure/readiness-watchdog.js'
 import { readServerConfig } from './infrastructure/server-config.js'
+import { shutdownProcess, type ShutdownReason } from './infrastructure/shutdown.js'
 
 const config = readServerConfig()
 const runtime = await createRuntime()
 const candidateStaticDir = resolve(process.env.ISTRA_STATIC_DIR ?? 'dist-web')
 const staticDir = await stat(candidateStaticDir).then((entry) => entry.isDirectory() ? candidateStaticDir : undefined, () => undefined)
+const readinessCheck = createReadinessWatchdog(
+  () => runtime.healthCheck(),
+  {
+    failureThreshold: config.readinessFailureExitThreshold,
+    intervalMillis: 10_000,
+    onFailureThreshold: (_error, consecutiveFailures) => {
+      app.log.fatal({ consecutiveFailures }, 'PostgreSQL readiness failed repeatedly; restarting Istra')
+      setImmediate(() => void close('readiness_failure'))
+    },
+  },
+)
 const app = await buildHttpApp({
   service: runtime.service,
   staticDir,
@@ -16,25 +29,21 @@ const app = await buildHttpApp({
 })
 
 let shutdown: Promise<void> | undefined
-const close = (signal: NodeJS.Signals) => {
+function close(signal: ShutdownReason) {
   if (shutdown) return shutdown
+  readinessCheck.stop()
   app.log.info({ signal }, 'Shutting down Istra')
-  shutdown = (async () => {
-    const deadline = setTimeout(() => {
+  shutdown = shutdownProcess({
+    reason: signal,
+    timeoutMillis: 10_000,
+    closeApp: () => app.close(),
+    closeRuntime: () => runtime.close(),
+    onClean: () => app.log.info({ signal }, 'Istra stopped cleanly'),
+    onError: (error) => app.log.error(error, 'Failed to shut down Istra cleanly'),
+    onTimeout: () => {
       app.log.fatal({ signal }, 'Timed out while shutting down Istra')
-      process.exit(1)
-    }, 10_000)
-    deadline.unref()
-    try {
-      await app.close()
-      await runtime.close()
-      app.log.info({ signal }, 'Istra stopped cleanly')
-    } finally {
-      clearTimeout(deadline)
-    }
-  })().catch((error) => {
-    app.log.error(error, 'Failed to shut down Istra cleanly')
-    process.exitCode = 1
+    },
+    exit: (code) => process.exit(code),
   })
   return shutdown
 }
@@ -42,3 +51,4 @@ process.once('SIGINT', () => void close('SIGINT'))
 process.once('SIGTERM', () => void close('SIGTERM'))
 
 await app.listen({ host: config.host, port: config.port })
+readinessCheck.start()

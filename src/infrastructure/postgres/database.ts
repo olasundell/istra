@@ -3,12 +3,39 @@ import {
   Pool,
   type PoolClient,
   type PoolConfig,
+  type QueryConfig,
   type QueryResult,
   type QueryResultRow,
 } from 'pg'
 import { latestPostgresSchemaVersion, postgresMigrations } from './migrations.js'
 
 const migrationLockId = '5283936332345650'
+const defaultConnectionTimeoutMillis = 2_000
+const defaultIdleTimeoutMillis = 30_000
+const defaultKeepAliveInitialDelayMillis = 10_000
+const defaultMaxLifetimeSeconds = 300
+const defaultReadinessTimeoutMillis = 2_000
+const defaultStatementTimeoutMillis = 30_000
+const protectedConnectionParameters = new Set([
+  'application_name',
+  'connectionTimeoutMillis',
+  'idle_in_transaction_session_timeout',
+  'keepAlive',
+  'keepAliveInitialDelayMillis',
+  'query_timeout',
+  'statement_timeout',
+])
+const protectedStartupOptionNames = [
+  'application_name',
+  'idle_in_transaction_session_timeout',
+  'statement_timeout',
+]
+
+export interface PostgresPoolDiagnostics {
+  totalCount: number
+  idleCount: number
+  waitingCount: number
+}
 
 export interface PostgresConnectionOptions {
   connectionString: string
@@ -16,9 +43,15 @@ export interface PostgresConnectionOptions {
   idleTimeoutMillis?: number
   connectionTimeoutMillis?: number
   statementTimeoutMillis?: number
+  queryTimeoutMillis?: number
+  readinessTimeoutMillis?: number
+  keepAliveInitialDelayMillis?: number
+  maxLifetimeSeconds?: number
+  idleInTransactionSessionTimeoutMillis?: number
   applicationName?: string
   ssl?: PoolConfig['ssl']
   migrate?: boolean
+  onPoolError?: (error: Error, diagnostics: PostgresPoolDiagnostics) => void
 }
 
 export interface PostgresTransactionOptions {
@@ -31,11 +64,78 @@ interface TransactionState {
   client: PoolClient
   nextSavepoint: number
   queryTail: Promise<void>
+  destroyClient: boolean
 }
 
 export interface PostgresHealth {
   ready: boolean
   schemaVersion: number
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('code' in error)) return undefined
+  return typeof error.code === 'string' ? error.code : undefined
+}
+
+export function isPostgresConnectionFailure(error: unknown): boolean {
+  if (error instanceof AggregateError) return error.errors.some(isPostgresConnectionFailure)
+  const code = errorCode(error)
+  if (code?.startsWith('08')) return true
+  if (code && ['57P01', '57P02', '57P03', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ENETDOWN', 'ENETUNREACH', 'EHOSTUNREACH'].includes(code)) return true
+  if (!(error instanceof Error)) return false
+  return error.message === 'Query read timeout'
+    || /connection (?:terminated|closed|ended) unexpectedly/i.test(error.message)
+    || /server closed the connection unexpectedly/i.test(error.message)
+}
+
+function aggregateRollbackFailure(error: unknown, rollbackError: unknown): AggregateError {
+  return new AggregateError([error, rollbackError], 'PostgreSQL operation failed and its rollback did not complete')
+}
+
+export function postgresPoolConfig(options: PostgresConnectionOptions): PoolConfig {
+  const parsed = parsePostgresUrl(options.connectionString)
+  const conflictingParameters = [...parsed.searchParams.keys()]
+    .filter((parameter) => protectedConnectionParameters.has(parameter))
+  const startupOptions = parsed.searchParams.get('options')?.toLowerCase()
+  if (startupOptions && protectedStartupOptionNames.some((parameter) => startupOptions.includes(parameter))) {
+    conflictingParameters.push('options')
+  }
+  if (conflictingParameters.length > 0) {
+    throw new Error(`ISTRA_DATABASE_URL must not override managed PostgreSQL parameters: ${conflictingParameters.join(', ')}`)
+  }
+  const statementTimeoutMillis = options.statementTimeoutMillis ?? defaultStatementTimeoutMillis
+  return {
+    connectionString: options.connectionString,
+    max: options.max ?? 4,
+    idleTimeoutMillis: options.idleTimeoutMillis ?? defaultIdleTimeoutMillis,
+    connectionTimeoutMillis: options.connectionTimeoutMillis ?? defaultConnectionTimeoutMillis,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: options.keepAliveInitialDelayMillis ?? defaultKeepAliveInitialDelayMillis,
+    maxLifetimeSeconds: options.maxLifetimeSeconds ?? defaultMaxLifetimeSeconds,
+    statement_timeout: statementTimeoutMillis,
+    query_timeout: options.queryTimeoutMillis ?? statementTimeoutMillis + 5_000,
+    idle_in_transaction_session_timeout: options.idleInTransactionSessionTimeoutMillis ?? statementTimeoutMillis,
+    application_name: options.applicationName ?? 'istra',
+    ssl: options.ssl,
+  }
+}
+
+function poolDiagnostics(pool: Pool): PostgresPoolDiagnostics {
+  return {
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount,
+  }
+}
+
+function reportPoolError(error: Error, diagnostics: PostgresPoolDiagnostics): void {
+  const code = errorCode(error)
+  process.stderr.write(`${JSON.stringify({
+    level: 'warn',
+    message: 'PostgreSQL idle pool client failed and was evicted',
+    ...(code ? { code } : {}),
+    pool: diagnostics,
+  })}\n`)
 }
 
 function parsePostgresUrl(connectionString: string): URL {
@@ -93,7 +193,12 @@ export class PostgresExecutor {
 
     const result = transaction.queryTail.then(() => transaction.client.query<Row>(text, [...values]))
     transaction.queryTail = result.then(() => undefined, () => undefined)
-    return result
+    try {
+      return await result
+    } catch (error) {
+      if (isPostgresConnectionFailure(error)) transaction.destroyClient = true
+      throw error
+    }
   }
 
   async many<Row extends QueryResultRow = QueryResultRow>(text: string, values: readonly unknown[] = []): Promise<Row[]> {
@@ -118,13 +223,24 @@ export class PostgresExecutor {
   }
 
   async withConnection<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
-    const active = this.transactions.getStore()?.client
-    if (active) return work(active)
+    const transaction = this.transactions.getStore()
+    if (transaction) {
+      try {
+        return await work(transaction.client)
+      } catch (error) {
+        if (isPostgresConnectionFailure(error)) transaction.destroyClient = true
+        throw error
+      }
+    }
     const client = await this.pool.connect()
+    let destroyClient = false
     try {
       return await work(client)
+    } catch (error) {
+      destroyClient = isPostgresConnectionFailure(error)
+      throw error
     } finally {
-      client.release()
+      client.release(destroyClient)
     }
   }
 
@@ -138,27 +254,43 @@ export class PostgresExecutor {
         await this.query(`RELEASE SAVEPOINT ${savepoint}`)
         return result
       } catch (error) {
-        await this.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
-        await this.query(`RELEASE SAVEPOINT ${savepoint}`)
+        if (active.destroyClient) throw error
+        try {
+          await this.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+          await this.query(`RELEASE SAVEPOINT ${savepoint}`)
+        } catch (rollbackError) {
+          active.destroyClient = true
+          throw aggregateRollbackFailure(error, rollbackError)
+        }
         throw error
       }
     }
 
     const client = await this.pool.connect()
+    const state: TransactionState = { client, nextSavepoint: 0, queryTail: Promise.resolve(), destroyClient: false }
     try {
       await client.query(beginStatement(options))
-      return await this.transactions.run({ client, nextSavepoint: 0, queryTail: Promise.resolve() }, async () => {
+      return await this.transactions.run(state, async () => {
         try {
           const result = await work(this)
           await this.query('COMMIT')
           return result
         } catch (error) {
-          await this.query('ROLLBACK')
+          if (state.destroyClient) throw error
+          try {
+            await this.query('ROLLBACK')
+          } catch (rollbackError) {
+            state.destroyClient = true
+            throw aggregateRollbackFailure(error, rollbackError)
+          }
           throw error
         }
       })
+    } catch (error) {
+      if (isPostgresConnectionFailure(error)) state.destroyClient = true
+      throw error
     } finally {
-      client.release()
+      client.release(state.destroyClient)
     }
   }
 }
@@ -201,7 +333,12 @@ export async function migratePostgres(executor: PostgresExecutor): Promise<numbe
       await client.query('COMMIT')
       return latestPostgresSchemaVersion
     } catch (error) {
-      await client.query('ROLLBACK')
+      if (isPostgresConnectionFailure(error)) throw error
+      try {
+        await client.query('ROLLBACK')
+      } catch (rollbackError) {
+        throw aggregateRollbackFailure(error, rollbackError)
+      }
       throw error
     }
   })
@@ -212,16 +349,20 @@ export class PostgresDatabase {
   readonly target: string
   private closed = false
 
-  constructor(readonly pool: Pool, target: string) {
+  constructor(readonly pool: Pool, target: string, private readonly readinessTimeoutMillis = defaultReadinessTimeoutMillis) {
     this.executor = new PostgresExecutor(pool)
     this.target = target
   }
 
   async healthCheck(): Promise<PostgresHealth> {
     try {
-      const row = await this.executor.one<{ version: number }>(
-        'SELECT COALESCE(MAX(version),0)::integer AS version FROM schema_migrations',
-      )
+      const query: QueryConfig & { query_timeout: number } = {
+        text: 'SELECT COALESCE(MAX(version),0)::integer AS version FROM schema_migrations',
+        query_timeout: this.readinessTimeoutMillis,
+      }
+      const result = await this.pool.query<{ version: number }>(query)
+      const row = result.rows[0]
+      if (!row || result.rows.length !== 1) throw new Error('Expected exactly one PostgreSQL schema version row')
       return { ready: true, schemaVersion: Number(row.version) }
     } catch {
       return { ready: false, schemaVersion: 0 }
@@ -243,20 +384,15 @@ export class PostgresDatabase {
 }
 
 export async function openPostgresDatabase(options: PostgresConnectionOptions): Promise<PostgresDatabase> {
-  parsePostgresUrl(options.connectionString)
-  const pool = new Pool({
-    connectionString: options.connectionString,
-    max: options.max ?? 4,
-    idleTimeoutMillis: options.idleTimeoutMillis ?? 30_000,
-    connectionTimeoutMillis: options.connectionTimeoutMillis ?? 5_000,
-    statement_timeout: options.statementTimeoutMillis ?? 30_000,
-    application_name: options.applicationName ?? 'istra',
-    ssl: options.ssl,
-  })
-  // An idle client error should make the next health check fail, not terminate
-  // the process through EventEmitter's special unhandled `error` behaviour.
-  pool.on('error', () => undefined)
-  const database = new PostgresDatabase(pool, redactPostgresTarget(options.connectionString))
+  const pool = new Pool(postgresPoolConfig(options))
+  // Observe idle-client errors so EventEmitter does not terminate the process;
+  // pg-pool has already evicted the failed client when this event is emitted.
+  pool.on('error', (error) => (options.onPoolError ?? reportPoolError)(error, poolDiagnostics(pool)))
+  const database = new PostgresDatabase(
+    pool,
+    redactPostgresTarget(options.connectionString),
+    options.readinessTimeoutMillis ?? defaultReadinessTimeoutMillis,
+  )
   try {
     if (options.migrate !== false) await migratePostgres(database.executor)
     return database
