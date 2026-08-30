@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Durable operational project memory for OpenCode.",
   "license": "MIT",
+  "homepage": "https://github.com/olasundell/istra#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olasundell/istra.git"
+  },
+  "bugs": {
+    "url": "https://github.com/olasundell/istra/issues"
+  },
   "type": "module",
   "main": "./dist/server.mjs",
   "exports": {
@@ -11,6 +19,7 @@
   },
   "files": [
     "dist",
+    "assets",
     "instructions",
     "skills",
     ".claude-plugin",

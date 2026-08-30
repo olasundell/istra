@@ -1,6 +1,6 @@
-# Istra
-
-> Durable project memory for the work between the plan and the proof.
+<p align="center"><img src="assets/brand/istra-mark.png" alt="Istra logo" width="96" height="96"></p>
+<h1 align="center">Istra</h1>
+<p align="center"><strong>Durable project memory for the work between the plan and the proof.</strong></p>
 
 Istra is a local-first command centre for open-ended work. It keeps the current pulse visible, turns decisions and next actions into a searchable journal, and connects requirements to work, runs, evidence and checkpoints so the next session can start with context instead of archaeology.
 

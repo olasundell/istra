@@ -51,14 +51,18 @@ h1, h2, h3, p { margin-top: 0; }
   padding: 39px 18px 24px;
 }
 .wordmark {
+  display: flex;
+  align-items: center;
+  gap: 13px;
   margin: 0 20px 42px;
   color: #070d17;
   font-family: var(--serif);
-  font-size: 45px;
+  font-size: 43px;
   line-height: 1;
   letter-spacing: .02em;
   text-decoration: none;
 }
+.wordmark__mark { width: 42px; height: 42px; flex: 0 0 auto; }
 .sidebar__nav { display: grid; gap: 6px; }
 .nav-link {
   position: relative;

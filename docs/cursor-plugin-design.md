@@ -57,12 +57,13 @@ Local development: copy `plugins/istra` to `~/.cursor/plugins/local/istra`, then
 - `homepage` / `repository`: the GitHub URLs already used by the Claude Code manifest
 - `license`: `MIT`
 - `keywords`: same set as the other hosts (`project-memory`, `checkpoints`, `requirements`, `evidence`, `error-reporting`, `local-first`)
+- `logo`: `assets/istra-mark.png`, the shared selected Istra mark packaged with every host
 - `commands`: `./commands/`
 - `skills`: `./skills/`
 - `rules`: `./rules/`
 - `mcpServers`: `./mcp.json`
 
-No logo in v1. No `variables` schema: `ISTRA_DATA_DIR` and related settings remain environment / platform-local configuration, as for every other host.
+No `variables` schema: `ISTRA_DATA_DIR` and related settings remain environment / platform-local configuration, as for every other host.
 
 ### `.cursor-plugin/marketplace.json` (repository root)
 

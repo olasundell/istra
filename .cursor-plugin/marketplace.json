@@ -10,7 +10,8 @@
     {
       "name": "istra",
       "source": "./plugins/istra",
-      "description": "Durable operational project memory for Cursor."
+      "description": "Durable operational project memory for Cursor.",
+      "logo": "./plugins/istra/assets/istra-mark.png"
     }
   ]
 }
