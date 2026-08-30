@@ -1,4 +1,5 @@
-# Istra agent plugins
+<p align="center"><img src="assets/istra-mark.png" alt="Istra logo" width="80" height="80"></p>
+<h1 align="center">Istra agent plugins</h1>
 
 This package adds durable, local-first operational project memory to Codex, Claude Code, Cursor, Hermes Agent and OpenCode. Every client starts the same self-contained Node.js MCP server against the database used by the Istra web application, then applies the requirements, work-queue, run, evidence and checkpoint workflow appropriate to its host.
 

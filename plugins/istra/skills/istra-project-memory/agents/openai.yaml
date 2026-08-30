@@ -1,6 +1,9 @@
 interface:
   display_name: "Istra Project Memory"
   short_description: "Maintain durable operational project memory"
+  icon_small: "./assets/istra-mark.png"
+  icon_large: "./assets/istra-mark.png"
+  brand_color: "#064DBF"
   default_prompt: "Use $istra-project-memory to resolve this checkout, reconcile requirements, work and evidence, and record an authoritative checkpoint after substantive changes."
 dependencies:
   tools:

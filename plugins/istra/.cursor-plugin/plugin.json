@@ -17,6 +17,7 @@
     "error-reporting",
     "local-first"
   ],
+  "logo": "assets/istra-mark.png",
   "category": "developer-tools",
   "tags": [
     "project-memory",

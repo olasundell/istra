@@ -28,7 +28,7 @@
     "test:backend": "vitest run src --exclude 'src/web/**'",
     "test:postgres": "vitest run src/infrastructure/postgres/postgres.integration.test.ts",
     "test:web": "vitest run src/web",
-    "test:plugin": "vitest run src/integration/plugin-package.test.ts src/integration/claude-plugin.test.ts src/integration/cursor-plugin.test.ts src/integration/hermes-plugin.test.ts src/integration/opencode-plugin.test.ts",
+    "test:plugin": "vitest run src/integration/brand-assets.test.ts src/integration/plugin-package.test.ts src/integration/claude-plugin.test.ts src/integration/cursor-plugin.test.ts src/integration/hermes-plugin.test.ts src/integration/opencode-plugin.test.ts",
     "test:deploy": "vitest run scripts/deploy-production.test.ts",
     "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json && tsc --noEmit -p tsconfig.scripts.json",

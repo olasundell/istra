@@ -1,6 +1,9 @@
 interface:
   display_name: "Report an Istra fault"
   short_description: "Report Istra tool and workflow faults"
+  icon_small: "./assets/istra-mark.png"
+  icon_large: "./assets/istra-mark.png"
+  brand_color: "#064DBF"
   default_prompt: "Use $istra-error-reporting to record this perceived Istra fault safely."
 dependencies:
   tools:

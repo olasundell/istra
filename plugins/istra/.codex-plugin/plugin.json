@@ -20,6 +20,8 @@
     "longDescription": "Resolve the current checkout, maintain requirements, ordered work, blockers, runs and evidence, save authoritative checkpoints, and report perceived Istra faults through the local MCP server.",
     "developerName": "Istra contributors",
     "category": "Productivity",
+    "logo": "./assets/istra-mark.png",
+    "composerIcon": "./assets/istra-mark.png",
     "capabilities": [
       "Read",
       "Write"
@@ -29,7 +31,7 @@
       "Record this verification run and link its evidence to the relevant acceptance criterion.",
       "Report this perceived Istra MCP, plugin, instruction or workflow fault with concise sanitised evidence."
     ],
-    "brandColor": "#2458B5"
+    "brandColor": "#064DBF"
   },
   "mcpServers": "./.mcp.json"
 }

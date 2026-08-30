@@ -13,7 +13,10 @@ export function AppShell() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <NavLink aria-label="Istra home" className="wordmark" to="/">Istra</NavLink>
+        <NavLink aria-label="Istra home" className="wordmark" to="/">
+          <img alt="" className="wordmark__mark" src="/icon-192.png" />
+          <span>Istra</span>
+        </NavLink>
         <nav aria-label="Main navigation" className="sidebar__nav">
           {navigation.map((item) => {
             const detailSelected = item.to === "/" && location.pathname.startsWith("/projects/");
@@ -41,4 +44,3 @@ export function AppShell() {
     </div>
   );
 }
-

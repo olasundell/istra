@@ -1,4 +1,5 @@
-# Istra for Hermes Agent
+<p align="center"><img src="../assets/brand/istra-mark.png" alt="Istra logo" width="96" height="96"></p>
+<h1 align="center">Istra for Hermes Agent</h1>
 
 The repository root is an installable Hermes plugin. It registers Hermes-specific workflow skills while the bundled Istra MCP runtime supplies the tools. Hermes keeps these as two explicit extension surfaces, so both must be enabled.
 
