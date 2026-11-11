@@ -52,7 +52,7 @@ export function ProjectPage() {
 
   const { project, pulse, phases, updates, activity } = detail.data;
   const sortedPhases = phases.filter((phase) => !phase.archivedAt).sort((a, b) => a.position - b.position);
-  const archivedPhases = (allPhases.data ?? []).filter((phase) => phase.archivedAt);
+  const archivedPhases = (allPhases.data ?? []).filter((phase) => phase.archivedAt && phase.projectId === projectId);
   const activityItems = (showAllActivity ? activity : activity.slice(0, 4)).map((event) => toActivityView(event, project));
 
   async function updateState(state: ProjectState) {

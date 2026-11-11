@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProjectPage } from "./ProjectPage";
 import { useQueueAutomationOverview } from "./useQueueAutomationOverview";
@@ -441,6 +441,36 @@ describe("ProjectPage", () => {
     await user.type(screen.getByLabelText("Name"), "Field calibration");
     await user.click(screen.getByRole("button", { name: "Save phase" }));
     await waitFor(() => expect(pulseCalls).toBe(3));
+  });
+
+  it("does not offer another project's archived phases while the next project loads", async () => {
+    const otherId = "55555555-5555-4555-8555-555555555555";
+    const otherProject = { ...project, id: otherId, title: "Quiet Orchard", blockers: [] };
+    const archivedPhase = { id: "66666666-6666-4666-8666-666666666666", projectId: id, name: "Retired prototype", description: null, status: "done", position: 0, archivedAt: "2026-07-05T10:00:00.000Z", version: 2, createdAt: "2026-07-01T10:00:00.000Z", updatedAt: "2026-07-05T10:00:00.000Z" };
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.includes(`/projects/${otherId}/phases`)) return pendingResponse();
+      if (url.endsWith(`/projects/${otherId}`)) return response({ ...detail, project: otherProject, pulse: { ...detail.pulse, blockers: [] } });
+      if (url.endsWith(`/projects/${otherId}/pulse`)) return response({ ...operationalPulse, project: otherProject });
+      if (url.includes(`/projects/${otherId}/requirements/page`)) return response(requirementsPage);
+      if (url.includes(`/projects/${otherId}`)) return response([]);
+      if (url.includes(`/projects/${id}/phases`)) return response([archivedPhase]);
+      return projectPageResponse(input, init);
+    });
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={[`/projects/${id}`]}>
+        <Link to={`/projects/${otherId}`}>Open Quiet Orchard</Link>
+        <Routes><Route path="/projects/:projectId" element={<ProjectPage />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Retired prototype")).toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: "Open Quiet Orchard" }));
+
+    expect(await screen.findByRole("heading", { name: "Quiet Orchard" })).toBeInTheDocument();
+    expect(screen.queryByText("Retired prototype")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Restore" })).not.toBeInTheDocument();
   });
 });
 
