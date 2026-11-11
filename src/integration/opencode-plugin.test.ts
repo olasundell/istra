@@ -6,10 +6,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 const execFileAsync = promisify(execFile);
 const pluginRoot = resolve("plugins/istra");
+const entry = pathToFileURL(resolve(pluginRoot, "dist/server.mjs")).href;
 const runtimePath = resolve(pluginRoot, "dist/mcp/stdio.mjs");
 const instructionPath = resolve(pluginRoot, "instructions/opencode-project-memory.md");
 
@@ -24,7 +25,7 @@ describe("OpenCode plugin package", () => {
       type: "module",
       main: "./dist/server.mjs",
       exports: { "./server": "./dist/server.mjs" },
-      engines: { node: ">=24.0.0", opencode: ">=1.17.15 <2" },
+      engines: { node: ">=24.0.0", opencode: ">=1.17.15 <3" },
     });
 
     const npmCache = await mkdtemp(join(tmpdir(), "istra-opencode-npm-cache-"));
@@ -66,8 +67,7 @@ describe("OpenCode plugin package", () => {
     expect(instructions).toMatch(/Never recursively report a failure of `istra_report_error`/i);
   });
 
-  it("adds Istra only when the user has not already configured it", async () => {
-    const entry = pathToFileURL(resolve(pluginRoot, "dist/server.mjs")).href;
+  it("adds Istra on OpenCode 1 only when the user has not already configured it", async () => {
     const module = await import(entry) as { default: { id: string; server: () => Promise<{ config?: (config: Record<string, unknown>) => Promise<void> }> } };
     const hooks = await module.default.server();
     const config: Record<string, unknown> = { instructions: ["existing.md"] };
@@ -97,5 +97,37 @@ describe("OpenCode plugin package", () => {
       mcp: { istra: { type: "remote", url: "https://example.test/mcp" } },
       instructions: [instructionPath],
     });
+  });
+
+  it("registers Istra and its instructions through the OpenCode 2 setup API", async () => {
+    const { default: plugin } = await import(entry) as typeof import("../adapters/opencode/plugin.js");
+    type Context = Parameters<typeof plugin.setup>[0];
+    const transform = vi.fn<Context["mcp"]["transform"]>().mockResolvedValue(undefined);
+    const hook = vi.fn<Context["session"]["hook"]>().mockResolvedValue(undefined);
+
+    await plugin.setup({ mcp: { transform }, session: { hook } });
+
+    expect(transform).toHaveBeenCalledOnce();
+    const [registerMcp] = transform.mock.calls[0]!;
+    const set = vi.fn();
+    registerMcp({ get: () => undefined, set });
+    expect(set).toHaveBeenCalledExactlyOnceWith("istra", {
+      type: "local",
+      command: ["node", runtimePath],
+      codemode: false,
+      timeout: { startup: 120_000, catalog: 120_000, execution: 120_000 },
+    });
+
+    registerMcp({ get: () => ({ type: "remote", url: "https://example.test/mcp", disabled: true }), set });
+    expect(set).toHaveBeenCalledOnce();
+
+    expect(hook).toHaveBeenCalledOnce();
+    const [hookName, addInstructions] = hook.mock.calls[0]!;
+    expect(hookName).toBe("context");
+    const existing = { type: "text", text: "Existing instructions" };
+    const system = [existing];
+    addInstructions({ system });
+    addInstructions({ system });
+    expect(system).toEqual([existing, { type: "text", text: await readFile(instructionPath, "utf8") }]);
   });
 });

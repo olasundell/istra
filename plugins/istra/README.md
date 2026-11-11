@@ -54,16 +54,20 @@ The separate MCP command is required because Hermes does not expose MCP registra
 
 ## OpenCode
 
-Install globally for all OpenCode projects:
+Install globally on OpenCode 2.
 
 ```bash
-opencode plugin opencode-istra --global
+opencode plugin add opencode-istra
 ```
 
-For local development from this checkout, add the absolute path to `plugins/istra` to the `plugin` array in `opencode.json`. The plugin registers a local `istra` MCP server unless `mcp.istra` is already configured and exposes tools with an `istra_` prefix. OpenCode writes use `client: "opencode-plugin:istra"`.
+On OpenCode 1, use `opencode plugin opencode-istra --global`.
+
+For local development, add `{"package": "file:///absolute/path/to/Istra/plugins/istra"}` to `plugins` in `opencode.json`. On OpenCode 1, add the absolute directory path as a string to `plugin`.
+
+The plugin registers a local `istra` MCP server, exposes tools with an `istra_` prefix and honours any existing Istra MCP configuration. OpenCode writes use `client: "opencode-plugin:istra"`.
 
 ## Behaviour
 
 Agents report only concrete or strongly suspected faults in Istra itself—its MCP tools, packaging, instructions, or workflow. They report once per root cause after a quick check, without blocking user work, and never include secrets or recursively report a reporter failure.
 
-To override the OpenCode runtime manually, configure `mcp.istra` in `opencode.json` with a local command that runs `node` and this package's `dist/mcp/stdio.mjs` file.
+To override the runtime, configure `mcp.servers.istra` in `opencode.json` with a local command that runs `node` and this package's `dist/mcp/stdio.mjs` file. Set `codemode` to `false` to keep the `istra_` tool names. On OpenCode 1, configure `mcp.istra`.

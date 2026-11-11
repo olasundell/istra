@@ -202,21 +202,25 @@ Hermes' public plugin API does not register MCP servers, so the explicit `hermes
 
 ## OpenCode plugin
 
-The same `plugins/istra` directory is an npm package named `opencode-istra`. Once published, install it globally with:
+The `plugins/istra` directory is an npm package named `opencode-istra`. Once published, install it globally on OpenCode 2.
 
 ```bash
-opencode plugin opencode-istra --global
+opencode plugin add opencode-istra
 ```
 
-The OpenCode entrypoint adds the bundled local `istra` MCP server and matching operational project-memory instructions. It preserves a pre-existing `mcp.istra` configuration and uses the same shared storage selection as the application.
+On OpenCode 1, use `opencode plugin opencode-istra --global`.
 
-For local development before publishing, add the absolute `plugins/istra` path to the `plugin` array in `opencode.json`:
+The plugin adds the bundled `istra` MCP server and operational project-memory instructions. It honours an existing Istra MCP configuration and uses the same storage as the application.
+
+For local development, add the package to `opencode.json`.
 
 ```json
 {
-  "plugin": ["/absolute/path/to/Istra/plugins/istra"]
+  "plugins": [{ "package": "file:///absolute/path/to/Istra/plugins/istra" }]
 }
 ```
+
+On OpenCode 1, use `"plugin": ["/absolute/path/to/Istra/plugins/istra"]`. Store backups outside the `plugin/` and `plugins/` discovery directories.
 
 ## Commands
 

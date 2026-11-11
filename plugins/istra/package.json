@@ -33,7 +33,7 @@
   ],
   "engines": {
     "node": ">=24.0.0",
-    "opencode": ">=1.17.15 <2"
+    "opencode": ">=1.17.15 <3"
   },
   "keywords": [
     "opencode",
