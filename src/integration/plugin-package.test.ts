@@ -10,6 +10,8 @@ import type { CheckpointSaveResult, ErrorReport, Project } from "../domain/contr
 import { createRuntime } from "../infrastructure/runtime.js";
 
 const pluginRoot = resolve("plugins/istra");
+// Subprocess start-up is much slower than the 5 s default on a contended machine.
+const subprocessTestTimeout = 30_000;
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -208,7 +210,7 @@ describe("Codex plugin package", () => {
       await client.close();
       await transport.close();
     }
-  });
+  }, subprocessTestTimeout);
 
   it.runIf(Boolean(process.env.TEST_DATABASE_URL))("runs the isolated bundled MCP against PostgreSQL", async () => {
     const isolatedRoot = await mkdtemp(join(tmpdir(), "istra-plugin-postgres-"));
@@ -257,5 +259,5 @@ describe("Codex plugin package", () => {
       await client.close();
       await transport.close();
     }
-  });
+  }, subprocessTestTimeout);
 });

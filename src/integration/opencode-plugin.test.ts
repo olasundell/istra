@@ -9,6 +9,8 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 const execFileAsync = promisify(execFile);
+// Subprocess start-up is much slower than the 5 s default on a contended machine.
+const subprocessTestTimeout = 30_000;
 const pluginRoot = resolve("plugins/istra");
 const entry = pathToFileURL(resolve(pluginRoot, "dist/server.mjs")).href;
 const runtimePath = resolve(pluginRoot, "dist/mcp/stdio.mjs");
@@ -65,7 +67,7 @@ describe("OpenCode plugin package", () => {
     expect(instructions).toContain("`istra_report_error`");
     expect(instructions).toMatch(/Never report user-project bugs/i);
     expect(instructions).toMatch(/Never recursively report a failure of `istra_report_error`/i);
-  });
+  }, subprocessTestTimeout);
 
   it("adds Istra on OpenCode 1 only when the user has not already configured it", async () => {
     const module = await import(entry) as { default: { id: string; server: () => Promise<{ config?: (config: Record<string, unknown>) => Promise<void> }> } };

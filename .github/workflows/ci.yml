@@ -11,6 +11,20 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_DB: istra_test
+          POSTGRES_USER: istra
+          POSTGRES_PASSWORD: istra-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U istra -d istra_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -23,6 +37,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+        env:
+          # Enables the live PostgreSQL suites, which skip silently without it.
+          TEST_DATABASE_URL: postgresql://istra:istra-ci-only@127.0.0.1:5432/istra_test
       - run: pnpm build
       - name: Ensure the tracked plugin bundle matches its source
         run: git diff --exit-code -- plugins/istra/dist

@@ -7,6 +7,8 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 const execFileAsync = promisify(execFile);
+// Subprocess start-up is much slower than the 5 s default on a contended machine.
+const subprocessTestTimeout = 30_000;
 const repositoryRoot = resolve(".");
 const hermesRoot = join(repositoryRoot, "hermes");
 const packagedRuntime = join(repositoryRoot, "plugins/istra/dist/mcp/stdio.mjs");
@@ -60,7 +62,7 @@ describe("Hermes Agent plugin", () => {
         description: "Report concrete or strongly suspected faults in Istra itself.",
       },
     ]);
-  });
+  }, subprocessTestTimeout);
 
   it("uses Hermes MCP names and preserves host-specific write provenance", async () => {
     const projectMemory = await readFile(
