@@ -1,12 +1,15 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ActivityEvent, ErrorReport, Project, ProjectDetail } from '../../domain/contracts.js'
 import { createRuntime } from '../../infrastructure/runtime.js'
 import { createMcpServer } from './server.js'
+import { captureMcpRuntimeInfo, type McpRuntimeInfo } from './runtime-info.js'
 
 describe('MCP server contract', () => {
   let client: Client
@@ -48,6 +51,7 @@ describe('MCP server contract', () => {
       'list_error_reports_page',
       'get_error_report',
       'get_storage_status',
+      'get_runtime_info',
       'update_error_report',
       'create_phase',
       'create_project',
@@ -140,7 +144,7 @@ describe('MCP server contract', () => {
     expect(waitSchema.properties?.timeoutSeconds).toMatchObject({ type: 'integer', minimum: 0, maximum: 60, default: 30 })
 
     for (const tool of tools) expect(tool.annotations?.destructiveHint).toBe(false)
-    for (const readTool of ['get_storage_status', 'list_projects', 'get_project_pulse', 'list_work_items', 'search']) {
+    for (const readTool of ['get_runtime_info', 'get_storage_status', 'list_projects', 'get_project_pulse', 'list_work_items', 'search']) {
       expect(byName.get(readTool)?.annotations?.readOnlyHint).toBe(true)
     }
 
@@ -160,6 +164,46 @@ describe('MCP server contract', () => {
       automaticBackups: true,
       importSupported: true,
     })
+  })
+
+  it('exposes a stable read-only runtime identity with an empty strict input schema', async () => {
+    const { tools } = await client.listTools()
+    const tool = tools.find(({ name }) => name === 'get_runtime_info')
+    expect(tool?.inputSchema).toMatchObject({ type: 'object', properties: {}, additionalProperties: false })
+    expect(tool?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false })
+
+    const first = structured<McpRuntimeInfo>(await client.callTool({ name: 'get_runtime_info', arguments: {} }))
+    expect(first).toEqual({ bundleSha256: null, startedAt: expect.any(String) })
+    expect(new Date(first.startedAt).toISOString()).toBe(first.startedAt)
+    expect(structured(await client.callTool({ name: 'get_runtime_info', arguments: {} }))).toEqual(first)
+    expect((await client.callTool({ name: 'get_runtime_info', arguments: { unexpected: true } })).isError).toBe(true)
+  })
+
+  it('keeps the captured bundle identity when files and caller-owned metadata change', async () => {
+    const entrypoint = join(dataDir, 'entrypoint.mjs')
+    const original = 'export const version = "original"\n'
+    await writeFile(entrypoint, original)
+    const captured = await captureMcpRuntimeInfo(pathToFileURL(entrypoint))
+    const expected = {
+      bundleSha256: createHash('sha256').update(original).digest('hex'),
+      startedAt: captured.startedAt,
+    }
+    expect(captured).toEqual(expected)
+    expect(Object.isFrozen(captured)).toBe(true)
+    const callerOwned = { ...captured }
+
+    await client.close()
+    await server.close()
+    server = createMcpServer(runtime.service, callerOwned)
+    client = new Client({ name: 'istra-runtime-info-test', version: '1.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+
+    callerOwned.bundleSha256 = '0'.repeat(64)
+    callerOwned.startedAt = '2000-01-01T00:00:00.000Z'
+    await writeFile(entrypoint, 'export const version = "replacement"\n')
+    expect(structured(await client.callTool({ name: 'get_runtime_info', arguments: {} }))).toEqual(expected)
   })
 
   it('returns machine-readable results and records MCP client provenance on writes', async () => {

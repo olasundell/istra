@@ -22300,6 +22300,14 @@ async function createRuntime(options = {}) {
     close: async () => database.db.close()
   };
 }
+async function captureMcpRuntimeInfo(entrypoint) {
+  const startedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const bundle = await readFile(entrypoint);
+  return Object.freeze({
+    bundleSha256: createHash("sha256").update(bundle).digest("hex"),
+    startedAt
+  });
+}
 const ZodMiniType = /* @__PURE__ */ $constructor("ZodMiniType", (inst, def) => {
   if (!inst._zod)
     throw new Error("Uninitialized schema in ZodMiniType.");
@@ -32993,8 +33001,17 @@ function required(value, entity, id2) {
   if (value === null) throw new NotFoundError(entity, id2);
   return value;
 }
-function createMcpServer(service) {
+function createMcpServer(service, runtimeInfo2) {
   const server2 = new McpServer({ name: "istra", version: "0.1.0" });
+  const runtimeSnapshot = Object.freeze({
+    bundleSha256: runtimeInfo2?.bundleSha256 ?? null,
+    startedAt: runtimeInfo2?.startedAt ?? (/* @__PURE__ */ new Date()).toISOString()
+  });
+  server2.registerTool("get_runtime_info", {
+    description: "Read the running MCP process’s start-up bundle SHA-256 and start time. Compare the captured hash with the plugin refresh output to verify that this connection loaded the refreshed runtime.",
+    inputSchema: objectType({}).strict(),
+    annotations: readOnly
+  }, async () => result(runtimeSnapshot));
   server2.registerTool("get_storage_status", {
     description: "Read the active storage backend, redacted target, schema version, readiness and backup capabilities.",
     inputSchema: objectType({}),
@@ -33350,8 +33367,9 @@ function createMcpServer(service) {
   }, async ({ checkpointId }) => result(required(await service.reconstructCheckpointState(checkpointId), "Checkpoint snapshot", checkpointId)));
   return server2;
 }
+const runtimeInfo = await captureMcpRuntimeInfo(new URL(import.meta.url));
 const runtime = await createRuntime();
-const server = createMcpServer(runtime.service);
+const server = createMcpServer(runtime.service, runtimeInfo);
 const transport = new StdioServerTransport();
 const close = async () => {
   await server.close();

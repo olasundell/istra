@@ -1,6 +1,7 @@
 // @vitest-environment node
 
 import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -114,6 +115,7 @@ describe("Codex plugin package", () => {
         "get_project_pulse_summary",
         "get_project_pulse",
         "get_storage_status",
+        "get_runtime_info",
         "list_evidence_page",
         "list_operational_work_items_page",
         "list_requirements_page",
@@ -134,6 +136,15 @@ describe("Codex plugin package", () => {
         expect.objectContaining({ type: "null" }),
       ]));
       expect(bundledByName.get("create_run")?.description).toMatch(/verified or failed outcomes, endedAt is required/i);
+
+      const runtimeInfo = await client.callTool({ name: "get_runtime_info", arguments: {} });
+      expect(runtimeInfo.isError).not.toBe(true);
+      expect(runtimeInfo.structuredContent).toEqual({
+        result: {
+          bundleSha256: createHash("sha256").update(await readFile(join(isolatedRoot, "dist/mcp/stdio.mjs"))).digest("hex"),
+          startedAt: expect.any(String),
+        },
+      });
 
       const created = await client.callTool({
         name: "create_project",

@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { NotFoundError, ValidationError } from '../../application/errors.js'
 import type { IstraService } from '../../application/istra-service.js'
+import type { McpRuntimeInfo } from './runtime-info.js'
 import {
   CheckpointSchema,
   CreatePhaseSchema,
@@ -77,8 +78,18 @@ function required<T>(value: T | null, entity: string, id: string): T {
   return value
 }
 
-export function createMcpServer(service: IstraService): McpServer {
+export function createMcpServer(service: IstraService, runtimeInfo?: McpRuntimeInfo): McpServer {
   const server = new McpServer({ name: 'istra', version: '0.1.0' })
+  const runtimeSnapshot = Object.freeze({
+    bundleSha256: runtimeInfo?.bundleSha256 ?? null,
+    startedAt: runtimeInfo?.startedAt ?? new Date().toISOString(),
+  })
+
+  server.registerTool('get_runtime_info', {
+    description: 'Read the running MCP process’s start-up bundle SHA-256 and start time. Compare the captured hash with the plugin refresh output to verify that this connection loaded the refreshed runtime.',
+    inputSchema: z.object({}).strict(),
+    annotations: readOnly,
+  }, async () => result(runtimeSnapshot))
 
   server.registerTool('get_storage_status', {
     description: 'Read the active storage backend, redacted target, schema version, readiness and backup capabilities.',
