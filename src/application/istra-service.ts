@@ -29,6 +29,7 @@ import {
   type Provenance,
   type MutationContext,
   type SearchFilters,
+  type SearchResult,
 } from '../domain/contracts.js'
 import {
   ClaimNextAutomatedWorkSchema,
@@ -167,7 +168,12 @@ export class IstraService {
       this.repository.search(query, 200, parsed),
       this.operations().search(query, 200, parsed),
     ])
-    const merged = new Map([...core, ...operational].map((entry) => [`${entry.type}:${entry.id}`, entry]))
+    // Both sources can match the same work item; keep the ranked full-text entry rather than the operational fallback.
+    const merged = new Map<string, SearchResult>()
+    for (const entry of [...core, ...operational]) {
+      const key = `${entry.type}:${entry.id}`
+      if (!merged.has(key)) merged.set(key, entry)
+    }
     return [...merged.values()].slice(0, max)
   }
   async exportAll() { return await this.repository.exportAll() }

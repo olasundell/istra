@@ -70,6 +70,9 @@ const json = <T>(value: unknown, fallback: T): T => {
   try { return value === null || value === undefined ? fallback : JSON.parse(String(value)) as T } catch { return fallback }
 }
 const stripAnsi = (value: string): string => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+// Mirrors the FTS index's remove_diacritics and PostgreSQL's istra_unaccent: fold case and strip combining marks.
+const foldSearchText = (value: string): string => value.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
+const searchTerms = (query: string): string[] => foldSearchText(query).split(/\s+/).filter(Boolean)
 const redactionMetadata = (entries: Array<{ field: string; result: SecretRedactionResult }>): RedactionMetadata => ({
   count: entries.reduce((total, entry) => total + entry.result.count, 0),
   fields: [...new Set(entries.flatMap((entry) => entry.result.redactions.map((redaction) => `${entry.field}:${redaction.kind}:${redaction.name}`)))],
@@ -81,6 +84,12 @@ export class SqliteOperationalRepository implements OperationalRepository {
   private readonly automation: SqliteAutomationRepository
 
   constructor(private readonly db: DatabaseSync) {
+    // LIKE folds only ASCII case and treats % and _ as wildcards, so search requires every folded query word instead.
+    db.function('istra_search_match', { deterministic: true, directOnly: true }, (text, query) => {
+      const terms = searchTerms(String(query ?? ''))
+      const folded = foldSearchText(String(text ?? ''))
+      return terms.length > 0 && terms.every((term) => folded.includes(term)) ? 1 : 0
+    })
     this.automation = new SqliteAutomationRepository(
       db,
       (work) => this.transaction(work),
@@ -868,8 +877,8 @@ export class SqliteOperationalRepository implements OperationalRepository {
   }
 
   search(query: string, limit = 50, filters: SearchFilters = {}): SearchResult[] {
-    const term = `%${query.trim()}%`
-    if (!query.trim()) return []
+    const term = query.trim()
+    if (!searchTerms(term).length) return []
     const types = filters.entityTypes ? new Set(filters.entityTypes) : null
     const results: SearchResult[] = []
     const projectClause = filters.projectId ? ' AND r.project_id=?' : ''
@@ -879,19 +888,19 @@ export class SqliteOperationalRepository implements OperationalRepository {
     const searchRuns = (!types || types.has('run')) && !filters.state && !filters.phaseId && !filters.requirementId && !filters.evidenceResult
     const searchEvidence = (!types || types.has('evidence')) && !filters.state && !filters.phaseId && !filters.requirementId
     if (searchRequirements) {
-      const rows = this.db.prepare(`SELECT r.id,r.project_id,r.stable_key,r.title,r.description FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE (r.title LIKE ? OR COALESCE(r.description,'') LIKE ?)${projectClause}${filters.state ? ' AND (s.semantic=? OR s.name=?)' : ''}${filters.phaseId ? " AND (r.responsible_phase_id=? OR EXISTS (SELECT 1 FROM requirement_phase_links l WHERE l.requirement_id=r.id AND l.phase_id=?))" : ''}${filters.from ? ' AND r.created_at>=?' : ''}${filters.to ? ' AND r.created_at<=?' : ''} ORDER BY r.updated_at DESC LIMIT ?`).all(term, term, ...projectArgs, ...(filters.state ? [filters.state, filters.state] : []), ...(filters.phaseId ? [filters.phaseId, filters.phaseId] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
+      const rows = this.db.prepare(`SELECT r.id,r.project_id,r.stable_key,r.title,r.description FROM requirements r JOIN requirement_states s ON s.id=r.state_id WHERE istra_search_match(r.title || char(10) || COALESCE(r.description,''), ?)=1${projectClause}${filters.state ? ' AND (s.semantic=? OR s.name=?)' : ''}${filters.phaseId ? " AND (r.responsible_phase_id=? OR EXISTS (SELECT 1 FROM requirement_phase_links l WHERE l.requirement_id=r.id AND l.phase_id=?))" : ''}${filters.from ? ' AND r.created_at>=?' : ''}${filters.to ? ' AND r.created_at<=?' : ''} ORDER BY r.updated_at DESC LIMIT ?`).all(term, ...projectArgs, ...(filters.state ? [filters.state, filters.state] : []), ...(filters.phaseId ? [filters.phaseId, filters.phaseId] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
       for (const row of rows) results.push({ type: 'requirement', id: String(row.id), projectId: String(row.project_id), title: `${String(row.stable_key)} ${String(row.title)}`, excerpt: textOrNull(row.description) ?? '', score: 0 })
     }
     if (searchWorkItems) {
-      const rows = this.db.prepare(`SELECT w.id,w.project_id,w.title,w.description FROM work_items w WHERE (w.title LIKE ? OR COALESCE(w.description,'') LIKE ?)${filters.projectId ? ' AND w.project_id=?' : ''}${filters.state ? ' AND w.status=?' : ''}${filters.phaseId ? ' AND w.phase_id=?' : ''}${filters.requirementId ? ' AND EXISTS (SELECT 1 FROM requirement_work_links l WHERE l.work_item_id=w.id AND l.requirement_id=?)' : ''}${filters.from ? ' AND w.created_at>=?' : ''}${filters.to ? ' AND w.created_at<=?' : ''} ORDER BY w.updated_at DESC LIMIT ?`).all(term, term, ...(filters.projectId ? [filters.projectId] : []), ...(filters.state ? [filters.state] : []), ...(filters.phaseId ? [filters.phaseId] : []), ...(filters.requirementId ? [filters.requirementId] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
+      const rows = this.db.prepare(`SELECT w.id,w.project_id,w.title,w.description FROM work_items w WHERE istra_search_match(w.title || char(10) || COALESCE(w.description,''), ?)=1${filters.projectId ? ' AND w.project_id=?' : ''}${filters.state ? ' AND w.status=?' : ''}${filters.phaseId ? ' AND w.phase_id=?' : ''}${filters.requirementId ? ' AND EXISTS (SELECT 1 FROM requirement_work_links l WHERE l.work_item_id=w.id AND l.requirement_id=?)' : ''}${filters.from ? ' AND w.created_at>=?' : ''}${filters.to ? ' AND w.created_at<=?' : ''} ORDER BY w.updated_at DESC LIMIT ?`).all(term, ...(filters.projectId ? [filters.projectId] : []), ...(filters.state ? [filters.state] : []), ...(filters.phaseId ? [filters.phaseId] : []), ...(filters.requirementId ? [filters.requirementId] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
       for (const row of rows) results.push({ type: 'work_item', id: String(row.id), projectId: String(row.project_id), title: String(row.title), excerpt: textOrNull(row.description) ?? '', score: 0 })
     }
     if (searchRuns) {
-      const rows = this.db.prepare(`SELECT id,project_id,command,stdout_excerpt,stderr_excerpt FROM runs WHERE (command LIKE ? OR COALESCE(stdout_excerpt,'') LIKE ? OR COALESCE(stderr_excerpt,'') LIKE ?)${filters.projectId ? ' AND project_id=?' : ''}${filters.from ? ' AND created_at>=?' : ''}${filters.to ? ' AND created_at<=?' : ''} ORDER BY created_at DESC LIMIT ?`).all(term, term, term, ...(filters.projectId ? [filters.projectId] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
+      const rows = this.db.prepare(`SELECT id,project_id,command,stdout_excerpt,stderr_excerpt FROM runs WHERE istra_search_match(command || char(10) || COALESCE(stdout_excerpt,'') || char(10) || COALESCE(stderr_excerpt,''), ?)=1${filters.projectId ? ' AND project_id=?' : ''}${filters.from ? ' AND created_at>=?' : ''}${filters.to ? ' AND created_at<=?' : ''} ORDER BY created_at DESC LIMIT ?`).all(term, ...(filters.projectId ? [filters.projectId] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
       for (const row of rows) results.push({ type: 'run', id: String(row.id), projectId: String(row.project_id), title: String(row.command), excerpt: textOrNull(row.stderr_excerpt) ?? textOrNull(row.stdout_excerpt) ?? '', score: 0 })
     }
     if (searchEvidence) {
-      const rows = this.db.prepare(`SELECT id,project_id,summary,result FROM evidence WHERE summary LIKE ?${filters.projectId ? ' AND project_id=?' : ''}${filters.evidenceResult ? ' AND result=?' : ''}${filters.from ? ' AND created_at>=?' : ''}${filters.to ? ' AND created_at<=?' : ''} ORDER BY created_at DESC LIMIT ?`).all(term, ...(filters.projectId ? [filters.projectId] : []), ...(filters.evidenceResult ? [filters.evidenceResult] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
+      const rows = this.db.prepare(`SELECT id,project_id,summary,result FROM evidence WHERE istra_search_match(summary, ?)=1${filters.projectId ? ' AND project_id=?' : ''}${filters.evidenceResult ? ' AND result=?' : ''}${filters.from ? ' AND created_at>=?' : ''}${filters.to ? ' AND created_at<=?' : ''} ORDER BY created_at DESC LIMIT ?`).all(term, ...(filters.projectId ? [filters.projectId] : []), ...(filters.evidenceResult ? [filters.evidenceResult] : []), ...(filters.from ? [filters.from] : []), ...(filters.to ? [filters.to] : []), limit) as Row[]
       for (const row of rows) results.push({ type: 'evidence', id: String(row.id), projectId: String(row.project_id), title: String(row.result), excerpt: String(row.summary), score: 0 })
     }
     return results.slice(0, Math.min(Math.max(limit, 1), 200))

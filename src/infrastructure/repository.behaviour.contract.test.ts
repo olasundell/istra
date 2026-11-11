@@ -363,6 +363,41 @@ function repositoryBehaviourContract(name: string, factory: RepositoryFactory, s
         expect.objectContaining({ id: item.id, status: 'open' }),
       ]))
     }, 30_000)
+
+    it('matches operational search words regardless of case, diacritics or order', async () => {
+      const { repository, operational } = harness
+      const project = await repository.createProject({ title: 'Folded operational search' }, provenance)
+      const requirement = await operational.createRequirement(project.id, { stableKey: 'FOLD-1', kind: 'requirement', title: 'Återhämtning efter avbrott' })
+      const run = await operational.createRun(project.id, {
+        command: 'pnpm test återhämtning',
+        startedAt: '2026-07-10T10:00:00.000Z',
+        endedAt: '2026-07-10T10:00:01.000Z',
+        outcome: 'verified',
+        exitCode: 0,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      })
+      const evidence = await operational.createEvidence(project.id, { result: 'recorded', summary: 'Återhämtning efter avbrott bekräftad' })
+      const found = async (query: string) => (await operational.search(query, 20, { projectId: project.id, entityTypes: ['requirement', 'run', 'evidence'] }))
+        .map(({ type, id }) => `${type}:${id}`).sort()
+      const everything = [`evidence:${evidence.id}`, `requirement:${requirement.id}`, `run:${run.run.id}`].sort()
+
+      expect(await found('återhämtning')).toEqual(everything)
+      expect(await found('ÅTERHÄMTNING')).toEqual(everything)
+      expect(await found('aterhamtning')).toEqual(everything)
+      expect(await found('avbrott återhämtning')).toEqual([`evidence:${evidence.id}`, `requirement:${requirement.id}`].sort())
+    }, 30_000)
+
+    it('does not treat LIKE wildcard characters in operational search as wildcards', async () => {
+      const { repository, operational } = harness
+      const project = await repository.createProject({ title: 'Literal operational search' }, provenance)
+      const literal = await operational.createRequirement(project.id, { stableKey: 'LITERAL-1', kind: 'requirement', title: 'Rename queue_cursor' })
+      await operational.createRequirement(project.id, { stableKey: 'LITERAL-2', kind: 'requirement', title: 'Rename queueXcursor' })
+      const found = async (query: string) => (await operational.search(query, 20, { projectId: project.id, entityTypes: ['requirement'] })).map(({ id }) => id)
+
+      expect(await found('queue_cursor')).toEqual([literal.id])
+      expect(await found('%')).toEqual([])
+    }, 30_000)
   })
 }
 

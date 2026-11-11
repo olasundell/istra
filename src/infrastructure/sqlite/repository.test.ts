@@ -146,6 +146,20 @@ describe('SQLite project memory repository', () => {
     await app.close()
   })
 
+  it('keeps the ranked full-text excerpt when operational search matches the same work item', async () => {
+    const app = await runtime()
+    const project = await app.service.createProject({ title: 'Merged search' })
+    const description = `${'Background detail about the enclosure. '.repeat(30)}The quasar calibration drifts overnight. ${'Further unrelated notes. '.repeat(30)}`
+    const item = await app.service.createWorkItem(project.id, { kind: 'task', title: 'Stabilise the receiver', description })
+
+    const [result] = (await app.service.search('quasar')).filter((entry) => entry.type === 'work_item' && entry.id === item.id)
+
+    expect(result?.excerpt).toContain('quasar')
+    expect(result?.excerpt.length).toBeLessThan(description.length / 2)
+    expect(result?.score).not.toBe(0)
+    await app.close()
+  })
+
   it('keeps full revision history while FTS indexes only the current revision', async () => {
     const app = await runtime()
     const project = await app.service.createProject({ title: 'Searchable' })
